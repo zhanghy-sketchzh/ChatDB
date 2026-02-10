@@ -83,5 +83,5 @@ Thumbs.db
 # Project specific
 *.pem
 *.key
-
+config.toml
 
