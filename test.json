@@ -1,0 +1,442 @@
+{
+    "success": true,
+    "query": "今年奖金最高的人是谁",
+    "sql": "SELECT \"基本信息(BasicInfo)-中英文名\" AS \"员工姓名\", \"本次合计(TotalofThisYear)-合计金额(CNY)\" AS \"合计金额\" FROM \"年终奖分配明细表_国内\"\nUNION ALL\nSELECT \"中英文名\" AS \"员工姓名\", \"合计金额(CNY)\" AS \"合计金额\" FROM \"年终奖分配明细表_海外\"\nORDER BY \"合计金额\" DESC\nLIMIT 1;",
+    "result": [
+        {
+            "员工姓名": "brooklynShao(邵芳薇)",
+            "合计金额": 668094.15
+        }
+    ],
+    "row_count": 1,
+    "summary": "今年合计金额最高的员工是brooklynShao(邵芳薇)，其中国内外年终奖总计为668,094.15元，该金额为唯一最高记录。",
+    "error": null,
+    "tables": [
+        {
+            "table_name": "年终奖分配明细表_国内",
+            "row_count": 1137,
+            "column_count": 51,
+            "columns_info": [
+                {
+                    "name": "基本信息(BasicInfo)-中英文名",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-员工ID",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-部门",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-部门下一级组织",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-组织全称",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-入职日期",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-应聘类别",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-发展通道",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-专业职位",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-专业职级",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-管理职级",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-2025绩效H1/H2",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-人才梯队",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-目前月薪",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-浮动比例",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "基本信息(BasicInfo)-发薪币种",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "本次奖金(BonusofThisYear)-年终奖时间系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次奖金(BonusofThisYear)-年终奖基数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次奖金(BonusofThisYear)-TargetBonus基数(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次奖金(BonusofThisYear)-绩效奖金(T)(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次奖金(BonusofThisYear)-下发特别奖金(T0)(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次奖金(BonusofThisYear)-提交特别奖金(T0)(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次奖金(BonusofThisYear)-项目奖金合计(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次奖金(BonusofThisYear)-(T+T0)金额(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次奖金(BonusofThisYear)-(T+T0)系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次奖金(BonusofThisYear)-(T+T0+项目奖)金额(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次奖金(BonusofThisYear)-(T+T0+项目奖)系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次奖金(BonusofThisYear)-下发建议(T+T0+项目奖)系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次-下发(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "提交(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次合计(TotalofThisYear)-合计金额(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次合计(TotalofThisYear)-国内合计系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "本次合计(TotalofThisYear)-VS2024合计金额",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "上年度参考信息(ReferenceInfoofLastYear)-2024年终奖时间系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "上年度参考信息(ReferenceInfoofLastYear)-2024年终奖基数(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "上年度参考信息(ReferenceInfoofLastYear)-2024TargetBonus基数(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "上年度参考信息(ReferenceInfoofLastYear)-2024月薪(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "上年度参考信息(ReferenceInfoofLastYear)-2024绩效H1/H2",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "上年度参考信息(ReferenceInfoofLastYear)-2024人才梯队",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "上年度参考信息(ReferenceInfoofLastYear)-2024(T+T0)金额(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "上年度参考信息(ReferenceInfoofLastYear)-2024(T+T0)系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "上年度参考信息(ReferenceInfoofLastYear)-2024项目奖合计(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "上年度参考信息(ReferenceInfoofLastYear)-2024(T+T0+项目奖)金额(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "上年度参考信息(ReferenceInfoofLastYear)-2024(T+T0+项目奖)系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "上年度参考信息(ReferenceInfoofLastYear)-2024合计金额(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "上年度参考信息(ReferenceInfoofLastYear)-2024国内合计系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "自定义标签(CustomLabels)-组织标签",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "自定义标签(CustomLabels)-绩效标签",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "自定义标签(CustomLabels)-职级标签",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "自定义标签(CustomLabels)-梯队标签",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "自定义标签(CustomLabels)-试点体系标签",
+                    "type": "VARCHAR"
+                }
+            ],
+            "create_table_sql": "CREATE TABLE \"年终奖分配明细表_国内\" (\n    \"基本信息(BasicInfo)-中英文名\" VARCHAR,\n    \"基本信息(BasicInfo)-员工ID\" DOUBLE,\n    \"基本信息(BasicInfo)-部门\" VARCHAR,\n    \"基本信息(BasicInfo)-部门下一级组织\" VARCHAR,\n    \"基本信息(BasicInfo)-组织全称\" VARCHAR,\n    \"基本信息(BasicInfo)-入职日期\" VARCHAR,\n    \"基本信息(BasicInfo)-应聘类别\" VARCHAR,\n    \"基本信息(BasicInfo)-发展通道\" VARCHAR,\n    \"基本信息(BasicInfo)-专业职位\" VARCHAR,\n    \"基本信息(BasicInfo)-专业职级\" VARCHAR,\n    \"基本信息(BasicInfo)-管理职级\" VARCHAR,\n    \"基本信息(BasicInfo)-2025绩效H1/H2\" VARCHAR,\n    \"基本信息(BasicInfo)-人才梯队\" VARCHAR,\n    \"基本信息(BasicInfo)-目前月薪\" DOUBLE,\n    \"基本信息(BasicInfo)-浮动比例\" DOUBLE,\n    \"基本信息(BasicInfo)-发薪币种\" VARCHAR,\n    \"本次奖金(BonusofThisYear)-年终奖时间系数\" DOUBLE,\n    \"本次奖金(BonusofThisYear)-年终奖基数\" DOUBLE,\n    \"本次奖金(BonusofThisYear)-TargetBonus基数(CNY)\" DOUBLE,\n    \"本次奖金(BonusofThisYear)-绩效奖金(T)(CNY)\" DOUBLE,\n    \"本次奖金(BonusofThisYear)-下发特别奖金(T0)(CNY)\" DOUBLE,\n    \"本次奖金(BonusofThisYear)-提交特别奖金(T0)(CNY)\" DOUBLE,\n    \"本次奖金(BonusofThisYear)-项目奖金合计(CNY)\" DOUBLE,\n    \"本次奖金(BonusofThisYear)-(T+T0)金额(CNY)\" DOUBLE,\n    \"本次奖金(BonusofThisYear)-(T+T0)系数\" DOUBLE,\n    \"本次奖金(BonusofThisYear)-(T+T0+项目奖)金额(CNY)\" DOUBLE,\n    \"本次奖金(BonusofThisYear)-(T+T0+项目奖)系数\" DOUBLE,\n    \"本次奖金(BonusofThisYear)-下发建议(T+T0+项目奖)系数\" DOUBLE,\n    \"本次-下发(CNY)\" DOUBLE,\n    \"提交(CNY)\" DOUBLE,\n    \"本次合计(TotalofThisYear)-合计金额(CNY)\" DOUBLE,\n    \"本次合计(TotalofThisYear)-国内合计系数\" DOUBLE,\n    \"本次合计(TotalofThisYear)-VS2024合计金额\" DOUBLE,\n    \"上年度参考信息(ReferenceInfoofLastYear)-2024年终奖时间系数\" DOUBLE,\n    \"上年度参考信息(ReferenceInfoofLastYear)-2024年终奖基数(CNY)\" DOUBLE,\n    \"上年度参考信息(ReferenceInfoofLastYear)-2024TargetBonus基数(CNY)\" DOUBLE,\n    \"上年度参考信息(ReferenceInfoofLastYear)-2024月薪(CNY)\" DOUBLE,\n    \"上年度参考信息(ReferenceInfoofLastYear)-2024绩效H1/H2\" VARCHAR,\n    \"上年度参考信息(ReferenceInfoofLastYear)-2024人才梯队\" VARCHAR,\n    \"上年度参考信息(ReferenceInfoofLastYear)-2024(T+T0)金额(CNY)\" DOUBLE,\n    \"上年度参考信息(ReferenceInfoofLastYear)-2024(T+T0)系数\" DOUBLE,\n    \"上年度参考信息(ReferenceInfoofLastYear)-2024项目奖合计(CNY)\" DOUBLE,\n    \"上年度参考信息(ReferenceInfoofLastYear)-2024(T+T0+项目奖)金额(CNY)\" DOUBLE,\n    \"上年度参考信息(ReferenceInfoofLastYear)-2024(T+T0+项目奖)系数\" DOUBLE,\n    \"上年度参考信息(ReferenceInfoofLastYear)-2024合计金额(CNY)\" DOUBLE,\n    \"上年度参考信息(ReferenceInfoofLastYear)-2024国内合计系数\" DOUBLE,\n    \"自定义标签(CustomLabels)-组织标签\" VARCHAR,\n    \"自定义标签(CustomLabels)-绩效标签\" DOUBLE,\n    \"自定义标签(CustomLabels)-职级标签\" DOUBLE,\n    \"自定义标签(CustomLabels)-梯队标签\" VARCHAR,\n    \"自定义标签(CustomLabels)-试点体系标签\" VARCHAR\n);",
+            "table_description": "表 年终奖分配明细表_国内，包含 1137 行，51 列"
+        },
+        {
+            "table_name": "年终奖分配明细表_海外",
+            "row_count": 26,
+            "column_count": 51,
+            "columns_info": [
+                {
+                    "name": "中英文名",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "员工ID",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "部门",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "部门下一级组织",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "组织全称",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "入职日期",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "应聘类别",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "发展通道",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "专业职位",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "专业职级",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "管理职级",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "2025绩效H1/H2",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "人才梯队",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "目前月薪(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "浮动比例",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "发薪币种",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "年终奖时间系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "年终奖基数(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "TargetBonus基数(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "绩效奖金(T)(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "下发TargetBonus(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "提交TargetBonus(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "项目奖金合计(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "(T+T0)金额(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "(T+T0)系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "(TargetBonus+项目奖)金额(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "(T+T0+项目奖)系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "下发建议(T+T0+项目奖)系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "下发(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "提交(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "合计金额(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "国内合计系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "VS2024合计金额",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "2024年终奖时间系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "2024年终奖基数(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "2024TargetBonus基数(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "2024月薪(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "2024绩效H1/H2",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "2024人才梯队",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "2024TargetBonus金额(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "2024(T+T0)系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "2024项目奖合计(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "2024(TargetBonus+项目奖)金额(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "2024(T+T0+项目奖)系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "2024合计金额(CNY)",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "2024国内合计系数",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "组织标签",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "绩效标签",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "职级标签",
+                    "type": "DOUBLE"
+                },
+                {
+                    "name": "梯队标签",
+                    "type": "VARCHAR"
+                },
+                {
+                    "name": "试点体系标签",
+                    "type": "VARCHAR"
+                }
+            ],
+            "create_table_sql": "CREATE TABLE \"年终奖分配明细表_海外\" (\n    \"中英文名\" VARCHAR,\n    \"员工ID\" DOUBLE,\n    \"部门\" VARCHAR,\n    \"部门下一级组织\" VARCHAR,\n    \"组织全称\" VARCHAR,\n    \"入职日期\" VARCHAR,\n    \"应聘类别\" VARCHAR,\n    \"发展通道\" VARCHAR,\n    \"专业职位\" VARCHAR,\n    \"专业职级\" VARCHAR,\n    \"管理职级\" VARCHAR,\n    \"2025绩效H1/H2\" VARCHAR,\n    \"人才梯队\" VARCHAR,\n    \"目前月薪(CNY)\" DOUBLE,\n    \"浮动比例\" DOUBLE,\n    \"发薪币种\" VARCHAR,\n    \"年终奖时间系数\" DOUBLE,\n    \"年终奖基数(CNY)\" DOUBLE,\n    \"TargetBonus基数(CNY)\" DOUBLE,\n    \"绩效奖金(T)(CNY)\" DOUBLE,\n    \"下发TargetBonus(CNY)\" DOUBLE,\n    \"提交TargetBonus(CNY)\" DOUBLE,\n    \"项目奖金合计(CNY)\" DOUBLE,\n    \"(T+T0)金额(CNY)\" DOUBLE,\n    \"(T+T0)系数\" DOUBLE,\n    \"(TargetBonus+项目奖)金额(CNY)\" DOUBLE,\n    \"(T+T0+项目奖)系数\" DOUBLE,\n    \"下发建议(T+T0+项目奖)系数\" DOUBLE,\n    \"下发(CNY)\" DOUBLE,\n    \"提交(CNY)\" DOUBLE,\n    \"合计金额(CNY)\" DOUBLE,\n    \"国内合计系数\" DOUBLE,\n    \"VS2024合计金额\" DOUBLE,\n    \"2024年终奖时间系数\" DOUBLE,\n    \"2024年终奖基数(CNY)\" DOUBLE,\n    \"2024TargetBonus基数(CNY)\" DOUBLE,\n    \"2024月薪(CNY)\" DOUBLE,\n    \"2024绩效H1/H2\" VARCHAR,\n    \"2024人才梯队\" VARCHAR,\n    \"2024TargetBonus金额(CNY)\" DOUBLE,\n    \"2024(T+T0)系数\" DOUBLE,\n    \"2024项目奖合计(CNY)\" DOUBLE,\n    \"2024(TargetBonus+项目奖)金额(CNY)\" DOUBLE,\n    \"2024(T+T0+项目奖)系数\" DOUBLE,\n    \"2024合计金额(CNY)\" DOUBLE,\n    \"2024国内合计系数\" DOUBLE,\n    \"组织标签\" VARCHAR,\n    \"绩效标签\" DOUBLE,\n    \"职级标签\" DOUBLE,\n    \"梯队标签\" VARCHAR,\n    \"试点体系标签\" VARCHAR\n);",
+            "table_description": "表 年终奖分配明细表_海外，包含 26 行，51 列"
+        }
+    ]
+}
