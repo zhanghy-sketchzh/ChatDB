@@ -175,7 +175,6 @@ class SemanticParseTool(BaseTool):
                 state.intent = intent_dict
             
             state.yml_config = result.data.get("yml_config", {})
-            state.observe(f"意图: {state.intent.intent_type if state.intent else 'unknown'}")
             state.mark_need(need_intent=False, need_sql=True)
             
             # 同步到 context

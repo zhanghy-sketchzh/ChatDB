@@ -2,8 +2,15 @@
 PlannerAgent：规划决策 Agent，将用户问题拆解为数据分析任务（DAG）。
 
 核心理念：让 LLM 做智能决策，减少规则层复杂度
-- 生成计划：LLM 直接输出 tasks
-- 执行决策：LLM 根据 temp_results 决定继续/调整/结束
+
+职责划分：
+- SemanticParser: 提取"用户想查什么"（metrics, dimensions, conditions）
+- Planner: 决定"怎么分析"（TaskType + 具体参数：comparison, order_by, limit 等）
+
+流程：
+1. 接收 SemanticParser 输出的 StructuredIntent
+2. 根据用户问题 + 意图，推断分析场景（TaskType）
+3. 生成分析计划（tasks DAG）
 """
 
 import json
@@ -23,25 +30,32 @@ from chatdb.utils.logger import get_component_logger
 # ============================================================
 
 class TaskType(str, Enum):
-    """任务类型枚举"""
-    TREND = "trend"
-    SOURCE = "source"
-    DRILLDOWN = "drilldown"
-    COMPARISON = "comparison"
-    BASIC = "basic"
-    SUMMARY = "summary"
-    VALIDATION = "validation"
-    ANOMALY = "anomaly"
-    COHORT = "cohort"
-    CORRELATION = "correlation"
-    CLARIFY = "clarify"
-    META = "meta"
+    """
+    任务类型枚举
+    
+    由 Planner 根据用户问题推断，而非 SemanticParser 提取
+    """
+    TREND = "trend"           # 趋势分析（按时间看变化）
+    SOURCE = "source"         # 来源分析（按维度拆解贡献）
+    DRILLDOWN = "drilldown"   # 下钻分析（对 top 结果进一步细分）
+    COMPARISON = "comparison" # 对比分析（同比/环比/两组对比）
+    RANKING = "ranking"       # 排名分析（TopN）
+    RATIO = "ratio"           # 占比分析（结构占比）
+    BASIC = "basic"           # 基础查询（简单聚合）
+    SUMMARY = "summary"       # 结果总结
+    VALIDATION = "validation" # SQL/数据验证
+    ANOMALY = "anomaly"       # 异常检测
+    COHORT = "cohort"         # 队列分析
+    CORRELATION = "correlation"  # 关联分析
+    CLARIFY = "clarify"       # 人工澄清
+    META = "meta"             # 元任务
 
     @property
     def label(self) -> str:
         labels = {
             self.TREND: "趋势分析", self.SOURCE: "来源分析",
             self.DRILLDOWN: "下钻分析", self.COMPARISON: "对比分析",
+            self.RANKING: "排名分析", self.RATIO: "占比分析",
             self.BASIC: "基础查询", self.SUMMARY: "结果总结",
             self.VALIDATION: "SQL/数据验证", self.ANOMALY: "异常检测",
             self.COHORT: "队列分析", self.CORRELATION: "关联分析",
@@ -55,7 +69,9 @@ class TaskType(str, Enum):
             self.TREND: "按时间聚合，分析变化趋势",
             self.SOURCE: "按维度拆解，找出贡献来源",
             self.DRILLDOWN: "对 top 结果进一步细分",
-            self.COMPARISON: "两个时间段/条件的对比",
+            self.COMPARISON: "两个时间段/条件的对比（同比/环比）",
+            self.RANKING: "排名查询，找出 TopN",
+            self.RATIO: "计算占比/结构",
             self.BASIC: "简单的聚合/求和/计数",
             self.SUMMARY: "整合前面结果，回答用户问题",
             self.VALIDATION: "验证 SQL 正确性、检查口径一致性、诊断空结果原因",
@@ -70,6 +86,17 @@ class TaskType(str, Enum):
     @property
     def priority_boost(self) -> int:
         return 10 if self == self.ANOMALY else 0
+    
+    @property
+    def sql_hints(self) -> dict[str, Any]:
+        """返回该任务类型对应的 SQL 生成提示"""
+        hints = {
+            self.TREND: {"order_by": {"column": "时间列", "direction": "ASC"}},
+            self.RANKING: {"order_by": {"column": "指标列", "direction": "DESC"}, "limit": 10},
+            self.COMPARISON: {"comparison": "yoy"},  # 默认同比
+            self.RATIO: {"need_total": True},  # 需要计算总量用于占比
+        }
+        return hints.get(self, {})
 
 
 def get_task_types_for_prompt(for_generation: bool = True) -> str:
@@ -238,16 +265,24 @@ class PlannerAgent(BaseAgent):
     规划决策 Agent
     
     核心能力：
-    1. 生成分析计划（LLM 直接输出任务 DAG）
+    1. 根据 SemanticParser 提取的意图（含 task_type）生成分析计划
     2. 查看执行结果，动态决策下一步
     3. 调整计划（跳过/插入/重试任务）
+    
+    职责边界：
+    - SemanticParser: 提取"用户想查什么"+ "怎么分析"（task_type）
+    - Planner: 根据 task_type 生成任务 DAG，动态调整执行策略
+    
+    设计变更（v4）：
+    - 移除 infer_analysis_type()，任务类型识别已合并到 SemanticParser
+    - 直接使用 Intent.task_type，避免二次推断不一致
     """
 
     def __init__(self, llm: BaseLLM):
         super().__init__(
             name="Planner",
             llm=llm,
-            description="规划者：生成数据分析任务，查看执行结果，动态调整策略",
+            description="规划者：根据意图生成数据分析任务，动态调整策略",
         )
         self._log = get_component_logger("Planner")
         self._analysis_plan: Optional[AnalysisPlan] = None
@@ -262,7 +297,17 @@ class PlannerAgent(BaseAgent):
     # ============================================================
 
     async def generate_analysis_plan(self, state: ReActState, context: AgentContext) -> AnalysisPlan:
-        """生成分析计划"""
+        """
+        生成分析计划
+        
+        流程：
+        1. 从 Intent 获取 task_type（由 SemanticParser 识别）
+        2. 根据 task_type 生成任务 DAG
+        
+        设计变更（v4）：
+        - 移除 infer_analysis_type()，直接使用 Intent.task_type
+        - 任务类型识别已合并到 SemanticParser，避免二次推断
+        """
         if not state.intent:
             self._log.warn("无 Intent，使用默认计划")
             return self._get_default_plan()
@@ -270,11 +315,22 @@ class PlannerAgent(BaseAgent):
         if state.yml_config:
             load_task_types_from_config(state.yml_config)
 
-        if state.intent.is_meta_query():
-            self._log.info("meta 模式，跳过分析流程")
-            return self._get_meta_plan(state)
+        if state.intent.is_other_query():
+            self._log.info("other 模式，跳过分析流程")
+            return self._get_other_plan(state)
 
-        plan = await self._generate_plan_with_llm(state, context)
+        # === 直接从 Intent 获取 task_type（由 SemanticParser 识别）===
+        task_type_str = state.intent.task_type or "basic"
+        try:
+            task_type = TaskType(task_type_str)
+        except ValueError:
+            self._log.warn(f"未知任务类型: {task_type_str}，使用 basic")
+            task_type = TaskType.BASIC
+        
+        self._log.info(f"任务类型: {task_type.label} ({task_type.value}) [来自 SemanticParser]")
+
+        # === 生成任务计划 ===
+        plan = await self._generate_plan_with_llm(state, context, task_type)
         if plan and plan.tasks:
             self._analysis_plan = plan
             return plan
@@ -283,27 +339,36 @@ class PlannerAgent(BaseAgent):
         return self._get_default_plan()
 
     async def _generate_plan_with_llm(
-        self, state: ReActState, context: AgentContext
+        self, state: ReActState, context: AgentContext, task_type: TaskType = TaskType.BASIC
     ) -> Optional[AnalysisPlan]:
-        """LLM 生成分析任务 DAG"""
+        """
+        LLM 生成分析任务 DAG
+        
+        根据任务类型（来自 SemanticParser），选择对应的 Prompt 模板，生成精准的任务计划。
+        """
         intent = state.intent
         intent_summary = {
             "metrics": intent.metrics,
             "dimensions": intent.dimensions,
-            "time": intent.time,
-            "filter_refs": intent.filter_refs,
+            "conditions": [c for c in intent.conditions if c.get("type") == "ref"],
+            "task_type": task_type.value,
         }
 
         resolved_filters = self._resolve_filter_refs(state, intent.filter_refs)
         schema_info = self._build_schema_info(state, context)
         yml_info = self._build_yml_info(state)
-        task_types_desc = get_task_types_for_prompt(for_generation=True)
+        
+        # ★ 根据任务类型选择对应的 Prompt 模板
+        task_specific_prompt = self._get_task_specific_prompt(task_type)
 
         prompt = f"""## 角色
-你是资深数据分析师，需要为用户问题设计**优雅、鲁棒**的分析思路。
+你是资深数据分析师，需要为用户问题设计**优雅、鲁棒**的分析计划。
 
 ## 用户问题
 {state.user_query}
+
+## 分析场景（由意图提取阶段识别）
+- **{task_type.label}** ({task_type.value}): {task_type.description}
 
 ## 已解析的意图
 {json.dumps(intent_summary, ensure_ascii=False, indent=2)}
@@ -317,22 +382,9 @@ class PlannerAgent(BaseAgent):
 ## 业务配置
 {yml_info or "（无）"}
 
-## 可用的任务类型
-{task_types_desc}
-
 ---
 
-## 核心原则：尽量一步到位！
-
-### 原则一：能一步完成的绝不拆分
-- **占比/比例计算**：一个 SQL 用子查询或 CTE 即可完成，**不要拆成分子和分母两个任务**
-- **同比/环比**：一个 SQL 用 LAG/LEAD 或子查询即可，**不要拆分**
-- **简单聚合**：一个 basic 任务搞定
-
-### 原则二：只有必须分步时才拆分
-- 后续分析依赖前一步的**具体结果**
-- 需要根据中间结果**动态决策**
-- 多维度并行分析后需要**汇总对比**
+{task_specific_prompt}
 
 ---
 
@@ -344,9 +396,9 @@ class PlannerAgent(BaseAgent):
   "tasks": [
     {{
       "id": "唯一标识",
-      "type": "basic|trend|source|...",
+      "type": "{task_type.value}",
       "description": "完整的分析指令",
-      "depends_on": ["依赖的任务ID"],
+      "depends_on": [],
       "notes": ["执行提示"]
     }}
   ]
@@ -354,15 +406,15 @@ class PlannerAgent(BaseAgent):
 ```
 
 ## 规则
-1. **占比、同比、环比等计算型问题 → 1 个 basic 任务**
-2. 简单问题不要拆解，1 个 basic 解决
-3. 复杂问题一般不超过 5 个任务
-4. **不要使用 validation/clarify**，它们是执行时遇到问题才用的"""
+1. 任务类型已确定为 **{task_type.value}**，直接使用该类型
+2. 简单问题一个任务解决，不要过度拆解
+3. 复杂问题最多 3-5 个任务
+4. 不要使用 validation/clarify 类型（执行时遇到问题才用）"""
 
         try:
             response = await self.llm.chat(
                 prompt=prompt,
-                system_prompt="你是数据分析规划专家。设计优雅的分析思路，用原子任务编排。输出 JSON。",
+                system_prompt="你是数据分析规划专家。根据识别的分析类型，设计精准的执行计划。输出 JSON。",
                 caller_name="planner",
             )
 
@@ -383,6 +435,150 @@ class PlannerAgent(BaseAgent):
         except Exception as e:
             self._log.warn(f"规划失败: {e}")
             return None
+
+    def _get_task_specific_prompt(self, task_type: TaskType) -> str:
+        """
+        根据任务类型返回特定的 Prompt 模板
+        
+        每种任务类型有其特定的执行要点和 SQL 模式。
+        """
+        prompts = {
+            TaskType.RATIO: """## 占比分析要点
+
+**核心**：一个 SQL 算出"部分/总体"比例，不要拆成多个任务
+- 分子条件放 CASE WHEN，全局条件放 WHERE
+- TOP N 占比：用 CTE 先 GROUP BY + ORDER BY 取 TOP N，再 CASE WHEN IN 算分子
+
+**任务输出示例**：
+```json
+{
+  "id": "ratio_1",
+  "type": "ratio",
+  "description": "计算手游在总流水中的占比，分子=手游流水，分母=总流水",
+  "notes": ["分子条件: 产品大类='手游'", "全局条件: 数据集来源=实际数据"]
+}
+```""",
+
+            TaskType.COMPARISON: """## 对比分析要点
+
+**核心目标**：对比两个时间段/条件的指标差异
+
+**SQL 模式**（同比）：
+```sql
+SELECT 
+    当前期指标,
+    上期指标,
+    (当前期 - 上期) / 上期 * 100 as 增长率
+FROM (子查询或 LAG 窗口函数)
+```
+
+**一步到位原则**：
+- 同比/环比用一个 SQL 完成，用 LAG/LEAD 或子查询
+- 不要拆成"先算今年、再算去年"两个任务
+
+**任务输出示例**：
+```json
+{
+  "id": "comparison_1",
+  "type": "comparison",
+  "description": "计算2025年Q1手游流水的同比增长率，对比2024年Q1",
+  "notes": ["对比方式: yoy(同比)", "基准期: 2024年Q1", "当前期: 2025年Q1"]
+}
+```""",
+
+            TaskType.RANKING: """## 排名分析要点
+
+**核心目标**：找出 TopN 或 BottomN
+
+**SQL 模式**：
+```sql
+SELECT 维度列, SUM(指标) as 指标值
+FROM 表
+WHERE 条件
+GROUP BY 维度列
+ORDER BY 指标值 DESC
+LIMIT N
+```
+
+**任务输出示例**：
+```json
+{
+  "id": "ranking_1",
+  "type": "ranking",
+  "description": "找出2025年流水最高的5个产品",
+  "notes": ["排序方向: DESC", "限制数量: 5", "分组维度: 产品"]
+}
+```""",
+
+            TaskType.TREND: """## 趋势分析要点
+
+**核心目标**：观察指标随时间的变化
+
+**SQL 模式**：
+```sql
+SELECT 时间列, SUM(指标) as 指标值
+FROM 表
+WHERE 条件
+GROUP BY 时间列
+ORDER BY 时间列 ASC
+```
+
+**任务输出示例**：
+```json
+{
+  "id": "trend_1",
+  "type": "trend",
+  "description": "分析2020-2025年手游流水的年度变化趋势",
+  "notes": ["时间粒度: 年", "排序: 按时间升序"]
+}
+```""",
+
+            TaskType.SOURCE: """## 来源分析要点
+
+**核心目标**：按维度拆解，找出主要贡献来源
+
+**SQL 模式**：
+```sql
+SELECT 维度列, SUM(指标) as 指标值
+FROM 表
+WHERE 条件
+GROUP BY 维度列
+ORDER BY 指标值 DESC
+```
+
+**任务输出示例**：
+```json
+{
+  "id": "source_1",
+  "type": "source",
+  "description": "按产品大类拆解流水来源，找出主要贡献类型",
+  "notes": ["分组维度: 产品大类", "计算贡献度占比"]
+}
+```""",
+
+            TaskType.BASIC: """## 基础查询要点
+
+**核心目标**：简单聚合，获取单一指标值
+
+**SQL 模式**：
+```sql
+SELECT SUM(指标) as 指标值
+FROM 表
+WHERE 条件
+```
+
+**任务输出示例**：
+```json
+{
+  "id": "basic_1",
+  "type": "basic",
+  "description": "查询2025年手游总流水",
+  "notes": []
+}
+```""",
+        }
+        
+        return prompts.get(task_type, prompts[TaskType.BASIC])
 
     def _resolve_filter_refs(self, state: ReActState, filter_refs: list[str]) -> str:
         if not filter_refs:
@@ -468,13 +664,13 @@ class PlannerAgent(BaseAgent):
             tasks.append(AnalysisTask.from_dict(raw))
         return AnalysisPlan(tasks=tasks) if tasks else None
 
-    def _get_meta_plan(self, state: ReActState) -> AnalysisPlan:
+    def _get_other_plan(self, state: ReActState) -> AnalysisPlan:
         tasks = [AnalysisTask(
-            id="meta_response",
+            id="other_response",
             type=TaskType.META,
-            description="处理元指令请求",
-            notes=[f"meta_request: {getattr(state.intent, 'meta_request', '未指定')}"],
-            meta={"action": "meta_response"},
+            description="处理非数据分析请求",
+            notes=[f"other_request: {getattr(state.intent, 'other_request', '未指定')}"],
+            meta={"action": "other_response"},
         )]
         plan = AnalysisPlan(tasks=tasks)
         self._analysis_plan = plan

@@ -38,11 +38,11 @@ if TYPE_CHECKING:
     from chatdb.agents.sql_agent import SQLAgent
 
 from chatdb.agents.base import BaseAgent, AgentContext, AgentResult, AgentStatus
+from chatdb.config.metrics_loader import preprocess_yaml_config
 from chatdb.core.react_state import ReActState
 from chatdb.database.base import BaseDatabaseConnector
 from chatdb.llm.base import BaseLLM
 from chatdb.tools.sql import SQLTool
-from chatdb.tools.calibration_designer import CalibrationDesigner, CalibrationPlan
 from chatdb.utils.logger import get_component_logger
 
 
@@ -56,6 +56,8 @@ class SQLTaskType(str, Enum):
     SOURCE = "source"         # 来源分析（按维度拆解）
     DRILLDOWN = "drilldown"   # 下钻分析（对 top 结果细分）
     COMPARISON = "comparison" # 对比分析（同比/环比）
+    RANKING = "ranking"       # 排名分析（TopN）
+    RATIO = "ratio"           # 占比分析（结构占比）
     BASIC = "basic"           # 基础查询（简单聚合）
     SUMMARY = "summary"       # 生成总结（由 Orchestrator 处理）
     ANOMALY = "anomaly"       # 异常检测（预留）
@@ -123,6 +125,21 @@ SQL_TASK_META: dict[SQLTaskType, SQLTaskMeta] = {
         intent_hint_template="对比两个时间段或条件下的指标，计算差值或增长率",
         stats_fields=["delta", "growth_rate", "comparison_base"],
         issue_fields=["insufficient_comparison_data"],
+    ),
+    SQLTaskType.RANKING: SQLTaskMeta(
+        label="排名分析",
+        description="按指标排序，找出 TopN 或 BottomN",
+        requires_dimension=True,
+        intent_hint_template="按{metric}排序，找出 Top{limit}，需要 GROUP BY 维度 ORDER BY 指标 DESC LIMIT N",
+        stats_fields=["top_items", "top_value", "bottom_value"],
+        issue_fields=["insufficient_data", "single_item"],
+    ),
+    SQLTaskType.RATIO: SQLTaskMeta(
+        label="占比分析",
+        description="计算部分占总体的比例",
+        intent_hint_template="计算{numerator}在{denominator}中的占比，分子条件用 CASE WHEN，全局条件用 WHERE",
+        stats_fields=["numerator", "denominator", "ratio"],
+        issue_fields=["zero_denominator", "missing_numerator"],
     ),
     SQLTaskType.BASIC: SQLTaskMeta(
         label="基础查询",
@@ -292,6 +309,9 @@ class DomainConfig:
     @classmethod
     def from_dict(cls, data: dict) -> "DomainConfig":
         """从字典加载配置"""
+        # 预处理：展开模板、表驱动生成
+        data = preprocess_yaml_config(data)
+        
         meta = data.get("meta", {})
         
         return cls(
@@ -354,7 +374,6 @@ class SQLAgent(BaseAgent):
         )
         self.db_connector = db_connector
         self._sql_tool = SQLTool(llm, db_connector)
-        self._calibration_designer = CalibrationDesigner(llm)  # ★ 新增：口径设计器
         self._log = get_component_logger("SQLAgent")
         self._thoughts: list[SQLAgentThought] = []
         
@@ -741,173 +760,21 @@ class SQLAgent(BaseAgent):
         self._log.info(f"注入指标定义: {metric_name} ({metric_type}), agg={agg_preview}..., "
                        f"required_filters={len(required_filters)}个")
 
-    async def _design_calibration(
-        self,
-        state: ReActState,
-        task_description: str = "",
-    ) -> Optional[CalibrationPlan]:
-        """
-        ★ 调用口径设计器，智能划分筛选条件角色
-        
-        这是架构改造的核心：
-        - 不再用关键词判断"是否是占比计算"
-        - 让 LLM 理解业务语义，智能决定筛选条件的角色
-        - 输出 CalibrationPlan，用于指导 SQL 生成
-        
-        ★ 重要：必须在 _inject_metric_definition 之后调用
-        这样口径设计器能看到完整的 required_filters 列表
-        
-        Args:
-            state: ReAct 状态（含 intent、yml_config、required_filters）
-            task_description: 当前任务描述
-        
-        Returns:
-            CalibrationPlan 或 None（如果不需要特殊处理）
-        """
-        if not state.intent or not state.yml_config:
-            return None
-        
-        # 调用口径设计器
-        try:
-            # ★ 重要修复：传入 required_filters，让口径设计器看到完整的筛选列表
-            plan = await self._calibration_designer.design(
-                user_query=state.user_query,
-                intent=state.intent,
-                yml_config=state.yml_config,
-                task_description=task_description,
-                required_filters=state.required_filters,  # 新增参数
-            )
-            
-            # 保存到 state，供后续使用
-            state.calibration_plan = plan
-            
-            self._log.info(
-                f"口径设计完成: type={plan.calculation_type}, "
-                f"numerator={len(plan.numerator_filters)}, "
-                f"global={len(plan.global_filters)}"
-            )
-            
-            return plan
-            
-        except Exception as e:
-            self._log.warn(f"口径设计失败，使用默认逻辑: {e}")
-            return None
-
-    def _apply_calibration_plan(self, state: ReActState, plan: CalibrationPlan) -> None:
-        """
-        ★ 根据口径设计方案，重新划分 required_filters
-        
-        核心逻辑：
-        - 如果是 ratio 类型，把 numerator_filters 从 required_filters 中移出
-        - numerator_filters 会被放入 state.numerator_filters，供 SQLTool 生成 CASE WHEN
-        - global_filters 保留在 required_filters 中，放入 WHERE
-        
-        ★ 重要修复：
-        - CalibrationDesigner 输出的是原始 filter ID（如 "category_mobile"）
-        - 但 _inject_metric_definition 可能生成了组合 ID（如 "product_category_combined"）
-        - 需要同时匹配原始 ID 和组合 ID
-        """
-        if not plan.is_ratio():
-            # 非占比计算，不需要特殊处理
-            return
-        
-        self._log.info("应用占比口径设计...")
-        
-        # ★ 修复：获取分子筛选的原始 ID 集合
-        numerator_filter_ids = {f["id"] for f in plan.numerator_filters}
-        
-        # ★ 修复：同时记录分子筛选的 group（用于匹配 _combined 形式的 ID）
-        numerator_groups = set()
-        filters_config = state.yml_config.get("filters", {}) if state.yml_config else {}
-        for fid in numerator_filter_ids:
-            if fid in filters_config:
-                group = filters_config[fid].get("group", "default")
-                numerator_groups.add(group)
-                numerator_groups.add(f"{group}_combined")  # 预防性添加组合 ID
-        
-        self._log.info(f"  分子筛选 ID: {numerator_filter_ids}")
-        self._log.info(f"  分子筛选组: {numerator_groups}")
-        
-        # 从 required_filters 中分离出分子筛选
-        new_required_filters = []
-        numerator_filters_for_sql = []
-        
-        for f in (state.required_filters or []):
-            fid = f.get("id", "")
-            flabel = f.get("label", "")
-            
-            # ★ 修复：多种匹配方式
-            is_numerator = False
-            
-            # 1. 精确匹配原始 ID
-            if fid in numerator_filter_ids:
-                is_numerator = True
-            
-            # 2. 匹配组合 ID（如 product_category_combined）
-            elif fid in numerator_groups:
-                is_numerator = True
-            
-            # 3. 匹配 _combined 后缀的组名
-            elif fid.endswith("_combined"):
-                base_group = fid.replace("_combined", "")
-                if base_group in numerator_groups or f"{base_group}_combined" in numerator_groups:
-                    is_numerator = True
-            
-            # 4. 检查 label 是否包含分子筛选的 label（兜底）
-            # 例如：label="手游, 端游" 包含 "手游"
-            if not is_numerator:
-                for nf in plan.numerator_filters:
-                    nlabel = nf.get("label", "")
-                    if nlabel and nlabel in flabel:
-                        is_numerator = True
-                        break
-            
-            if is_numerator:
-                # 这是分子专用筛选，放入 numerator_filters
-                numerator_filters_for_sql.append(f)
-                self._log.info(f"  分子筛选: {fid} ({flabel})")
-            else:
-                # 这是全局筛选，保留在 WHERE
-                new_required_filters.append(f)
-                self._log.info(f"  全局筛选: {fid} ({flabel})")
-        
-        # 更新 state
-        state.required_filters = new_required_filters
-        state.numerator_filters = numerator_filters_for_sql
-        
-        # 设置 SQL 模式提示
-        state.sql_pattern = plan.sql_pattern
-        state.sql_hint = plan.sql_hint
-        
-        self._log.info(
-            f"口径划分完成: WHERE 筛选 {len(new_required_filters)} 个, "
-            f"CASE WHEN 筛选 {len(numerator_filters_for_sql)} 个"
-        )
-        
-        # ★ 重要校验：如果 LLM 识别出是 ratio 但没有分离出分子筛选，打印警告
-        if not numerator_filters_for_sql:
-            self._log.warn(
-                f"⚠️ 口径设计为 ratio 类型，但未能从 required_filters 中分离出分子筛选！"
-                f"numerator_filter_ids={numerator_filter_ids}, "
-                f"required_filter_ids={[f.get('id') for f in state.required_filters or []]}"
-            )
-
     async def run_task(self, state: ReActState, context: AgentContext, task: dict[str, Any]) -> None:
         """
         执行 Planner 给的分析任务（核心接口）
         
         重构后使用注册表分发，支持插件式扩展。
         
+        ReAct 回放只记录关键信息：
+        - THINK: 分析思路
+        - ACT: 执行的 SQL
+        - OBSERVE: 执行结果
+        
         Args:
             state: ReAct 状态
             context: Agent 上下文
             task: Planner 任务
-                {
-                    "id": "source_analysis",
-                    "type": "source",
-                    "description": "从主要维度拆解流水来源，找出贡献最大的部分",
-                    "notes": ["优先尝试国内/海外维度", "关注 top 贡献者"]
-                }
         
         结果写入 state.temp_results[task_id]
         """
@@ -916,10 +783,6 @@ class SQLAgent(BaseAgent):
         raw_type = task.get("type", "basic")
         description = task.get("description", "")
         notes = task.get("notes", [])
-        
-        self._think(f"收到任务: {task_id} - {description[:50]}...", state)
-        if notes:
-            self._think(f"注意事项: {notes[0][:50]}...", state)
         
         # 注入领域配置
         if self.config:
@@ -934,11 +797,9 @@ class SQLAgent(BaseAgent):
         retry_hint = task_meta.get("retry_hint", "")
         
         # 初始化或清空 temp_results
-        # ★ 如果是重试任务（retry_count > 0），清空旧结果，避免 Planner 看到旧的错误信息
         if retry_count > 0:
             self._log.info(f"重试任务 {task_id}（第 {retry_count} 次），清除旧结果")
             state.temp_results[task_id] = []
-            # 同时清理可能残留的错误状态
             state.execution_error = None
             state.error = None
         elif task_id not in state.temp_results:
@@ -957,20 +818,23 @@ class SQLAgent(BaseAgent):
             self._log.warn(f"任务类型 {task_type.value} 未注册 handler，降级 basic")
             handler = get_task_handler(SQLTaskType.BASIC)
         
+        # THINK: 记录分析思路
+        state.think(description)
+        
         # 执行 handler
         try:
             if handler:
                 await handler(self, state, context, task)
             else:
-                # 兜底：直接执行基础查询
                 self._log.error("无法找到任何 handler，执行最简查询")
                 await self._fallback_basic_query(state, context, task)
         except Exception as e:
-            self._observe(f"任务执行失败: {e}", state)
+            self._log.error(f"任务执行失败: {e}")
             result = TaskResult(subtask="error", issues=[str(e)])
             state.temp_results[task_id].append(result.to_dict())
         
-        self._observe(f"任务 {task_id} 完成，{len(self._thoughts)} 步思考", state)
+        # 进入下一个 ReAct 步骤
+        state.next_step()
     
     async def _fallback_basic_query(
         self, state: ReActState, context: AgentContext, task: dict[str, Any]
@@ -1138,10 +1002,6 @@ class SQLAgent(BaseAgent):
         # 无指令时，使用基础流程
         self._think(f"开始 SQL 分析: {state.user_query[:50]}...", state)
         await self._sql_tool.run_workflow(state, context)
-        
-        if state.has_result:
-            self._observe(f"执行成功，返回 {state.execute_result.get('row_count', 0) if state.execute_result else 0} 行", state)
-        state.observe(f"[SQLAgent] 完成，{len(self._thoughts)} 步思考")
 
     def _map_task_type(self, task_name: str) -> str:
         """将任务名映射为任务类型"""
@@ -1207,12 +1067,24 @@ class SQLAgent(BaseAgent):
         if state:
             state.reflect(content)
     
-    def _act(self, action: str, content: str, result: str = "") -> None:
-        """记录行动"""
+    def _act(self, action: str, content: str, result: str = "", state: ReActState | None = None, tool: str = "") -> None:
+        """
+        记录行动
+        
+        Args:
+            action: 行动类型（如 "execute_sql", "call_llm"）
+            content: 行动描述
+            result: 执行结果（可选）
+            state: ReActState（可选，用于同步）
+            tool: 工具名称（可选）
+        """
         self._thoughts.append(SQLAgentThought(len(self._thoughts)+1, action, content, result))
         self._log.info(f"[ACT] {content}")
         if result:
             self._log.info(f"  → {result[:100]}...")
+        # 同步到 state
+        if state:
+            state.act(content, tool=tool or action)
 
     def get_thoughts_display(self) -> str:
         """获取思考过程的可读展示"""
@@ -1250,27 +1122,13 @@ async def handle_basic_task(
 ) -> None:
     """执行基础查询任务
     
-    ★ 架构改造：在 SQL 生成前调用口径设计器
-    
     根据 Intent 中的时间粒度提示 LLM 如何分组。
     LLM 会根据 column_profiles（列元信息）自行推理合适的分组列。
     """
     task_id = task.get("id", "basic")
-    task_desc = task.get("description", "")
-    
-    agent._step("1. 分析查询需求", state)
     
     # 注入指标定义
     agent._inject_metric_definition(state)
-    
-    # ★ 新增：调用口径设计器，智能划分筛选条件角色
-    agent._step("2. 设计数据口径", state)
-    plan = await agent._design_calibration(state, task_desc)
-    if plan:
-        agent._apply_calibration_plan(state, plan)
-        agent._observe(f"口径类型: {plan.calculation_type}, 推理: {plan.reasoning[:50]}...", state)
-    
-    agent._step("3. 生成并执行 SQL", state)
     
     # 构建任务上下文（LLM 根据 Intent 和 column_profiles 自行推理分组方式）
     context.current_task = agent._build_task_context(
@@ -1289,7 +1147,6 @@ async def handle_basic_task(
         result.stats["total_value"] = total
     
     state.temp_results[task_id].append(result.to_dict())
-    agent._observe(f"基础查询完成: {result.row_count} 行", state)
 
 
 @register_sql_task_handler(SQLTaskType.TREND)
@@ -1301,10 +1158,6 @@ async def handle_trend_task(
 ) -> None:
     """执行趋势分析任务"""
     task_id = task.get("id", "trend")
-    
-    agent._step("1. 确定时间维度（年）", state)
-    agent._step("2. 构造年度聚合 SQL", state)
-    agent._step("3. 执行并分析趋势", state)
     
     # 注入指标定义
     agent._inject_metric_definition(state)
@@ -1341,10 +1194,8 @@ async def handle_trend_task(
         
         if len(years) <= 1:
             result.issues.append("only_single_year")
-            agent._observe("⚠️ 只有单一年份数据，无法做多年度趋势分析", state)
     
     state.temp_results[task_id].append(result.to_dict())
-    agent._observe(f"趋势分析完成: {result.row_count} 个时间点", state)
 
 
 @register_sql_task_handler(SQLTaskType.SOURCE)
@@ -1357,8 +1208,6 @@ async def handle_source_task(
     """执行来源分析任务（按维度拆解）"""
     task_id = task.get("id", "source")
     
-    agent._step("1. 获取优先维度列表", state)
-    
     # 注入指标定义
     agent._inject_metric_definition(state)
     
@@ -1369,18 +1218,13 @@ async def handle_source_task(
     if not priority_dims:
         priority_dims = ["国内/海外", "投资公司标签", "产品大类"]
     
-    agent._step(f"2. 候选维度: {priority_dims[:3]}", state)
-    
     # 获取上游任务结果摘要
     parent_summary = agent._get_parent_results_summary(state, task)
     
     # 对每个维度尝试分析
     for dim in priority_dims[:3]:
         if dim in state.explored_dimensions:
-            agent._step(f"   维度 [{dim}] 已探索，跳过", state)
             continue
-        
-        agent._step(f"3. 分析维度: {dim}", state)
         
         # 构建任务上下文
         context.current_task = agent._build_task_context(
@@ -1426,13 +1270,10 @@ async def handle_source_task(
             result.issues.append("single_category")
         
         state.temp_results[task_id].append(result.to_dict())
-        agent._observe(f"维度 [{dim}] 分析完成: {result.row_count} 类别", state)
         
         # 如果有有效结果，可以停止
         if result.row_count > 1:
             break
-    
-    agent._reflect(f"来源分析完成，探索了 {len(state.explored_dimensions)} 个维度", state)
 
 
 @register_sql_task_handler(SQLTaskType.DRILLDOWN)
@@ -1445,20 +1286,14 @@ async def handle_drilldown_task(
     """执行下钻分析任务"""
     task_id = task.get("id", "drilldown")
     
-    agent._step("1. 获取上一步的 top 结果", state)
-    
     # 从 temp_results 获取上一步结果
     prev_results = agent._get_previous_results(state, exclude_task=task_id)
     parent_summary = agent._get_parent_results_summary(state, task)
     
     if not prev_results:
-        agent._observe("⚠️ 没有上一步结果，无法下钻", state)
         result = TaskResult(subtask="drilldown", issues=["no_previous_result"])
         state.temp_results[task_id].append(result.to_dict())
         return
-    
-    agent._step("2. 选择下钻目标", state)
-    agent._step("3. 执行下钻 SQL", state)
     
     # 注入指标定义
     agent._inject_metric_definition(state)
@@ -1485,7 +1320,6 @@ async def handle_drilldown_task(
             break
     
     state.temp_results[task_id].append(result.to_dict())
-    agent._observe(f"下钻分析完成: {result.row_count} 行", state)
 
 
 @register_sql_task_handler(SQLTaskType.COMPARISON)
@@ -1497,10 +1331,6 @@ async def handle_comparison_task(
 ) -> None:
     """执行对比分析任务"""
     task_id = task.get("id", "comparison")
-    
-    agent._step("1. 确定对比基准", state)
-    agent._step("2. 构造对比 SQL", state)
-    agent._step("3. 计算差异", state)
     
     # 注入指标定义
     agent._inject_metric_definition(state)
@@ -1531,7 +1361,6 @@ async def handle_comparison_task(
             result.stats["comparison_base"] = values[0]
     
     state.temp_results[task_id].append(result.to_dict())
-    agent._observe(f"对比分析完成: {result.row_count} 行", state)
 
 
 @register_sql_task_handler(SQLTaskType.SUMMARY)
@@ -1543,7 +1372,6 @@ async def handle_summary_task(
 ) -> None:
     """处理总结任务（由 Orchestrator 处理，此处仅记录）"""
     task_id = task.get("id", "summary")
-    agent._observe("总结任务，跳过 SQL 执行，由 Orchestrator 处理", state)
     
     # 记录一个空结果，标明此任务已处理
     result = TaskResult(subtask="summary", issues=["handled_by_orchestrator"])
@@ -1568,9 +1396,6 @@ async def handle_validation_task(
     """
     task_id = task.get("id", "validation")
     description = task.get("description", "")
-    
-    agent._think(f"执行诊断任务: {description}", state)
-    agent._step("1. 检查基础数据量", state)
     
     table_name = state.table_name
     
@@ -1619,7 +1444,6 @@ async def handle_validation_task(
     # 执行诊断查询
     results = []
     for diag in diagnostic_sqls:
-        agent._step(f"检查: {diag['desc']}", state)
         try:
             rows = await agent.db_connector.execute_query(diag["sql"])
             result = TaskResult(
@@ -1635,15 +1459,11 @@ async def handle_validation_task(
                 total = rows[0].get("cnt", 0)
                 if total == 0:
                     result.issues.append("table_empty")
-                    agent._observe("⚠️ 表为空！", state)
-                else:
-                    agent._observe(f"表总行数: {total}", state)
                 result.stats["total_rows"] = total
             elif diag["name"].startswith("values_"):
                 if rows:
                     distinct_values = [str(r.get(list(r.keys())[0], "")) for r in rows[:5]]
                     result.stats["distinct_values"] = distinct_values
-                    agent._observe(f"字段值示例: {distinct_values}", state)
                 else:
                     result.issues.append("no_values")
                     
@@ -1655,10 +1475,143 @@ async def handle_validation_task(
                 issues=[f"query_error: {str(e)[:100]}"],
             )
             results.append(result)
-            agent._observe(f"查询失败: {e}", state)
     
     # 汇总诊断结果
     for r in results:
         state.temp_results[task_id].append(r.to_dict())
+
+
+@register_sql_task_handler(SQLTaskType.RATIO)
+async def handle_ratio_task(
+    agent: SQLAgent,
+    state: ReActState,
+    context: AgentContext,
+    task: dict[str, Any],
+) -> None:
+    """
+    执行占比分析任务
     
-    agent._observe(f"诊断完成: 执行了 {len(results)} 个检查", state)
+    核心目标：计算"部分 / 总体"的比例
+    
+    SQL 模式：
+    ```sql
+    SELECT 
+        SUM(CASE WHEN 分子条件 THEN 金额 ELSE 0 END) as 分子,
+        SUM(金额) as 分母,
+        ROUND(分子/分母 * 100, 2) as 占比
+    FROM 表
+    WHERE 全局条件
+    ```
+    
+    关键点：
+    - 分子条件放 CASE WHEN（由 LLM 在生成 SQL 时智能识别）
+    - 全局条件放 WHERE
+    - 口径设计已合并到 generate_sql 的 prompt 中，无需单独步骤
+    """
+    task_id = task.get("id", "ratio")
+    
+    # 注入指标定义
+    agent._inject_metric_definition(state)
+    
+    # 构建任务上下文
+    context.current_task = agent._build_task_context(
+        task, SQLTaskType.RATIO, state,
+        intent_hint="计算占比，LLM 需智能判断：分子条件用 CASE WHEN，全局条件用 WHERE，输出占比百分比",
+    )
+    
+    # 执行 SQL
+    await agent._sql_tool.run_workflow(state, context)
+    
+    # 收集结果
+    result = agent._collect_result("ratio_analysis", state)
+    
+    # 统一 stats 字段（占比特有）
+    if result.examples:
+        # 尝试从结果中提取占比相关字段
+        for ex in result.examples:
+            for key, val in ex.items():
+                if "占比" in key or "ratio" in key.lower() or "percent" in key.lower():
+                    if isinstance(val, (int, float)):
+                        result.stats["ratio"] = val
+                        break
+                elif "分子" in key or "numerator" in key.lower():
+                    if isinstance(val, (int, float)):
+                        result.stats["numerator"] = val
+                elif "分母" in key or "denominator" in key.lower():
+                    if isinstance(val, (int, float)):
+                        result.stats["denominator"] = val
+    
+    state.temp_results[task_id].append(result.to_dict())
+
+
+@register_sql_task_handler(SQLTaskType.RANKING)
+async def handle_ranking_task(
+    agent: SQLAgent,
+    state: ReActState,
+    context: AgentContext,
+    task: dict[str, Any],
+) -> None:
+    """
+    执行排名分析任务
+    
+    核心目标：按指标排序，找出 TopN 或 BottomN
+    
+    SQL 模式：
+    ```sql
+    SELECT 维度列, SUM(指标) as 指标值
+    FROM 表
+    WHERE 条件
+    GROUP BY 维度列
+    ORDER BY 指标值 DESC
+    LIMIT N
+    ```
+    """
+    task_id = task.get("id", "ranking")
+    task_desc = task.get("description", "")
+    
+    # 注入指标定义
+    agent._inject_metric_definition(state)
+    
+    # 获取排名参数（从 Intent 中）
+    order_by = None
+    limit = 10  # 默认 Top10
+    
+    if state.intent:
+        order_by = getattr(state.intent, "order_by", None)
+        limit = getattr(state.intent, "limit", None) or 10
+    
+    direction = "DESC"
+    if order_by and isinstance(order_by, dict):
+        direction = order_by.get("direction", "DESC")
+    
+    # 构建任务上下文
+    context.current_task = agent._build_task_context(
+        task, SQLTaskType.RANKING, state,
+        intent_hint=f"按指标{'降序' if direction == 'DESC' else '升序'}排序，返回 Top{limit}，需要 GROUP BY 维度 ORDER BY 指标 {direction} LIMIT {limit}",
+        extra={"limit": limit, "order_direction": direction},
+    )
+    
+    # 执行 SQL
+    await agent._sql_tool.run_workflow(state, context)
+    
+    # 收集结果
+    result = agent._collect_result("ranking_analysis", state)
+    
+    # 统一 stats 字段（排名特有）
+    result.stats["limit"] = limit
+    result.stats["direction"] = direction
+    
+    if result.examples:
+        # 记录排名结果
+        result.stats["top_items"] = len(result.examples)
+        
+        # 找到数值列，记录最大/最小值
+        for ex in result.examples:
+            for key, val in ex.items():
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    if "top_value" not in result.stats:
+                        result.stats["top_value"] = val
+                    result.stats["bottom_value"] = val
+                    break
+    
+    state.temp_results[task_id].append(result.to_dict())

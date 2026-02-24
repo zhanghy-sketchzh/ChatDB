@@ -146,7 +146,6 @@ LIMIT {limit}
         from chatdb.core.react_state import ReActPhase, AnalysisPhase
         
         state.phase = ReActPhase.CRITIQUE
-        state.think("按维度拆解，探索分析")
         
         table = state.table_name
         if not table:

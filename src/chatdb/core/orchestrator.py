@@ -81,7 +81,7 @@ class AgentOrchestrator:
         
         if debug:
             set_log_level_to_debug()
-            enable_llm_debug(True, show_input=False)  # debug 默认只显示输出
+            enable_llm_debug(True, show_input=True)  # debug 显示完整输入输出
         
         # 初始化 ToolRegistry
         self.registry = ToolRegistry()
@@ -123,7 +123,7 @@ class AgentOrchestrator:
         try:
             # ============================================================
             # 1. [前置 workflow] 语义解析
-            # 不属于 Planner 调度，是必要的前置步骤
+            # 不属于 Planner 调度，是必要的前置步骤（不参与 ReAct 回放）
             # ============================================================
             orch_log.info("1. [前置] 语义解析...")
             await self._semantic_parse_tool(state, context)
@@ -140,12 +140,12 @@ class AgentOrchestrator:
                 orch_log.warn("语义解析未返回 Intent，继续执行")
             
             # ============================================================
-            # 1.5 检查是否为元查询（如模拟问题、解释结构等）
-            # 使用 is_meta_query() 方法判断
+            # 1.5 检查是否为非数据分析请求
+            # 使用 is_other_query() 方法判断
             # ============================================================
-            if state.intent and state.intent.is_meta_query():
-                orch_log.info("检测到元查询（mode=meta），直接生成响应...")
-                state = await self._handle_meta_query(state, context, orch_log)
+            if state.intent and state.intent.is_other_query():
+                orch_log.info("检测到非数据分析请求（mode=other），直接生成响应...")
+                state = await self._handle_other_query(state, context, orch_log)
                 if state.summary:
                     task_log.done(state.summary)
                 return self._build_result(state, query, start_time)
@@ -209,25 +209,15 @@ class AgentOrchestrator:
         1. 获取当前任务
         2. SQLAgent.run_task() 执行任务，结果写入 temp_results
         3. Planner.inspect_temp_results() 查看结果
-        4. Planner.decide_next_action() 决定下一步:
-           - continue: 继续下一任务
-           - adjust: 调整当前任务（重新执行）
-           - done: 结束，可能带有 conclusion
+        4. Planner.decide_next_action() 决定下一步
         5. 循环直到计划完成或达到最大步数
-        """
-        step_count = 0
-        max_plan_steps = 8  # 最多执行 8 个任务（包括动态插入的）
-        adjust_count = 0    # 调整次数限制
-        max_adjust = 2      # 同一任务最多调整 2 次
-        validation_count = 0  # validation 任务计数
-        max_validation = 2    # 最多执行 2 个 validation 任务
-        last_task_id = None   # 上一个任务 ID，用于检测死循环
-        same_task_count = 0   # 同一任务重复执行次数
         
-        while step_count < max_plan_steps:
-            step_count += 1
+        状态管理：所有执行状态由 ReActState.exec_meta 统一管理
+        """
+        while state.plan_step < state.max_plan_steps:
+            current_step = state.inc_plan_step()
             
-            # 获取当前任务
+            # 1. 获取当前任务
             current_task = self.planner.get_current_task(state.temp_results)
             if not current_task:
                 orch_log.info("没有更多任务")
@@ -237,34 +227,27 @@ class AgentOrchestrator:
             task_id = task_dict.get("id", "")
             task_type = task_dict.get("type", "")
             
-            # 死循环检测：同一任务重复执行
-            if task_id == last_task_id:
-                same_task_count += 1
-                if same_task_count >= 2:
-                    orch_log.warn(f"任务 {task_id} 重复执行 {same_task_count} 次，强制跳过")
-                    self.planner.advance_plan(state.temp_results)
-                    same_task_count = 0
-                    continue
-            else:
-                last_task_id = task_id
-                same_task_count = 0
+            # 2. 死循环检测：同一任务重复执行
+            if state.mark_task_repeat(task_id):
+                orch_log.warn(f"任务 {task_id} 重复执行，强制跳过")
+                self.planner.advance_plan(state.temp_results)
+                continue
             
-            # validation 任务数量限制
+            # 3. validation 任务数量限制
             if task_type == "validation":
-                validation_count += 1
-                if validation_count > max_validation:
-                    orch_log.warn(f"已执行 {validation_count-1} 个 validation 任务，跳过更多诊断")
+                if not state.bump_validation():
+                    orch_log.warn("validation 任务达到上限，跳过更多诊断")
                     self.planner.advance_plan(state.temp_results)
                     continue
             
-            orch_log.info(f"执行任务 {step_count}: [{task_type}] {task_dict['description'][:50]}...")
+            orch_log.info(f"执行任务 {current_step}: [{task_type}] {task_dict['description'][:50]}...")
             
-            # summary 任务由 Orchestrator 处理
+            # 4. summary 任务由 Orchestrator 处理（直接跳过）
             if task_type == "summary":
                 self.planner.advance_plan(state.temp_results)
                 continue
             
-            # SQLAgent 执行任务（结果写入 temp_results）
+            # 5. SQLAgent 执行任务（结果写入 temp_results）
             try:
                 await self._sql_agent.run_task(state, context, task_dict)
                 
@@ -278,42 +261,8 @@ class AgentOrchestrator:
                 
                 # 让 Planner 决定下一步
                 decision = await self.planner.decide_next_action(state, context)
-                action = decision.get("action", "done")
-                
-                if action == "done":
-                    reason = decision.get("reason", "")
-                    conclusion = decision.get("conclusion", "")
-                    orch_log.info(f"Planner 决定结束: {reason}")
-                    
-                    # 如果 Planner 给出了结论，直接使用
-                    if conclusion:
-                        orch_log.info(f"Planner 结论: {conclusion[:100]}...")
-                        state.summary = conclusion
-                    break
-                    
-                elif action == "adjust":
-                    adjust_count += 1
-                    reason = decision.get("reason", "")
-                    adjustment = decision.get("adjustment", {})
-                    
-                    orch_log.info(f"Planner 决定调整 ({adjust_count}/{max_adjust}): {reason}")
-                    
-                    if adjust_count >= max_adjust:
-                        orch_log.warn("达到最大调整次数，继续下一任务")
-                        adjust_count = 0
-                    else:
-                        # 应用调整策略
-                        self._apply_adjustment(state, context, adjustment, orch_log)
-                        
-                elif action == "retry":
-                    # 重试任务（不增加 step_count）
-                    retry_hint = decision.get("retry_hint", "")
-                    orch_log.info(f"重试任务，提示: {retry_hint}")
-                    step_count -= 1  # 不计入步数
-                    
-                else:
-                    # continue - 继续下一任务
-                    adjust_count = 0  # 重置调整计数
+                if await self._handle_planner_decision(state, context, decision, orch_log):
+                    break  # Planner 决定结束
                 
             except Exception as e:
                 orch_log.warn(f"任务执行失败: {e}")
@@ -323,6 +272,52 @@ class AgentOrchestrator:
         # 日志：最终 temp_results 状态
         if state.temp_results:
             orch_log.info(f"完成 {len(state.temp_results)} 个任务的数据收集")
+
+    async def _handle_planner_decision(
+        self,
+        state: ReActState,
+        context: AgentContext,
+        decision: dict[str, Any],
+        orch_log,
+    ) -> bool:
+        """
+        处理 Planner 的决策
+        
+        返回 True 表示结束整个计划执行；False 表示继续后续任务
+        """
+        action = decision.get("action", "done")
+        
+        if action == "done":
+            reason = decision.get("reason", "")
+            conclusion = decision.get("conclusion", "")
+            orch_log.info(f"Planner 决定结束: {reason}")
+            if conclusion:
+                orch_log.info(f"Planner 结论: {conclusion[:100]}...")
+                state.summary = conclusion
+            return True
+        
+        if action == "adjust":
+            if state.bump_adjust():
+                reason = decision.get("reason", "")
+                adjustment = decision.get("adjustment", {})
+                max_adjust = state.exec_meta["max_adjust"]
+                adjust_count = state.exec_meta["adjust_count"]
+                orch_log.info(f"Planner 决定调整 ({adjust_count}/{max_adjust}): {reason}")
+                self._apply_adjustment(state, context, adjustment, orch_log)
+            else:
+                orch_log.warn("达到最大调整次数，继续下一任务")
+                state.reset_adjust()
+            return False
+        
+        if action == "retry":
+            retry_hint = decision.get("retry_hint", "")
+            orch_log.info(f"重试任务，提示: {retry_hint}")
+            state.dec_plan_step()  # 不计入步数
+            return False
+        
+        # action == "continue" 或未知值：默认继续下一任务
+        state.reset_adjust()
+        return False
 
     def _apply_adjustment(
         self,
@@ -355,7 +350,6 @@ class AgentOrchestrator:
     async def _init_state(self, query: str) -> ReActState:
         """初始化 State"""
         state = ReActState(user_query=query, max_steps=self.max_steps)
-        state.think("开始处理查询")
         return state
     
     async def _init_context(self, query: str, state: ReActState) -> AgentContext:
@@ -373,7 +367,6 @@ class AgentOrchestrator:
         
         state.schema_text = schema_text
         state.table_name = select_best_table(query, tables_info)
-        state.think(f"选择表: {state.table_name}")
         
         return AgentContext(
             user_query=query,
@@ -382,21 +375,21 @@ class AgentOrchestrator:
             selected_tables=[state.table_name] if state.table_name else [],
         )
     
-    async def _handle_meta_query(self, state: ReActState, context: AgentContext, orch_log) -> ReActState:
+    async def _handle_other_query(self, state: ReActState, context: AgentContext, orch_log) -> ReActState:
         """
-        处理非数据分析请求（mode=meta）
+        处理非数据分析请求（mode=other）
         
         SemanticParser 已判断这不是数据分析请求，直接让 LLM 响应。
-        meta_request 字段包含了 SemanticParser 对用户意图的理解。
+        other_request 字段包含了 SemanticParser 对用户意图的理解。
         """
-        meta_request = state.intent.meta_request if state.intent else None
-        orch_log.info(f"非数据分析请求: {meta_request or context.user_query[:50]}...")
+        other_request = state.intent.other_request if state.intent else None
+        orch_log.info(f"非数据分析请求: {other_request or context.user_query[:50]}...")
         
         # 构建上下文：始终提供数据能力说明，让 LLM 知道自己能做什么
         data_context = self._build_data_context(context, state)
         
         prompt = f"""用户问题: {context.user_query}
-{f"用户意图: {meta_request}" if meta_request else ""}
+{f"用户意图: {other_request}" if other_request else ""}
 
 {data_context}
 

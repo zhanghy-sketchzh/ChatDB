@@ -14,7 +14,7 @@ async def main():
     from chatdb.llm.factory import LLMFactory
     
     csv_path = sys.argv[1] if len(sys.argv) > 1 else "data/excel/脚本测试数据.csv"
-    query = sys.argv[2] if len(sys.argv) > 2 else "手游在 IEG 总流水中的占比是多少"
+    query = sys.argv[2] if len(sys.argv) > 2 else "流水最高的5个产品占总流水的比例是多少？"
     yml_config = sys.argv[3] if len(sys.argv) > 3 else "data/yml/metrics_config.yml"
     
     async with CSVConnector(csv_path) as db:

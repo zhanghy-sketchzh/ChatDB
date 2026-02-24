@@ -610,8 +610,6 @@ class SQLTool:
         group_cols = [p for p in select_parts if "AS" not in p and "(" not in p]
         if group_cols:
             sql += f"\nGROUP BY {', '.join(group_cols)}"
-        if intent.limit:
-            sql += f"\nLIMIT {intent.limit}"
         return sql + ";"
 
     def _build_sql_hard_rules(self, required_where_clauses: str, has_task_description: bool = False) -> str:
@@ -739,10 +737,8 @@ class SQLTool:
         # 构建任务指令（通用：不绑定具体 pipeline 名称）
         task_instruction = ""
         
-        # ★ 架构改造：从 state 获取口径设计结果，不再用关键词判断
-        # numerator_filters 由 CalibrationDesigner 智能决定，存储在 state.numerator_filters
-        numerator_filters = getattr(state, "numerator_filters", []) if state else []
-        is_ratio_calculation = bool(numerator_filters)  # 有分子筛选就是占比计算
+        # 获取用户原始查询（用于 LLM 理解占比语义）
+        user_query = getattr(state, "user_query", "") if state else ""
         
         if current_task:
             task_type = current_task.get("task_type", current_task.get("type", ""))
@@ -793,60 +789,67 @@ class SQLTool:
             # 根据任务类型添加具体指导
             if task_type == "trend":
                 task_instruction += """
-### ⚠️ 趋势分析规则
-- **必须** 按时间维度（年/月）GROUP BY
-- 只生成 **1 个** 趋势 SQL，不要生成其他维度的 SQL
-- 结果应该按时间 **升序** 排序
-- 不要按其他维度分组
+### 趋势分析规则
+- 必须按时间维度（年/季/月/周/日）GROUP BY
+- 结果按时间**升序**排序（ORDER BY 时间列 ASC）
+- 只生成 1 个趋势 SQL
 """
             elif task_type == "source":
                 dim_hint = f"「{current_dim}」" if current_dim else "指定维度"
                 task_instruction += f"""
-### ⚠️ 来源分析规则
-- **必须** 按维度 {dim_hint} GROUP BY 分析来源构成
-- 只生成 **1 个** 按 {dim_hint} 分组的 SQL
-- **不要** 生成趋势或其他维度的 SQL
-- 按数值 **降序** 排序，便于看 top 贡献
+### 来源/构成分析规则
+- 必须按维度 {dim_hint} GROUP BY
+- 结果按数值**降序**排序（看 top 贡献）
+- 只生成 1 个按 {dim_hint} 分组的 SQL
 """
             elif task_type == "comparison":
                 task_instruction += """
-### ⚠️ 对比分析规则
-- 需要对比两个时间段或条件
-- 计算差值或增长率
-- 结果应包含对比基准和对比值
+### 对比分析规则
+- 需要对比两个时间段或两个条件
+- 计算差值或增长率：(当期 - 基期) / 基期 * 100
+- 结果应包含：基期值、当期值、变化值/增长率
 """
             elif task_type == "drilldown":
                 task_instruction += """
-### ⚠️ 下钻分析规则
+### 下钻分析规则
 - 在上一步结果基础上进一步细分
-- 增加筛选条件或更细粒度的维度
+- 增加更细粒度的维度或筛选条件
 - 保留上游的筛选条件
 """
-        
-        # ★★★ 占比计算规则（基于口径设计结果，非关键词判断）★★★
-        # 如果 CalibrationDesigner 识别出这是占比计算，会把分子筛选放入 state.numerator_filters
-        # SQLTool 只需要根据这个结构生成正确的 CASE WHEN
-        if is_ratio_calculation and numerator_filters:
-            task_instruction += f"""
-### 🎯 占比计算规则（由口径设计器确定）
-这是一个**占比计算**任务，需要特殊处理筛选条件：
+            elif task_type == "ratio":
+                task_instruction += f"""
+### 占比分析规则
 
-**分子筛选**（只影响分子，用 CASE WHEN 实现）：
-"""
-            for f in numerator_filters:
-                task_instruction += f"  - {f.get('label', f.get('id', ''))}: {f.get('expr', '')}\n"
-            
-            task_instruction += """
-**正确写法示例**：
+**用户问题**：{user_query}
+
+**标准写法**：分子条件放 CASE WHEN，全局筛选放 WHERE，分子条件**禁止**放 WHERE（否则分母被限制，占比恒为1）
 ```sql
-SELECT 
-  SUM(CASE WHEN <分子条件> THEN "金额" ELSE 0 END) * 1.0 
-  / SUM("金额") AS ratio
-FROM ...
-WHERE <全局筛选条件>  -- 分子筛选已通过 CASE WHEN 处理，不要重复放在这里！
+SELECT
+  SUM(CASE WHEN <分子条件> THEN "数值列" ELSE 0 END) AS 分子,
+  SUM("数值列") AS 分母,
+  ROUND(SUM(CASE WHEN <分子条件> THEN "数值列" ELSE 0 END) * 100.0 / SUM("数值列"), 2) AS 占比
+FROM 表名 WHERE <全局筛选>
 ```
 
-⚠️ **禁止**把分子筛选放入 WHERE 子句，否则分母也会被限制，导致占比恒等于 1！
+**TOP N 占比**：分子条件涉及聚合排序时，用 CTE 取 TOP N，再 CASE WHEN IN
+```sql
+WITH top_n AS (
+  SELECT "维度列" FROM 表名 WHERE <全局筛选>
+  GROUP BY "维度列" ORDER BY SUM("数值列") DESC LIMIT N
+)
+SELECT
+  SUM(CASE WHEN "维度列" IN (SELECT "维度列" FROM top_n) THEN "数值列" ELSE 0 END) AS 分子,
+  SUM("数值列") AS 分母,
+  ROUND(... * 100.0 / ..., 2) AS 占比
+FROM 表名 WHERE <全局筛选>
+```
+"""
+            elif task_type == "ranking":
+                task_instruction += """
+### 排名分析规则
+- 按指标 GROUP BY 维度后排序
+- 使用 ORDER BY 指标 DESC/ASC
+- 使用 LIMIT N 限制返回数量
 """
         
         if filters_info:
@@ -875,15 +878,11 @@ WHERE <全局筛选条件>  -- 分子筛选已通过 CASE WHEN 处理，不要�
 {columns_info}
 
 ## 结构化意图
-- intent_type: {intent.intent_type}
+- task_type: {intent.task_type}
 - metrics: {intent.metrics}
 - dimensions: {intent.dimensions}
 - filter_refs: {intent.filter_refs}
-- time: {json.dumps(intent.time, ensure_ascii=False)}
 - filters: {json.dumps(intent.filters, ensure_ascii=False)}
-- exclusions: {intent.exclusions}
-- order_by: {intent.order_by}
-- limit: {intent.limit}
 
 ## 指标定义（参考）
 {metrics_info}
@@ -1193,6 +1192,62 @@ WHERE <全局筛选条件>  -- 分子筛选已通过 CASE WHEN 处理，不要�
             self._log.error(f"生成 no_data 用户指导失败: {e}")
             return "当前条件下查不到任何数据，可能是数据尚未入库或筛选条件过于严格。"
 
+    def _format_result_for_observe(self, rows: list[dict]) -> str:
+        """
+        格式化查询结果用于 OBSERVE 展示
+        
+        示例输出：
+        total_gross: 550983403643.47
+        或
+        年份 | 流水
+        2023 | 100亿
+        2024 | 120亿
+        """
+        if not rows:
+            return "无结果"
+        
+        # 单行结果：直接展示 key: value
+        if len(rows) == 1:
+            row = rows[0]
+            parts = []
+            for k, v in row.items():
+                if isinstance(v, float):
+                    # 格式化数字，保留2位小数
+                    parts.append(f"{k}: {v:,.2f}")
+                elif isinstance(v, int):
+                    parts.append(f"{k}: {v:,}")
+                else:
+                    parts.append(f"{k}: {v}")
+            return " | ".join(parts)
+        
+        # 多行结果：表格形式，最多展示前5行
+        max_rows = 5
+        display_rows = rows[:max_rows]
+        
+        # 获取列名
+        columns = list(rows[0].keys())
+        
+        # 构建表格
+        lines = []
+        lines.append(" | ".join(columns))
+        
+        for row in display_rows:
+            values = []
+            for col in columns:
+                v = row.get(col, "")
+                if isinstance(v, float):
+                    values.append(f"{v:,.2f}")
+                elif isinstance(v, int):
+                    values.append(f"{v:,}")
+                else:
+                    values.append(str(v) if v is not None else "")
+            lines.append(" | ".join(values))
+        
+        if len(rows) > max_rows:
+            lines.append(f"... 共 {len(rows)} 行")
+        
+        return "\n".join(lines)
+
     async def _assess_answer_sufficiency(self, state: ReActState) -> None:
         rows = (state.execute_result or {}).get("rows", [])
         if not rows:
@@ -1333,7 +1388,6 @@ WHERE <全局筛选条件>  -- 分子筛选已通过 CASE WHEN 处理，不要�
 
     async def _critique(self, state: ReActState) -> None:
         state.phase = ReActPhase.CRITIQUE
-        state.think("开始评估 SQL 执行结果")
         sql = state.current_sql or state.final_sql
         if not sql:
             state.set_error("缺少 SQL", ErrorType.OTHER)
@@ -1346,7 +1400,6 @@ WHERE <全局筛选条件>  -- 分子筛选已通过 CASE WHEN 处理，不要�
             state.execute_result = {"rows": rows, "row_count": len(rows)}
             state.execution_error = None
             state.clear_error()
-            state.observe(f"执行成功: {len(rows)} 行")
             if len(rows) == 0:
                 state.set_error("查询返回空结果", ErrorType.NO_DATA)
                 state.mark_need(need_critique=True)
@@ -1355,7 +1408,6 @@ WHERE <全局筛选条件>  -- 分子筛选已通过 CASE WHEN 处理，不要�
                 await self._assess_answer_sufficiency(state)
         except Exception as e:
             state.execution_error = str(e)
-            state.observe(f"执行失败: {e}")
             error_type = self._classify_error(str(e))
             context = self._extract_error_context(str(e), error_type, state)
             state.set_error(str(e), error_type, context)
@@ -1363,7 +1415,6 @@ WHERE <全局筛选条件>  -- 分子筛选已通过 CASE WHEN 处理，不要�
 
     async def _refine_sql(self, state: ReActState) -> None:
         state.phase = ReActPhase.REFINE
-        state.think(f"根据错误类型 {state.error_type.value} 修正 SQL")
         eval_result = EvaluationResult(
             sql=state.current_sql,
             execution_error=state.execution_error or state.error,
@@ -1382,7 +1433,6 @@ WHERE <全局筛选条件>  -- 分子筛选已通过 CASE WHEN 处理，不要�
 
     async def _diagnose_no_data(self, state: ReActState) -> None:
         state.phase = ReActPhase.CRITIQUE
-        state.think("查询返回空结果，开始诊断原因")
         sql = state.current_sql or state.final_sql
         if not sql or not state.table_name:
             state.reflect("缺少 SQL 或表名，无法诊断")
@@ -1435,7 +1485,8 @@ WHERE <全局筛选条件>  -- 分子筛选已通过 CASE WHEN 处理，不要�
         if result.success:
             state.current_sql = result.data.get("sql", "")
             state.sql_candidates = result.data.get("candidates", [])
-            state.observe(f"SQL: {state.current_sql[:60]}...")
+            # ACT: 记录生成的 SQL
+            state.act(state.current_sql, tool="SQL")
             state.mark_need(need_sql=False, need_execute=True)
             if hasattr(context, "generated_sql"):
                 context.generated_sql = state.current_sql
@@ -1459,7 +1510,8 @@ WHERE <全局筛选条件>  -- 分子筛选已通过 CASE WHEN 处理，不要�
                 state.final_sql = sql
                 state.current_sql = sql
                 state.clear_error()
-                state.observe(f"执行成功: {len(rows)} 行")
+                # OBSERVE: 展示实际查询结果
+                state.observe(self._format_result_for_observe(rows))
                 if len(rows) == 0:
                     state.set_error("查询返回空结果", ErrorType.NO_DATA)
                     state.mark_need(need_critique=True)
@@ -1471,7 +1523,7 @@ WHERE <全局筛选条件>  -- 分子筛选已通过 CASE WHEN 处理，不要�
                     context.generated_sql = state.final_sql
             except Exception as e:
                 state.execution_error = str(e)
-                state.observe(f"执行失败: {e}")
+                state.observe(f"失败: {str(e)[:50]}")
                 error_type = self._classify_error(str(e))
                 ctx = self._extract_error_context(str(e), error_type, state)
                 state.set_error(str(e), error_type, ctx)
@@ -1491,11 +1543,90 @@ WHERE <全局筛选条件>  -- 分子筛选已通过 CASE WHEN 处理，不要�
             state.clear_all_needs()
 
     async def run_workflow(self, state: ReActState, context: Any) -> None:
-        """完整流程：生成 SQL 后执行与评估。供 Orchestrator 调用。"""
+        """
+        完整流程：生成 SQL → 执行 → 评估 → (失败时 critique → refine → 重新执行)
+        
+        ReAct 重试循环：
+        1. 生成 SQL
+        2. 执行 SQL
+        3. 执行失败 → critique → refine → 重新执行（最多 max_refine 次）
+        4. 执行成功 → 结束
+        """
+        max_refine = 3
+        
         await self.run_generate(state, context)
         if state.error:
             return
-        await self.run_execute_and_evaluate(state, context)
+        
+        for attempt in range(max_refine + 1):
+            # 执行 SQL
+            await self._execute_sql(state, context)
+            
+            # 执行成功，结束
+            if state.has_result:
+                return
+            
+            # 空结果，诊断后结束（不重试）
+            if state.error_type == ErrorType.NO_DATA:
+                if not state.error_context.get("no_data_diagnosis_done"):
+                    await self._diagnose_no_data(state)
+                    # 诊断后如果有修正 SQL，继续重试
+                    if state.current_sql and state.need_execute:
+                        state.execute_result = None
+                        state.execution_error = None
+                        continue
+                return
+            
+            # SQL 执行报错，尝试 refine（LLM 诊断错误并生成修正 SQL）
+            if state.execution_error and attempt < max_refine:
+                self._log.info(f"SQL 执行失败，尝试修正 (第 {attempt + 1}/{max_refine} 次)")
+                await self._refine_sql(state)
+                if state.current_sql and state.need_execute:
+                    # refine 产生了新 SQL，记录 ACT，清除旧执行结果，继续循环
+                    state.act(state.current_sql, tool="SQL")
+                    state.execute_result = None
+                    state.execution_error = None
+                    continue
+                # 无法修正，结束
+                self._log.warn("SQL 无法修正，停止重试")
+                return
+            
+            # 其他错误或超过最大重试，结束
+            return
+    
+    async def _execute_sql(self, state: ReActState, context: Any) -> None:
+        """执行 SQL 并记录结果（不含 critique/refine 逻辑）"""
+        if not self.db_connector:
+            state.set_error("未配置数据库连接", ErrorType.OTHER)
+            return
+        state.phase = ReActPhase.EXECUTE
+        sql = state.current_sql
+        if not sql:
+            state.set_error("缺少 SQL", ErrorType.OTHER)
+            return
+        try:
+            rows = await self.db_connector.execute_query(sql)
+            state.execute_result = {"rows": rows, "row_count": len(rows)}
+            state.final_sql = sql
+            state.current_sql = sql
+            state.clear_error()
+            # OBSERVE: 展示实际查询结果
+            state.observe(self._format_result_for_observe(rows))
+            if len(rows) == 0:
+                state.set_error("查询返回空结果", ErrorType.NO_DATA)
+            else:
+                state.clear_all_needs()
+            if hasattr(context, "query_result"):
+                context.query_result = rows
+            if hasattr(context, "generated_sql"):
+                context.generated_sql = state.final_sql
+        except Exception as e:
+            state.execution_error = str(e)
+            state.observe(f"失败: {str(e)[:80]}")
+            error_type = self._classify_error(str(e))
+            ctx = self._extract_error_context(str(e), error_type, state)
+            state.set_error(str(e), error_type, ctx)
+            state.refine_attempts += 1
 
 
 # ---------- 薄包装（供 Registry 注册，构造签名不变） ----------
@@ -1629,7 +1760,6 @@ class GenerateSQLTool(BaseTool):
         if result.success:
             state.current_sql = result.data.get("sql", "")
             state.sql_candidates = result.data.get("candidates", [])
-            state.observe(f"SQL: {state.current_sql[:60]}...")
             state.mark_need(need_sql=False, need_execute=True)
             context.generated_sql = state.current_sql
         else:
@@ -1704,7 +1834,6 @@ class ExecuteAndEvaluateTool(BaseTool):
             state.final_sql = result.data.get("sql", sql)
             state.current_sql = state.final_sql
             state.clear_error()
-            state.observe(f"执行成功: {len(rows)} 行")
             if len(rows) == 0:
                 state.set_error("查询返回空结果", ErrorType.NO_DATA)
                 state.mark_need(need_critique=True)
@@ -1717,7 +1846,6 @@ class ExecuteAndEvaluateTool(BaseTool):
             error_type = error_type_from_str(result.data.get("error_type", "other"))
             state.execution_error = error
             state.set_error(error, error_type)
-            state.observe(f"执行失败: {error}")
             state.mark_need(need_execute=False, need_critique=True)
             if result.data.get("refined") and result.data.get("sql") != sql:
                 state.current_sql = result.data.get("sql")
@@ -1825,7 +1953,6 @@ class SQLWorkflowTool(BaseTool):
             rows = d.get("rows", [])
             state.execute_result = {"rows": rows, "row_count": d.get("row_count", 0)}
             state.clear_error()
-            state.observe(f"执行成功: {len(rows)} 行")
             if len(rows) == 0:
                 state.set_error("查询返回空结果", ErrorType.NO_DATA)
                 state.mark_need(need_critique=True)
@@ -1836,6 +1963,5 @@ class SQLWorkflowTool(BaseTool):
         else:
             state.execution_error = d.get("error", "执行失败")
             state.set_error(state.execution_error, error_type_from_str(d.get("error_type", "other")))
-            state.observe(f"执行失败: {state.execution_error}")
             state.mark_need(need_execute=False, need_critique=True)
         state.mark_need(need_sql=False)

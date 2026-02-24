@@ -224,17 +224,30 @@ class ReActState:
     current_metric_def: dict[str, Any] = field(default_factory=dict)  # 指标定义（含 agg, filter_refs）
     required_filters: list[dict[str, Any]] = field(default_factory=list)  # 必须包含的 WHERE 筛选条件
     
-    # ===== 口径设计（CalibrationDesigner -> SQLTool）=====
-    calibration_plan: Any = None             # CalibrationPlan 对象
-    numerator_filters: list[dict[str, Any]] = field(default_factory=list)  # 分子专用筛选（CASE WHEN）
-    sql_pattern: str = ""                    # SQL 模式建议（case_when_ratio / simple_agg）
+    # ===== 口径设计（已合并到 SQLTool generate_sql prompt）=====
+    calibration_plan: Any = None             # 保留字段（兼容）
+    numerator_filters: list[dict[str, Any]] = field(default_factory=list)  # 保留字段（兼容）
+    sql_pattern: str = ""                    # SQL 模式建议（保留字段）
     sql_hint: str = ""                       # LLM 给 SQL 生成的额外建议
 
     # ===== 思考/反思日志 =====
-    thoughts: list[str] = field(default_factory=list)        # 思考日志
-    observations: list[str] = field(default_factory=list)    # 观察日志
-    reflections: list[str] = field(default_factory=list)     # 反思日志
+    thoughts: list[str] = field(default_factory=list)        # 思考日志（THINK）
+    actions: list[str] = field(default_factory=list)         # 行动日志（ACT）
+    observations: list[str] = field(default_factory=list)    # 观察日志（OBSERVE）
+    reflections: list[str] = field(default_factory=list)     # 反思日志（REFLECT）
     tool_log: list[dict[str, Any]] = field(default_factory=list)
+    
+    # ===== 执行状态元信息（Orchestrator 使用）=====
+    exec_meta: dict[str, Any] = field(default_factory=lambda: {
+        "plan_step": 0,
+        "max_plan_steps": 8,
+        "adjust_count": 0,
+        "max_adjust": 2,
+        "validation_count": 0,
+        "max_validation": 2,
+        "last_task_id": None,
+        "same_task_count": 0,
+    })
     
     # ===== 方法 =====
     
@@ -243,28 +256,72 @@ class ReActState:
         return get_component_logger("ReAct")
     
     def think(self, thought: str) -> None:
-        """记录思考"""
+        """
+        记录思考（推理/分析/决策）
+        
+        用途：
+        - 分析用户意图
+        - 选择下一步行动
+        - 推理业务逻辑
+        """
         self.thoughts.append(f"[Step {self.step}] THINK: {thought}")
         self._get_logger().think(f"(Step {self.step}) {thought}")
     
+    def act(self, action: str, tool: str = "", params: dict[str, Any] | None = None) -> None:
+        """
+        记录行动（执行的 SQL）
+        
+        Args:
+            action: SQL 语句或行动描述
+            tool: 工具名称（可选，用于内部记录）
+            params: 工具参数（可选）
+        
+        用途：
+        - 记录执行的 SQL
+        """
+        self.actions.append(f"[Step {self.step}] ACT: {action}")
+        self._get_logger().act(action)
+        
+        # 同时记录到 tool_log（保持兼容）
+        if tool:
+            self.tool_log.append({
+                "step": self.step,
+                "action": action,
+                "tool": tool,
+                "params": params,
+            })
+    
     def observe(self, observation: str) -> None:
-        """记录观察"""
+        """
+        记录观察（工具返回结果/执行结果）
+        
+        用途：
+        - 工具返回结果
+        - SQL 执行结果
+        - LLM 响应摘要
+        """
         self.observations.append(f"[Step {self.step}] OBSERVE: {observation}")
         self._get_logger().observe(f"(Step {self.step}) {observation}")
     
     def reflect(self, reflection: str) -> None:
-        """记录反思"""
+        """
+        记录反思（错误分析/策略调整）
+        
+        用途：
+        - 分析失败原因
+        - 调整策略
+        - 总结经验
+        """
         self.reflections.append(f"[Step {self.step}] REFLECT: {reflection}")
         self._get_logger().reflect(f"(Step {self.step}) {reflection}")
     
-    def act(self, action: str, result: dict[str, Any] | None = None) -> None:
-        """记录行动"""
-        self.tool_log.append({
-            "step": self.step,
-            "action": action,
-            "result": result,
-        })
-        self._get_logger().act(action)
+    def next_step(self) -> None:
+        """
+        进入下一个 ReAct 循环步骤
+        
+        每完成一轮 THINK → ACT → OBSERVE 后调用
+        """
+        self.step += 1
     
     # ===== 兼容旧版方法 =====
     
@@ -365,11 +422,13 @@ class ReActState:
             "plan_display": self.get_plan_display(),
             "reasoning_trace": self.get_reasoning_trace(),
             "thoughts": self.thoughts,
+            "actions": self.actions,
             "observations": self.observations,
             "reflections": self.reflections,
             "tool_log": self.tool_log,
             "flags": self.flags,
             "refine_attempts": self.refine_attempts,
+            "exec_meta": self.exec_meta,
         }
 
     def get_plan_display(self) -> str:
@@ -391,6 +450,61 @@ class ReActState:
         if 0 <= self.plan_index < len(self.plan):
             return self.plan[self.plan_index]
         return None
+    
+    def get_current_task(self) -> dict[str, Any] | None:
+        """别名：获取当前任务（与 Planner 接口对齐）"""
+        return self.get_current_plan_step()
+
+    # ===== exec_meta helpers（Orchestrator 执行状态管理）=====
+    
+    def inc_plan_step(self) -> int:
+        """增加计划步数，返回当前步数"""
+        self.exec_meta["plan_step"] += 1
+        return self.exec_meta["plan_step"]
+    
+    @property
+    def plan_step(self) -> int:
+        """当前计划步数"""
+        return self.exec_meta["plan_step"]
+    
+    @property
+    def max_plan_steps(self) -> int:
+        """最大计划步数"""
+        return self.exec_meta["max_plan_steps"]
+    
+    def bump_validation(self) -> bool:
+        """
+        validation 计数 +1，返回是否还能继续做 validation
+        """
+        self.exec_meta["validation_count"] += 1
+        return self.exec_meta["validation_count"] <= self.exec_meta["max_validation"]
+    
+    def mark_task_repeat(self, task_id: str) -> bool:
+        """
+        记录 task 是否重复执行。返回 True 表示达到重复上限，应强制跳过
+        """
+        if task_id == self.exec_meta["last_task_id"]:
+            self.exec_meta["same_task_count"] += 1
+        else:
+            self.exec_meta["last_task_id"] = task_id
+            self.exec_meta["same_task_count"] = 0
+        return self.exec_meta["same_task_count"] >= 2
+    
+    def reset_adjust(self) -> None:
+        """重置调整计数"""
+        self.exec_meta["adjust_count"] = 0
+    
+    def bump_adjust(self) -> bool:
+        """
+        调整计数 +1，返回是否还允许继续调整
+        """
+        self.exec_meta["adjust_count"] += 1
+        return self.exec_meta["adjust_count"] <= self.exec_meta["max_adjust"]
+    
+    def dec_plan_step(self) -> None:
+        """减少计划步数（用于 retry 场景）"""
+        if self.exec_meta["plan_step"] > 0:
+            self.exec_meta["plan_step"] -= 1
 
     def advance_plan(self) -> None:
         """将计划推进到下一步"""
@@ -418,23 +532,30 @@ class ReActState:
 
     def get_reasoning_trace(self) -> str:
         """
-        将 THINK/OBSERVE/REFLECT 按步数合并为一段「ReAct 过程回放」
+        将 THINK/ACT/OBSERVE/REFLECT 按步数合并为「ReAct 过程回放」
         
-        格式优化：按步骤分组展示，THINK → OBSERVE → REFLECT 形成完整思考链
+        格式：按步骤分组展示，THINK → ACT → OBSERVE → REFLECT 形成完整思考链
         """
         entries: list[tuple[int, str, str]] = []  # (step, kind, msg)
         
-        # 定义排序优先级：THINK → OBSERVE → REFLECT
-        kind_order = {"THINK": 0, "OBSERVE": 1, "REFLECT": 2}
+        # 定义排序优先级：THINK → ACT → OBSERVE → REFLECT
+        kind_order = {"THINK": 0, "ACT": 1, "OBSERVE": 2, "REFLECT": 3}
         
         for s in self.thoughts:
             m = re.match(r"\[Step (\d+)\] THINK: (.+)", s, re.DOTALL)
             if m:
                 entries.append((int(m.group(1)), "THINK", m.group(2).strip()))
+        
+        for s in self.actions:
+            m = re.match(r"\[Step (\d+)\] ACT: (.+)", s, re.DOTALL)
+            if m:
+                entries.append((int(m.group(1)), "ACT", m.group(2).strip()))
+        
         for s in self.observations:
             m = re.match(r"\[Step (\d+)\] OBSERVE: (.+)", s, re.DOTALL)
             if m:
                 entries.append((int(m.group(1)), "OBSERVE", m.group(2).strip()))
+        
         for s in self.reflections:
             m = re.match(r"\[Step (\d+)\] REFLECT: (.+)", s, re.DOTALL)
             if m:
@@ -456,7 +577,7 @@ class ReActState:
                 lines.append(f"\n[Step {step}]")
             
             # 根据类型添加前缀符号
-            prefix = {"THINK": "💭", "OBSERVE": "👁️", "REFLECT": "🔄"}.get(kind, "•")
+            prefix = {"THINK": "💭", "ACT": "⚡", "OBSERVE": "👁️", "REFLECT": "🔄"}.get(kind, "•")
             lines.append(f"  {prefix} {kind}: {msg}")
         
         return "\n".join(lines)

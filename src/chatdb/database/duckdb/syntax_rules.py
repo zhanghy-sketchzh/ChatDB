@@ -24,6 +24,7 @@ DUCKDB_CTE_NUMERIC_LIMIT = """
 - CTE/表别名用英文或拼音；同一 SELECT 不能引用本层别名；禁止 SELECT 中多行子查询，用 JOIN 或窗口函数
 - 数值：ROUND(column, 2)；除零用 NULLIF；比例：ROUND(SUM(CASE WHEN cond THEN 1 ELSE 0 END)*100.0/COUNT(*), 2)
 - 仅当用户要求「前N条」等时加 LIMIT
+- **聚合子查询必须 GROUP BY**：若子查询中使用 ORDER BY SUM(...)/COUNT(*) 等聚合排序，必须对 SELECT 的非聚合列加 GROUP BY
 
 ### 日期函数类型限制（重要！）
 - QUARTER()/MONTH()/YEAR() 等日期函数**只接受 DATE/TIMESTAMP 类型**，不接受 BIGINT/INTEGER

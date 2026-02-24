@@ -314,8 +314,8 @@ debug_on: bool = False
 debug_level: Literal[1, 2] = 1
 
 # LLM Debug 模式控制
-llm_debug_on: bool = False
-llm_debug_show_input: bool = False  # 是否显示 LLM 输入（prompt）
+llm_debug_on: bool = True  # 默认开启 LLM Debug
+llm_debug_show_input: bool = True  # 默认显示 LLM 输入（prompt）
 
 # ============================================================
 # 三层日志系统
