@@ -159,6 +159,7 @@ class ReActState:
     table_name: str | None = None
     schema_text: str = ""
     available_columns: list[dict[str, Any]] = field(default_factory=list)
+    available_tables: list[dict[str, Any]] = field(default_factory=list)  # 表元数据列表
     
     # ===== 语义解析 =====
     intent: Any = None                     # StructuredIntent
@@ -179,6 +180,10 @@ class ReActState:
     
     # ===== 输出 =====
     summary: str = ""
+    
+    # ===== 任务 & 上下文（原 AgentContext 独有，迁移至此消除双写） =====
+    current_task: dict[str, Any] | None = None   # 当前执行的 Planner 任务
+    extra_context: str = ""                       # 调整策略等额外上下文
     
     # ===== 状态控制 =====
     phase: ReActPhase = ReActPhase.INIT
@@ -206,16 +211,27 @@ class ReActState:
     # - missing_time_dimension: True  (没有时间列)
     # - accept_no_time_filter: False  (是否接受无时间条件)
     
-    # ===== 显式任务计划（ToDoList）=====
-    plan: list[dict[str, Any]] = field(default_factory=list)  # [{"step", "action", "goal", "status"}, ...]
-    plan_index: int = 0                    # 当前执行到计划的第几步（从 0 开始）
+    # ===== 显式任务计划（已迁移到 PlannerAgent._analysis_plan + 文件持久化）=====
+    # 旧版 plan/plan_index 已废弃，保留字段仅为 debug 输出兼容
+    # 实际计划管理由 PlannerAgent._analysis_plan（DAG 拓扑）驱动
+    # 跨轮次持久化由 ScratchPadManager.save_plan/load_plan 实现
+    plan: list[dict[str, Any]] = field(default_factory=list)
+    plan_index: int = 0
+    
+    # ===== 持久化计划引用（Plan Persistence）=====
+    # Orchestrator 在恢复/创建计划时设置，用于 debug 和上下文注入
+    persistent_plan_path: str = ""              # scratch/{session_id}/plan.json 路径
+    plan_resumed: bool = False                  # 是否从持久化计划恢复（而非重新生成）
     
     # ===== 分析型任务：结构化中间结果 =====
     need_more_analysis: bool = False       # LLM 评估：当前结果尚不足以完整回答用户问题
     analysis_slices: list[AnalysisSlice] = field(default_factory=list)  # 结构化分析切片
     explored_dimensions: set[str] = field(default_factory=set)  # 已探索过的维度（用于 Planner 决策）
     
-    # ===== temp_results: Planner <-> SQL Agent 共享记忆 =====
+    # ===== temp_results: 向后兼容字段 =====
+    # Orchestrator 在 _execute_plan 中通过消息对象协调 Agent 通信后，
+    # 会将 collected_results 同步到此字段，供 _generate_summary 等尚未迁移的消费者使用。
+    # 新代码应通过 TaskRequest/TaskResponse 消息对象传递数据，不直接读写此字段。
     # 结构: {task_id: [{"subtask", "sql", "row_count", "examples", "stats", "issues"}, ...]}
     temp_results: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
@@ -420,6 +436,8 @@ class ReActState:
         return {
             "plan": self.plan,
             "plan_display": self.get_plan_display(),
+            "plan_resumed": self.plan_resumed,
+            "persistent_plan_path": self.persistent_plan_path,
             "reasoning_trace": self.get_reasoning_trace(),
             "thoughts": self.thoughts,
             "actions": self.actions,

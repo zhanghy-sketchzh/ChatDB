@@ -111,6 +111,7 @@ class SemanticParseTool(BaseTool):
         schema_text: str = "",
         table_name: str = "",
         available_tables: list[dict] | None = None,
+        chat_history: list[dict[str, str]] | None = None,
         **kwargs: Any,
     ) -> ToolResult:
         """执行语义解析"""
@@ -119,13 +120,15 @@ class SemanticParseTool(BaseTool):
         try:
             from chatdb.agents.base import AgentContext
             
-            # 构建 context
+            # 构建 context（AgentContext 精简后不含 available_tables/selected_tables，
+            # 通过动态属性传递给 SemanticParser，其内部用 getattr 安全读取）
             context = AgentContext(
                 user_query=user_query,
                 schema_text=schema_text,
-                available_tables=available_tables or [],
-                selected_tables=[table_name] if table_name else [],
+                chat_history=chat_history or [],
             )
+            context.available_tables = available_tables or []  # type: ignore[attr-defined]
+            context.selected_tables = [table_name] if table_name else []  # type: ignore[attr-defined]
             
             # 调用 parser agent
             parser = self._get_parser()
@@ -159,26 +162,23 @@ class SemanticParseTool(BaseTool):
         state.phase = ReActPhase.SEMANTIC_PARSE
         
         result = await self.execute(
-            user_query=context.user_query,
-            schema_text=context.schema_text,
+            user_query=state.user_query,
+            schema_text=state.schema_text,
             table_name=state.table_name or "",
-            available_tables=context.available_tables,
+            available_tables=state.available_tables,
+            chat_history=context.chat_history or None,
         )
         
         if result.success:
-            # 更新 state
+            # 更新 state（唯一权威源，不再同步到 context）
             from chatdb.agents.semantic_parser import StructuredIntent
             intent_dict = result.data.get("intent", {})
             if isinstance(intent_dict, dict):
-                state.intent = StructuredIntent.from_dict(intent_dict, context.user_query)
+                state.intent = StructuredIntent.from_dict(intent_dict, state.user_query)
             else:
                 state.intent = intent_dict
             
             state.yml_config = result.data.get("yml_config", {})
             state.mark_need(need_intent=False, need_sql=True)
-            
-            # 同步到 context
-            context.query_intent = state.intent
-            context.yml_config = state.yml_config
         else:
             state.set_error(result.error or "语义解析失败", ErrorType.AMBIGUOUS_INTENT)

@@ -50,6 +50,44 @@ class ToolParameter:
 
 
 @dataclass
+class SubToolDef:
+    """子工具定义 -- LLM 可独立调用的原子指令"""
+    name: str
+    description: str
+    parameters: list["ToolParameter"] = field(default_factory=list)
+
+    def to_function_schema(self) -> dict[str, Any]:
+        properties = {}
+        required = []
+        for p in self.parameters:
+            properties[p.name] = p.to_schema()
+            if p.required:
+                required.append(p.name)
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            },
+        }
+
+    def to_prompt_text(self) -> str:
+        lines = [f"#### {self.name}", f"{self.description}"]
+        if self.parameters:
+            lines.append("参数：")
+            for p in self.parameters:
+                opt = "" if p.required else "（可选）"
+                enum_hint = f"，可选值: {p.enum}" if p.enum else ""
+                lines.append(f"  - `{p.name}` ({p.type}): {p.description}{opt}{enum_hint}")
+        return "\n".join(lines)
+
+
+@dataclass
 class ToolMetadata:
     """
     工具元数据 - 完整的工具"说明书"
@@ -321,7 +359,39 @@ class BaseTool(ABC):
     def get_prompt_description(self, include_subtools: bool = False) -> str:
         """获取供 LLM 使用的描述文本"""
         return self.metadata.to_prompt_text(include_subtools)
-    
+
+    # ============================================================
+    # 子工具（LLM 可选指令集）
+    # ============================================================
+
+    @property
+    def subtool_defs(self) -> list[SubToolDef]:
+        """子工具定义列表，子类覆写以声明 LLM 可调用的原子指令"""
+        return []
+
+    def get_subtool_schemas(self) -> list[dict[str, Any]]:
+        """生成所有子工具的 Function Calling Schema"""
+        return [d.to_function_schema() for d in self.subtool_defs]
+
+    def get_tool_instructions(self) -> str:
+        """生成 LLM 可读的工具使用说明（含所有子工具）"""
+        defs = self.subtool_defs
+        if not defs:
+            return self.get_prompt_description(include_subtools=True)
+        lines = [f"## {self.name}", self.description, ""]
+        lines.append("### 可用指令\n")
+        for d in defs:
+            lines.append(d.to_prompt_text())
+            lines.append("")
+        return "\n".join(lines)
+
+    async def invoke(self, subtool_name: str, **kwargs: Any) -> ToolResult:
+        """按子工具名称调用，默认映射到 execute(action=subtool_name, ...)"""
+        valid_names = {d.name for d in self.subtool_defs}
+        if valid_names and subtool_name not in valid_names:
+            return ToolResult.fail(f"未知指令: {subtool_name}，可用: {valid_names}")
+        return await self.execute(action=subtool_name, **kwargs)
+
     def __repr__(self) -> str:
         return f"<Tool: {self.name}>"
 

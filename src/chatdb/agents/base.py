@@ -42,12 +42,12 @@ class AgentStatus(str, Enum):
 
 @dataclass
 class AgentContext:
-    """智能体上下文 - 在智能体之间传递的共享数据"""
+    """智能体上下文 - 精简版，仅保留 ReActState 中没有的字段"""
 
-    # 用户原始查询
+    # 用户原始查询（API 兼容层需要，ReAct 流程中以 state.user_query 为准）
     user_query: str
 
-    # 数据库 Schema 信息
+    # Schema 信息（API 兼容层需要）
     schema_text: str = ""
 
     # 历史对话上下文（滑动窗口管理）- 兼容旧版
@@ -56,39 +56,8 @@ class AgentContext:
     # 会话 ID（用于历史管理）
     session_id: str | None = None
 
-    # 表选择结果
-    available_tables: list[dict[str, Any]] = field(default_factory=list)
-    selected_tables: list[str] = field(default_factory=list)
-    selection_reason: str = ""
-
-    # 结构化意图（SemanticParser 输出）
-    query_intent: Any = None  # StructuredIntent
-    
-    # YAML 配置（业务口径）
-    yml_config: dict[str, Any] = field(default_factory=dict)
-    
-    # 当前正在执行的任务（Planner → SQLAgent）
-    current_task: dict[str, Any] | None = None
-
-    # 生成的 SQL
+    # 生成的 SQL（API 兼容层读取）
     generated_sql: str = ""
-
-    # SQL 验证结果
-    is_sql_valid: bool = False
-    sql_validation_message: str = ""
-
-    # 查询结果
-    query_result: list[dict[str, Any]] = field(default_factory=list)
-    query_error: str = ""
-
-    # 结果总结
-    summary: str = ""
-
-    # 额外上下文（用于总结等）
-    extra_context: str = ""
-
-    # 元数据
-    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

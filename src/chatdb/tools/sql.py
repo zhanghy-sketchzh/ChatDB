@@ -612,38 +612,73 @@ class SQLTool:
             sql += f"\nGROUP BY {', '.join(group_cols)}"
         return sql + ";"
 
-    def _build_sql_hard_rules(self, required_where_clauses: str, has_task_description: bool = False) -> str:
-        """
-        拼装 SQL 生成的硬约束列表（通用表述，不写死业务列名/值）。
-        
-        核心设计原则：
-        - 数据筛选由语义解析器和 Planner 确定，已在 "required_where_clauses" 中给出
-        - SQL 生成器只负责技术实现，不推断业务逻辑
-        - 任务描述（description）只描述分析动作，不包含筛选语义
-        """
+    def _build_sql_hard_rules(self, has_required_where: bool = False, has_task_description: bool = False) -> str:
+        """SQL 生成的技术约束，根据上下文动态调整规则。"""
         rules = [
-            '**列名必须从"表结构"中选择，不能发明不存在的列！**',
+            '**列名必须从"表结构"中选择，不能发明不存在的列**',
             '使用双引号包裹列名：SELECT "列名1", "列名2"',
             '字符串值使用单引号：WHERE "列名" = \'值\'',
             '**只生成 1 个 SQL，必须与当前任务类型匹配**',
             '**若上文指定了指标聚合表达式，SELECT 中必须使用该表达式**',
         ]
-        
-        if required_where_clauses.strip():
+        if has_required_where:
             rules.append(
-                '**WHERE 条件已确定**：上文"必须包含的 WHERE 条件"是数据约束的**完整定义**，直接使用，可追加 AND，不可删改'
+                '**WHERE 条件已确定**：上文"建议 WHERE 条件"是数据约束的完整定义，直接使用，可追加 AND，不可删改'
             )
             rules.append(
-                '**禁止推断额外筛选**：任务描述（description）只描述分析动作，不包含筛选逻辑。不要根据描述中的词汇添加额外 WHERE 条件'
+                '**禁止推断额外筛选**：任务描述只描述分析动作，不包含筛选逻辑。不要根据描述中的词汇添加额外 WHERE 条件'
             )
-        
         if has_task_description:
             rules.append(
-                '**任务描述解读**：description 中的词汇（如"市场费""今年"）是上下文说明，其对应的筛选条件已在"必须包含的 WHERE 条件"中，不要重复添加'
+                '**任务描述解读**：description 中的词汇（如"市场费""今年"）是上下文说明，其对应的筛选条件已在"建议 WHERE 条件"中，不要重复添加'
             )
-        
         rules.append("只输出 JSON，不要其他文字")
         return "\n".join(f"{i}. {r}" for i, r in enumerate(rules, 1))
+
+    def _collect_relevant_columns(
+        self,
+        intent: Any,
+        yml_config: dict[str, Any],
+        state: Any,
+    ) -> set[str]:
+        """收集 intent 涉及的所有真实列名，用于筛选 table schema。"""
+        cols: set[str] = set()
+        dims_config = yml_config.get("dimensions", {})
+        metrics_config = yml_config.get("metrics", {})
+
+        # 维度 → 列名
+        for did in (intent.dimensions or []):
+            if did in dims_config:
+                cols.add(dims_config[did].get("column", did))
+
+        # 指标 agg 中引用的列
+        for mid in (intent.metrics or []):
+            m = metrics_config.get(mid, {})
+            agg = m.get("agg", "")
+            for match in re.findall(r'"([^"]+)"', agg):
+                cols.add(match)
+
+        # conditions 中引用的列
+        for c in (intent.conditions or []):
+            col_id = c.get("column", "")
+            if col_id in dims_config:
+                cols.add(dims_config[col_id].get("column", col_id))
+            elif col_id:
+                cols.add(col_id)
+
+        # required_filters 中引用的列
+        if state and getattr(state, "required_filters", None):
+            for f in state.required_filters:
+                for match in re.findall(r'"([^"]+)"', f.get("expr", "")):
+                    cols.add(match)
+
+        # current_metric_def 中的列
+        if state and getattr(state, "current_metric_def", None):
+            agg = state.current_metric_def.get("agg", "")
+            for match in re.findall(r'"([^"]+)"', agg):
+                cols.add(match)
+
+        return cols
 
     def _build_generation_prompt(
         self,
@@ -652,251 +687,90 @@ class SQLTool:
         schema_text: str | None,
         table_schema: dict[str, Any] | None,
         current_task: dict[str, Any] | None = None,
-        state: Any = None,  # ReActState，用于获取注入的指标定义
+        state: Any = None,
     ) -> str:
-        columns_info = "无列信息"
+        # ── 1. 列信息：只保留 intent 相关列 ──
+        relevant_cols = self._collect_relevant_columns(intent, yml_config, state)
         if table_schema and table_schema.get("columns"):
-            # 使用 column_profiles 丰富列信息（包含唯一值数量、高频值、统计信息）
-            column_profiles = table_schema.get("column_profiles", [])
-            columns_info = self._format_columns_for_prompt(
-                table_schema["columns"], 
-                column_profiles=column_profiles
-            )
+            all_cols = table_schema["columns"]
+            profiles = table_schema.get("column_profiles", [])
+            if relevant_cols:
+                key_cols = [c for c in all_cols if c.get("name", c.get("column_name", "")) in relevant_cols]
+                other_cols = [c for c in all_cols if c.get("name", c.get("column_name", "")) not in relevant_cols]
+                columns_info = "### 关键列（与本次查询直接相关）\n"
+                columns_info += self._format_columns_for_prompt(key_cols, column_profiles=profiles)
+                columns_info += f"\n\n### 其他可用列（共 {len(other_cols)} 列）\n"
+                columns_info += ", ".join(
+                    f'"{c.get("name", c.get("column_name", ""))}"'
+                    for c in other_cols
+                )
+            else:
+                columns_info = self._format_columns_for_prompt(all_cols, column_profiles=profiles)
         elif schema_text:
             columns_info = schema_text
-        
-        # ★ 核心改动：从 state 获取结构化的指标定义和必须筛选器
-        metric_constraint = ""
-        required_where_clauses = ""
-        
-        if state and hasattr(state, "current_metric_def") and state.current_metric_def:
-            metric_def = state.current_metric_def
+        else:
+            columns_info = "无列信息"
+
+        # ── 2. 指标约束（强制使用聚合表达式）──
+        metric_section = ""
+        if state and getattr(state, "current_metric_def", None):
+            md = state.current_metric_def
             metric_name = getattr(state, "current_metric", "")
-            agg_expr = metric_def.get("agg", "")
-            filter_refs = metric_def.get("filter_refs", [])
-            
-            metric_constraint = f"""
-## 指标约束
+            agg_expr = md.get("agg", "")
+            filter_refs = md.get("filter_refs", [])
+            metric_section = f"""## 指标约束
 - 指标ID: {metric_name}
-- 含义: {metric_def.get('label', '')}
+- 含义: {md.get('label', '')}
 - 聚合表达式（必须使用）: {agg_expr}
-- 默认筛选器: {filter_refs}
-"""
-        
-        if state and hasattr(state, "required_filters") and state.required_filters:
+- 默认筛选器: {filter_refs}"""
+
+        # ── 3. WHERE 条件（已解析的 SQL 片段）──
+        has_required_where = bool(state and getattr(state, "required_filters", None))
+        where_section = ""
+        if has_required_where:
             where_parts = []
             for f in state.required_filters:
                 where_parts.append(f"  -- {f['id']}: {f['label']}\n  ({f['expr']})")
-            required_where_clauses = f"""
-## 必须包含的 WHERE 条件
-以下条件必须**完整**出现在 WHERE 子句中（可追加 AND，不可删改）：
+            where_section = f"## 建议 WHERE 条件\n以下条件直接用于 WHERE 子句（可追加 AND，不可删改）：\n\n{chr(10).join(where_parts)}"
 
-{chr(10).join(where_parts)}
-"""
-        
-        has_required_where = bool(
-            state and getattr(state, "required_filters", None)
-        )
-        current_metric_id = (
-            getattr(state, "current_metric", None)
-            if state and getattr(state, "current_metric_def", None) else None
-        )
+        # ── 4. 结构化意图摘要 ──
+        intent_section = f"""## 结构化意图
+- task_type: {intent.task_type}
+- metrics: {intent.metrics}
+- dimensions: {intent.dimensions}"""
 
-        # 指标：有「指标约束」时排除当前指标，避免重复
-        metrics_info = self._get_metrics_info(
-            intent.metrics,
-            yml_config.get("metrics", {}),
-            exclude_metric_id=current_metric_id,
-        )
-        dimensions_info = self._get_dimensions_info(
-            intent.dimensions, yml_config.get("dimensions", {})
-        )
-        # 筛选：有「必须包含的 WHERE 条件」时不再重复预定义筛选器与映射
-        if has_required_where:
-            filter_refs_info = "（见上文「必须包含的 WHERE 条件」）"
-            filters_info = ""
-        else:
-            filter_refs_info = self._get_filter_refs_info(
-                intent.filter_refs, yml_config.get("filters", {})
-            )
-            filters_info = self._get_filters_info(
-                intent.filters, yml_config.get("dimensions", {})
-            )
-
-        # 从 filter_refs 提取指标相关筛选（已有「必须包含的 WHERE 条件」时不重复罗列）
-        if not has_required_where:
-            metrics_from_filters = self._extract_metrics_from_filter_refs(
-                intent.filter_refs, yml_config.get("filters", {}), yml_config.get("metrics", {})
-            )
-            if metrics_from_filters:
-                if metrics_info == "无指定指标" or metrics_info == "无匹配指标":
-                    metrics_info = metrics_from_filters
-                else:
-                    metrics_info += f"\n\n### 从筛选器推断的指标条件\n{metrics_from_filters}"
-        
-        # 构建任务指令（通用：不绑定具体 pipeline 名称）
-        task_instruction = ""
-        
-        # 获取用户原始查询（用于 LLM 理解占比语义）
+        # ── 5. 任务指令 ──
         user_query = getattr(state, "user_query", "") if state else ""
-        
-        if current_task:
-            task_type = current_task.get("task_type", current_task.get("type", ""))
-            task_id = current_task.get("task_id", current_task.get("id", ""))
-            task_desc = current_task.get("description", "")
-            task_notes = current_task.get("notes", [])
-            current_dim = current_task.get("current_dimension", "")
-            time_granularity = current_task.get("time_granularity", "")
-            intent_hint = current_task.get("intent_hint", "")
-            parent_summary = current_task.get("parent_results_summary", "")
-            depends_on = current_task.get("depends_on", [])
-            
-            # ★ 获取 Planner 的 SQL 修复建议（重试时使用）
-            retry_hint = current_task.get("retry_hint", "")
-            retry_count = current_task.get("retry_count", 0)
-            
-            task_instruction = f"""
-## 🎯 当前分析任务
-- 任务 ID: {task_id}
-- 任务类型: {task_type}
-- 任务描述: {task_desc}
-"""
-            if task_notes:
-                task_instruction += f"- 注意事项: {'; '.join(str(n) for n in task_notes)}\n"
-            if current_dim:
-                task_instruction += f"- 当前分析维度: {current_dim}\n"
-            if time_granularity:
-                task_instruction += f"- 时间粒度: {time_granularity}\n"
-            if depends_on:
-                task_instruction += f"- 依赖任务: {', '.join(depends_on)}\n"
-            if parent_summary:
-                task_instruction += f"- 上游结果摘要: {parent_summary}\n"
-            
-            # 如果有 retry_hint，显示 SQL 修复建议
-            if retry_hint:
-                task_instruction += f"""
-### 🔴 SQL 修复建议（第 {retry_count} 次重试）
-上一次 SQL 执行失败，请根据以下建议修复：
-{retry_hint}
-"""
-            
-            if intent_hint:
-                task_instruction += f"""
-### 💡 执行意图
-{intent_hint}
-"""
-            
-            # 根据任务类型添加具体指导
-            if task_type == "trend":
-                task_instruction += """
-### 趋势分析规则
-- 必须按时间维度（年/季/月/周/日）GROUP BY
-- 结果按时间**升序**排序（ORDER BY 时间列 ASC）
-- 只生成 1 个趋势 SQL
-"""
-            elif task_type == "source":
-                dim_hint = f"「{current_dim}」" if current_dim else "指定维度"
-                task_instruction += f"""
-### 来源/构成分析规则
-- 必须按维度 {dim_hint} GROUP BY
-- 结果按数值**降序**排序（看 top 贡献）
-- 只生成 1 个按 {dim_hint} 分组的 SQL
-"""
-            elif task_type == "comparison":
-                task_instruction += """
-### 对比分析规则
-- 需要对比两个时间段或两个条件
-- 计算差值或增长率：(当期 - 基期) / 基期 * 100
-- 结果应包含：基期值、当期值、变化值/增长率
-"""
-            elif task_type == "drilldown":
-                task_instruction += """
-### 下钻分析规则
-- 在上一步结果基础上进一步细分
-- 增加更细粒度的维度或筛选条件
-- 保留上游的筛选条件
-"""
-            elif task_type == "ratio":
-                task_instruction += f"""
-### 占比分析规则
+        task_instruction = self._build_task_instruction(current_task, user_query)
 
-**用户问题**：{user_query}
-
-**标准写法**：分子条件放 CASE WHEN，全局筛选放 WHERE，分子条件**禁止**放 WHERE（否则分母被限制，占比恒为1）
-```sql
-SELECT
-  SUM(CASE WHEN <分子条件> THEN "数值列" ELSE 0 END) AS 分子,
-  SUM("数值列") AS 分母,
-  ROUND(SUM(CASE WHEN <分子条件> THEN "数值列" ELSE 0 END) * 100.0 / SUM("数值列"), 2) AS 占比
-FROM 表名 WHERE <全局筛选>
-```
-
-**TOP N 占比**：分子条件涉及聚合排序时，用 CTE 取 TOP N，再 CASE WHEN IN
-```sql
-WITH top_n AS (
-  SELECT "维度列" FROM 表名 WHERE <全局筛选>
-  GROUP BY "维度列" ORDER BY SUM("数值列") DESC LIMIT N
-)
-SELECT
-  SUM(CASE WHEN "维度列" IN (SELECT "维度列" FROM top_n) THEN "数值列" ELSE 0 END) AS 分子,
-  SUM("数值列") AS 分母,
-  ROUND(... * 100.0 / ..., 2) AS 占比
-FROM 表名 WHERE <全局筛选>
-```
-"""
-            elif task_type == "ranking":
-                task_instruction += """
-### 排名分析规则
-- 按指标 GROUP BY 维度后排序
-- 使用 ORDER BY 指标 DESC/ASC
-- 使用 LIMIT N 限制返回数量
-"""
-        
-        if filters_info:
-            filter_section = f"## 筛选（参考）\n{filter_refs_info}\n\n## 筛选条件映射\n{filters_info}"
+        # ── 6. 用户查询 ──
+        rewritten = getattr(intent, "rewritten_query", "") or ""
+        if rewritten and rewritten != intent.raw_query:
+            query_section = f"## 用户查询\n{rewritten}\n（原始: {intent.raw_query}）"
         else:
-            filter_section = f"## 筛选（参考）\n{filter_refs_info}"
-        
-        # ★ 状态隔离：有任务上下文时，不显示用户原始问题，只显示任务描述
-        if current_task:
-            # 子任务只能看到自己的任务描述，完全隔离用户原始问题
-            query_section = ""  # 不再显示 raw_query
-        else:
-            # 没有任务上下文时，直接根据 raw_query 生成
-            query_section = f"""## 用户查询
-{intent.raw_query}"""
-        
+            query_section = f"## 用户查询\n{intent.raw_query}"
+
         return f"""请根据以下信息生成可执行的 SQL。
 {task_instruction}
-{metric_constraint}
-{required_where_clauses}
 {query_section}
+
 ## 表名
 {intent.table_name}
 
-## 表结构（可用列名 - 只能使用这些列！）
+## 列信息（只能使用这些列！）
 {columns_info}
 
-## 结构化意图
-- task_type: {intent.task_type}
-- metrics: {intent.metrics}
-- dimensions: {intent.dimensions}
-- filter_refs: {intent.filter_refs}
-- filters: {json.dumps(intent.filters, ensure_ascii=False)}
+{intent_section}
 
-## 指标定义（参考）
-{metrics_info}
+{metric_section}
 
-## 维度定义（参考）
-{dimensions_info}
-
-{filter_section}
+{where_section}
 
 ## DuckDB SQL 规范
 {get_duckdb_syntax_rules()}
 
 ### 硬约束
-{self._build_sql_hard_rules(required_where_clauses, has_task_description=bool(current_task))}
+{self._build_sql_hard_rules(has_required_where=has_required_where, has_task_description=bool(current_task))}
 
 ## 输出要求
 严格输出 JSON，**只生成 1 个最匹配当前任务的 SQL**：
@@ -906,6 +780,135 @@ FROM 表名 WHERE <全局筛选>
   ]
 }}
 """
+
+    def _build_task_instruction(self, current_task: dict[str, Any] | None, user_query: str) -> str:
+        """构建任务类型指令（完整版，保留各类型的详细规则）。"""
+        if not current_task:
+            return ""
+
+        task_type = current_task.get("task_type", current_task.get("type", ""))
+        task_id = current_task.get("task_id", current_task.get("id", ""))
+        task_desc = current_task.get("description", "")
+        task_notes = current_task.get("notes", [])
+        current_dim = current_task.get("current_dimension", "")
+        time_granularity = current_task.get("time_granularity", "")
+        intent_hint = current_task.get("intent_hint", "")
+        parent_summary = current_task.get("parent_results_summary", "")
+        depends_on = current_task.get("depends_on", [])
+        retry_hint = current_task.get("retry_hint", "")
+        retry_count = current_task.get("retry_count", 0)
+
+        inst = f"""
+## 当前分析任务
+- 任务 ID: {task_id}
+- 任务类型: {task_type}
+- 任务描述: {task_desc}
+"""
+        if task_notes:
+            inst += f"- 注意事项: {'; '.join(str(n) for n in task_notes)}\n"
+        if current_dim:
+            inst += f"- 当前分析维度: {current_dim}\n"
+        if time_granularity:
+            inst += f"- 时间粒度: {time_granularity}\n"
+        if depends_on:
+            inst += f"- 依赖任务: {', '.join(depends_on)}\n"
+        if parent_summary:
+            inst += f"- 上游结果摘要: {parent_summary}\n"
+
+        if retry_hint:
+            inst += f"""
+### SQL 修复建议（第 {retry_count} 次重试）
+上一次 SQL 执行失败，请根据以下建议修复：
+{retry_hint}
+"""
+        if intent_hint:
+            inst += f"""
+### 执行意图
+{intent_hint}
+"""
+
+        # ── 各任务类型的详细规则 ──
+        if task_type == "trend":
+            inst += """
+### 趋势分析规则
+- 必须按时间维度（年/季/月/周/日）GROUP BY
+- 结果按时间**升序**排序（ORDER BY 时间列 ASC）
+- 只生成 1 个趋势 SQL
+"""
+        elif task_type == "source":
+            dim_hint = f"「{current_dim}」" if current_dim else "指定维度"
+            inst += f"""
+### 来源/构成分析规则
+- 必须按维度 {dim_hint} GROUP BY
+- 结果按数值**降序**排序（看 top 贡献）
+- 只生成 1 个按 {dim_hint} 分组的 SQL
+"""
+        elif task_type == "comparison":
+            inst += """
+### 对比分析规则
+- 需要对比两个时间段或两个条件
+- 计算差值或增长率：(当期 - 基期) / 基期 * 100
+- 结果应包含：基期值、当期值、变化值/增长率
+"""
+        elif task_type == "drilldown":
+            inst += """
+### 下钻分析规则
+- 在上一步结果基础上进一步细分
+- 增加更细粒度的维度或筛选条件
+- 保留上游的筛选条件
+"""
+        elif task_type == "ratio":
+            inst += f"""
+### 占比分析规则
+
+**用户问题**：{user_query}
+
+请根据用户问题判断使用哪种占比模式：
+
+**模式1 - 分别占比**（用户说"分别""各自""每个"时使用）：按维度 GROUP BY，每行一个占比
+```sql
+SELECT "维度列",
+  SUM("数值列") AS 值,
+  ROUND(SUM("数值列") * 100.0 / (SELECT SUM("数值列") FROM 表名 WHERE <全局条件>), 2) AS 占比
+FROM 表名
+WHERE <全局条件> AND <分组条件>
+GROUP BY "维度列"
+ORDER BY 值 DESC
+```
+
+**模式2 - 合计占比**（用户问一组对象合起来占多少时使用）：CASE WHEN 输出单行
+```sql
+SELECT
+  ROUND(SUM(CASE WHEN <分子条件> THEN "数值列" ELSE 0 END) * 100.0 / SUM("数值列"), 2) AS 占比
+FROM 表名 WHERE <全局条件>
+```
+
+**模式3 - TOP N 占比**（分子条件涉及聚合排序时）：CTE 取 TOP N 再 CASE WHEN IN
+```sql
+WITH top_n AS (
+  SELECT "维度列" FROM 表名 WHERE <全局条件>
+  GROUP BY "维度列" ORDER BY SUM("数值列") DESC LIMIT N
+)
+SELECT
+  SUM(CASE WHEN "维度列" IN (SELECT "维度列" FROM top_n) THEN "数值列" ELSE 0 END) AS 分子,
+  SUM("数值列") AS 分母,
+  ROUND(... * 100.0 / ..., 2) AS 占比
+FROM 表名 WHERE <全局条件>
+```
+
+**关键判断**：
+- 用户说"**分别**占多少"→ 模式1（GROUP BY）
+- 用户说"**一共**占多少"→ 模式2（CASE WHEN）
+- 涉及"前N名""TOP N"→ 模式3（CTE + CASE WHEN IN）
+"""
+        elif task_type == "ranking":
+            inst += """
+### 排名分析规则
+- 按指标 GROUP BY 维度后排序
+- 使用 ORDER BY 指标 DESC/ASC
+- 使用 LIMIT N 限制返回数量
+"""
+        return inst
 
     async def _generate_candidates(
         self,
@@ -917,9 +920,7 @@ FROM 表名 WHERE <全局筛选>
         state: Any = None,  # ReActState
     ) -> list[SQLCandidate]:
         prompt = self._build_generation_prompt(intent, yml_config, schema_text, table_schema, current_task, state)
-        system = "你是 SQL 生成专家。根据结构化意图和表结构生成 DuckDB SQL。核心原则：只使用提供的列名，绝不发明不存在的列；列名用双引号，字符串值用单引号。严格输出 JSON；每个 SQL 可执行；reason 说明业务逻辑。"
-        if state and getattr(state, "required_filters", None):
-            system += " 必须完整包含上文指定的筛选条件，不能遗漏。"
+        system = "你是 SQL 生成专家。根据用户查询和表结构生成 DuckDB SQL。核心原则：以用户查询为准，业务配置仅供参考；只使用提供的列名；列名用双引号，字符串值用单引号。严格输出 JSON。"
         try:
             response = await self.llm.chat(
                 prompt=prompt,
@@ -1471,14 +1472,14 @@ FROM 表名 WHERE <全局筛选>
             state.set_error("未配置 LLM，无法生成 SQL", ErrorType.OTHER)
             return
         
-        # 获取当前任务上下文（来自 Planner）
-        current_task = getattr(context, "current_task", None)
+        # 获取当前任务上下文（来自 state，由 Planner/SQLAgent 设置）
+        current_task = state.current_task
         
         result = await self.generate_sql(
             intent=state.intent,
-            schema_text=state.schema_text or getattr(context, "schema_text", ""),
-            yml_config=state.yml_config or getattr(context, "yml_config", {}),
-            available_tables=getattr(context, "available_tables", None),
+            schema_text=state.schema_text,
+            yml_config=state.yml_config,
+            available_tables=state.available_tables or None,
             current_task=current_task,  # 传递任务上下文
             state=state,  # ★ 传递 state，用于获取注入的指标定义
         )
@@ -1517,8 +1518,6 @@ FROM 表名 WHERE <全局筛选>
                     state.mark_need(need_critique=True)
                 else:
                     state.clear_all_needs()
-                if hasattr(context, "query_result"):
-                    context.query_result = rows
                 if hasattr(context, "generated_sql"):
                     context.generated_sql = state.final_sql
             except Exception as e:
@@ -1616,8 +1615,6 @@ FROM 表名 WHERE <全局筛选>
                 state.set_error("查询返回空结果", ErrorType.NO_DATA)
             else:
                 state.clear_all_needs()
-            if hasattr(context, "query_result"):
-                context.query_result = rows
             if hasattr(context, "generated_sql"):
                 context.generated_sql = state.final_sql
         except Exception as e:
@@ -1753,15 +1750,16 @@ class GenerateSQLTool(BaseTool):
             return
         result = await self.execute(
             intent=state.intent,
-            schema_text=state.schema_text or context.schema_text,
-            yml_config=state.yml_config or context.yml_config,
-            available_tables=context.available_tables,
+            schema_text=state.schema_text,
+            yml_config=state.yml_config,
+            available_tables=state.available_tables or None,
         )
         if result.success:
             state.current_sql = result.data.get("sql", "")
             state.sql_candidates = result.data.get("candidates", [])
             state.mark_need(need_sql=False, need_execute=True)
-            context.generated_sql = state.current_sql
+            if hasattr(context, "generated_sql"):
+                context.generated_sql = state.current_sql
         else:
             state.set_error(result.error or "SQL 生成失败", ErrorType.OTHER)
 
@@ -1824,9 +1822,9 @@ class ExecuteAndEvaluateTool(BaseTool):
             return
         result = await self.execute(
             sql=sql,
-            schema_text=state.schema_text or context.schema_text,
+            schema_text=state.schema_text,
             intent=state.intent,
-            yml_config=state.yml_config or context.yml_config,
+            yml_config=state.yml_config,
         )
         if result.data.get("execution_success"):
             rows = result.data.get("rows", [])
@@ -1839,8 +1837,8 @@ class ExecuteAndEvaluateTool(BaseTool):
                 state.mark_need(need_critique=True)
             else:
                 state.clear_all_needs()
-            context.query_result = rows
-            context.generated_sql = state.final_sql
+            if hasattr(context, "generated_sql"):
+                context.generated_sql = state.final_sql
         else:
             error = result.data.get("execution_error", "执行失败")
             error_type = error_type_from_str(result.data.get("error_type", "other"))
@@ -1938,9 +1936,9 @@ class SQLWorkflowTool(BaseTool):
             return
         result = await self.execute(
             intent=state.intent,
-            schema_text=state.schema_text or context.schema_text,
-            yml_config=state.yml_config or context.yml_config,
-            available_tables=context.available_tables,
+            schema_text=state.schema_text,
+            yml_config=state.yml_config,
+            available_tables=state.available_tables or None,
         )
         if not result.success:
             state.set_error(result.error or "SQL 流程失败", ErrorType.OTHER)
@@ -1958,8 +1956,8 @@ class SQLWorkflowTool(BaseTool):
                 state.mark_need(need_critique=True)
             else:
                 state.clear_all_needs()
-            context.query_result = rows
-            context.generated_sql = state.final_sql
+            if hasattr(context, "generated_sql"):
+                context.generated_sql = state.final_sql
         else:
             state.execution_error = d.get("error", "执行失败")
             state.set_error(state.execution_error, error_type_from_str(d.get("error_type", "other")))

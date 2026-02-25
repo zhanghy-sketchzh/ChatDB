@@ -5,6 +5,10 @@
 
 from chatdb.core.react_state import ReActState, ReActPhase, ErrorType
 from chatdb.core.tracer import TaskTracer, TaskStep
+from chatdb.core.messages import TaskRequest, TaskResponse, TaskResultEntry, PlanDecision
+from chatdb.core.scratch_pad import ScratchPadManager
+from chatdb.core.semantic_parse import SemanticParseTool
+from chatdb.core.summarize import SummarizeAnswerTool
 
 
 def __getattr__(name):
@@ -30,7 +34,17 @@ __all__ = [
     "ReActState",
     "ReActPhase",
     "ErrorType",
+    # Agent 通信消息
+    "TaskRequest",
+    "TaskResponse",
+    "TaskResultEntry",
+    "PlanDecision",
     # 追踪器
     "TaskTracer",
     "TaskStep",
+    # Scratch Pad（文件暂存）
+    "ScratchPadManager",
+    # 流程步骤
+    "SemanticParseTool",
+    "SummarizeAnswerTool",
 ]

@@ -51,6 +51,7 @@ class StructuredIntent:
     注意：order_by/limit 等具体参数由 SQLAgent 根据 task_type 自行处理
     """
     raw_query: str
+    rewritten_query: str = ""  # 改写后的完整查询（指代消解 + 补全后的自然语言）
     table_name: str = ""
     
     # === 核心字段 ===
@@ -79,7 +80,7 @@ class StructuredIntent:
         self._sync_task_type()
     
     def _migrate_legacy_fields(self):
-        """将旧版 filter_refs 和 filters 迁移到 conditions"""
+        """将旧版 filter_refs 和 filters 迁移到 conditions（去重）"""
         for ref_id in self._filter_refs:
             if not any(c.get("type") == "ref" and c.get("id") == ref_id for c in self.conditions):
                 self.conditions.append({"type": "ref", "id": ref_id})
@@ -92,7 +93,14 @@ class StructuredIntent:
             val = f.get("value")
             op = f.get("operator", "=")
             if col and val is not None:
-                self.conditions.append({"type": "custom", "column": col, "op": op, "value": val})
+                # 去重：如果 conditions 里已有相同 column+op+value 的 custom 条件，跳过
+                dup = any(
+                    c.get("type") == "custom" and c.get("column") == col
+                    and c.get("op", "=") == op and c.get("value") == val
+                    for c in self.conditions
+                )
+                if not dup:
+                    self.conditions.append({"type": "custom", "column": col, "op": op, "value": val})
     
     def _sync_task_type(self):
         """同步 task_type 和 _analysis_type（向后兼容）"""
@@ -171,6 +179,7 @@ class StructuredIntent:
     def to_dict(self) -> dict[str, Any]:
         return {
             "raw_query": self.raw_query,
+            "rewritten_query": self.rewritten_query,
             "table_name": self.table_name,
             "mode": self.mode,
             "task_type": self.task_type,
@@ -192,6 +201,7 @@ class StructuredIntent:
     def from_dict(cls, data: dict[str, Any], raw_query: str = "") -> "StructuredIntent":
         intent = cls(
             raw_query=raw_query,
+            rewritten_query=data.get("rewritten_query", ""),
             table_name=data.get("table_name", ""),
             mode=data.get("mode", "analysis"),
             task_type=data.get("task_type", "basic"),
@@ -275,20 +285,17 @@ class SemanticParser:
             # 2. 加载 YAML 配置
             yml_config = self._load_yml_config(table_name)
             
-            # 3. 使用 LLM 提取结构化意图（传入 schema_text）
+            # 3. 使用 LLM 提取结构化意图（传入 schema_text + chat_history）
             intent = await self._extract_intent(
                 context.user_query, 
                 table_name, 
                 yml_config,
                 context.schema_text,  # 传入表结构
-                context.available_tables,  # 传入表元数据
+                getattr(context, "available_tables", []),  # 兼容精简后的 AgentContext
+                context.chat_history,  # 传入历史对话
             )
             
-            # 4. 更新上下文
-            context.selected_tables = [table_name] if table_name else []
-            context.query_intent = intent
-            context.yml_config = yml_config
-            
+            # 4. 返回结果（不再写入 context，ReAct 流程由 SemanticParseTool 处理）
             return AgentResult(
                 status=AgentStatus.SUCCESS,
                 message="语义解析成功",
@@ -308,16 +315,18 @@ class SemanticParser:
     
     async def _select_table(self, context: AgentContext) -> str:
         """选择表"""
-        if context.selected_tables:
-            return context.selected_tables[0]
+        selected = getattr(context, "selected_tables", [])
+        if selected:
+            return selected[0]
         
-        if context.available_tables and len(context.available_tables) == 1:
-            return context.available_tables[0].get("table_name", "")
+        available = getattr(context, "available_tables", [])
+        if available and len(available) == 1:
+            return available[0].get("table_name", "")
         
-        if context.available_tables and len(context.available_tables) > 1:
+        if available and len(available) > 1:
             tables_desc = "\n".join([
                 f"- {t.get('table_name')}: {t.get('table_description', '')}"
-                for t in context.available_tables
+                for t in available
             ])
             
             response = await self.llm.chat(
@@ -326,12 +335,12 @@ class SemanticParser:
                 caller_name="select_table",
             )
             
-            for table in context.available_tables:
+            for table in available:
                 if table.get("table_name") in response:
                     return table.get("table_name", "")
         
-        if context.available_tables:
-            return context.available_tables[0].get("table_name", "")
+        if available:
+            return available[0].get("table_name", "")
         return ""
     
     def _load_yml_config(self, table_name: str) -> dict[str, Any]:
@@ -373,6 +382,7 @@ class SemanticParser:
         yml_config: dict[str, Any],
         schema_text: str = "",
         tables_meta: list[dict[str, Any]] | None = None,
+        chat_history: list[dict[str, str]] | None = None,
     ) -> StructuredIntent:
         """使用 LLM 提取结构化意图"""
         
@@ -381,16 +391,17 @@ class SemanticParser:
         
         if has_yml:
             # 有 YAML 配置：基于配置提取
-            return await self._extract_intent_with_yml(query, table_name, yml_config)
+            return await self._extract_intent_with_yml(query, table_name, yml_config, chat_history)
         else:
             # 无 YAML 配置：基于 schema 提取
-            return await self._extract_intent_from_schema(query, table_name, schema_text, tables_meta)
+            return await self._extract_intent_from_schema(query, table_name, schema_text, tables_meta, chat_history)
     
     async def _extract_intent_with_yml(
         self,
         query: str,
         table_name: str,
         yml_config: dict[str, Any],
+        chat_history: list[dict[str, str]] | None = None,
     ) -> StructuredIntent:
         """
         基于 YAML 配置提取意图（v4 精简版）
@@ -404,112 +415,66 @@ class SemanticParser:
         available_dimensions = self._format_dimensions(yml_config.get("dimensions", {}))
         available_filters = self._format_filters(yml_config.get("filters", {}))
         rules = self._format_rules(yml_config.get("rules", []))
+        history_section = self._format_chat_history(chat_history)
         
-        prompt = f"""请从以下查询中提取结构化意图。
-
+        prompt = f"""你同时承担两个任务：**查询改写** 和 **意图提取**。
+{history_section}
 ## 用户查询
 {query}
 
 ## 可用表
 - {table_name}
 
-## 业务术语词典（参考，帮助理解查询）
+## 业务参考信息（仅供理解用户意图，不是强制约束）
+
+### 业务术语
 {available_business_terms}
 
-## 可用指标（优先从这里选择 ID，如需自定义可用 metric_name 字段补充）
+### 可用指标（参考）
 {available_metrics}
 
-## 可用维度（优先从这里选择 ID，用于 GROUP BY）
+### 可用维度（参考）
 {available_dimensions}
 
-## 可用筛选器（优先从这里选择 ID；若找不到合适的，可用 type=custom 补充）
+### 可用筛选器（参考）
 {available_filters}
 
-## 业务规则
+### 业务规则（参考）
 {rules}
 
-## 输出 JSON 格式
+## 你的任务
+
+### 1. 查询改写（rewritten_query）
+将用户当前问题改写为一句**完整、独立、无歧义**的查询：
+- 解析代词/指代："这几个""上面那些""它" → 替换为历史对话中的具体名称
+- 补全省略信息：如果上文有时间范围、产品等条件，补充到问题中
+- 如果当前问题已经完整明确，原样填入即可
+- **输出自然语言，不要输出SQL**
+
+### 2. 意图提取（mode + task_type + metrics + dimensions + conditions）
+
+| task_type | 含义 | 典型关键词 |
+|-----------|------|------------|
+| ratio | 占比/比例 | "占比""比例""占多少" |
+| comparison | 对比 | "同比""环比""增长""对比" |
+| trend | 趋势 | "趋势""走势""逐月""逐年" |
+| ranking | 排名 | "Top""前N""排名""最高" |
+| source | 来源/构成 | "按XX分""各个""构成""分布" |
+| basic | 基础查询 | "是多少""总计""合计" |
+
+## 输出 JSON
 ```json
 {{
+  "rewritten_query": "改写后的完整问题（自然语言）",
   "mode": "analysis|other",
   "task_type": "basic|ratio|comparison|ranking|trend|source",
-  "metrics": ["指标ID或自定义描述"],
-  "dimensions": ["维度ID或列名"],
+  "metrics": ["指标ID"],
+  "dimensions": ["维度ID"],
   "conditions": [
     {{"type": "ref", "id": "筛选器ID"}},
     {{"type": "custom", "column": "列名", "op": "=|!=|>|<|>=|<=|IN|LIKE", "value": "值"}}
   ]
 }}
-```
-
----
-
-## 字段说明
-
-### mode
-- `analysis`: 数据分析问题（需要生成 SQL）
-- `other`: 非数据分析问题（闲聊、问概念、解释术语等）
-
-### task_type（分析类型）
-
-| 类型 | 含义 | 典型关键词 |
-|------|------|------------|
-| **ratio** | 占比/比例分析 | "占比"、"比例"、"占多少"、"百分比" |
-| **comparison** | 对比分析 | "同比"、"环比"、"增长"、"对比"、"变化" |
-| **trend** | 趋势分析 | "趋势"、"走势"、"逐月"、"逐年"、"随时间" |
-| **ranking** | 排名分析 | "Top"、"前N"、"排名"、"最高"、"最低" |
-| **source** | 来源/构成分析 | "按XX分"、"各个"、"构成"、"分布"、"拆解" |
-| **basic** | 基础查询 | "是多少"、"有多少"、"总计"、"合计" |
-
-### metrics / dimensions / conditions
-- **metrics**: 要计算的指标（SUM/COUNT/AVG 等聚合对象）
-- **dimensions**: 要分组的维度（GROUP BY 的列）
-- **conditions**: 筛选条件
-  - 优先用预定义筛选器（type=ref）
-  - 兜底用自定义（type=custom）
-
----
-
-## 示例
-
-**占比**: "A类产品在总销售额中的占比"
-```json
-{{"mode": "analysis", "task_type": "ratio", "metrics": ["sales"], "dimensions": ["product_category"], "conditions": []}}
-```
-
-**同比**: "今年销售额同比增长多少"
-```json
-{{"mode": "analysis", "task_type": "comparison", "metrics": ["sales"], "dimensions": [], "conditions": [{{"type": "custom", "column": "year", "op": "=", "value": "2025"}}]}}
-```
-
-**趋势**: "最近12个月的订单量趋势"
-```json
-{{"mode": "analysis", "task_type": "trend", "metrics": ["order_count"], "dimensions": ["month"], "conditions": []}}
-```
-
-**排名**: "销售额最高的10个客户"
-```json
-{{"mode": "analysis", "task_type": "ranking", "metrics": ["sales"], "dimensions": ["customer"], "conditions": []}}
-```
-
-**来源分析**: "各渠道的用户数量"
-```json
-{{"mode": "analysis", "task_type": "source", "metrics": ["user_count"], "dimensions": ["channel"], "conditions": []}}
-```
-
-**基础查询**: "上个月的总订单数"
-```json
-{{"mode": "analysis", "task_type": "basic", "metrics": ["order_count"], "dimensions": [], "conditions": [{{"type": "custom", "column": "month", "op": "=", "value": "上月"}}]}}
-```
-
-**自定义筛选**: "北京地区VIP客户的消费金额"
-```json
-{{"mode": "analysis", "task_type": "basic", "metrics": ["amount"], "dimensions": [], "conditions": [{{"type": "custom", "column": "region", "op": "=", "value": "北京"}}, {{"type": "custom", "column": "customer_level", "op": "=", "value": "VIP"}}]}}
-```
-
-**非分析**: "什么是环比"
-```json
-{{"mode": "other", "task_type": "basic", "metrics": [], "dimensions": [], "conditions": []}}
 ```
 
 只输出 JSON，不要其他文字。"""
@@ -523,6 +488,12 @@ class SemanticParser:
             
             intent_dict = self._parse_json_response(response)
             intent = StructuredIntent.from_dict(intent_dict, raw_query=query)
+            
+            # 取出 LLM 输出的 rewritten_query
+            rq = intent_dict.get("rewritten_query", "")
+            if rq and rq != query:
+                intent.rewritten_query = rq
+                self._log.info(f"查询改写: {query[:40]} → {rq[:60]}")
             
             # === 校验和转换 ===
             
@@ -568,6 +539,7 @@ class SemanticParser:
         table_name: str,
         schema_text: str,
         tables_meta: list[dict[str, Any]] | None = None,
+        chat_history: list[dict[str, str]] | None = None,
     ) -> StructuredIntent:
         """
         基于 Schema 提取意图（无 YAML 配置时）
@@ -586,10 +558,12 @@ class SemanticParser:
                 for t in tables_meta
             ])
         
+        history_section = self._format_chat_history(chat_history)
+        
         self._log.think(f"提取列信息: tables_meta={len(tables_meta) if tables_meta else 0}个表, table_name={table_name}")
         
         prompt = f"""请从以下查询中提取结构化意图。
-
+{history_section}
 ## 用户查询
 {query}
 
@@ -602,9 +576,14 @@ class SemanticParser:
 ## 表结构（列名和类型）
 {columns_info}
 
+## 你的任务
+1. **查询改写**：将用户问题改写为完整、独立、无歧义的自然语言查询（解析指代词，补全省略信息）
+2. **意图提取**：提取结构化字段
+
 ## 输出 JSON
 ```json
 {{
+  "rewritten_query": "改写后的完整问题",
   "mode": "analysis|other",
   "task_type": "basic|ratio|comparison|ranking|trend|source",
   "tables": ["表名"],
@@ -646,12 +625,16 @@ class SemanticParser:
             
             intent = StructuredIntent(
                 raw_query=query,
+                rewritten_query=intent_dict.get("rewritten_query", ""),
                 table_name=table_name,
                 mode=intent_dict.get("mode", "analysis"),
                 task_type=intent_dict.get("task_type", "basic"),
                 tables=intent_dict.get("tables", [table_name] if table_name else []),
                 table_relation=intent_dict.get("table_relation", "single"),
             )
+            
+            if intent.rewritten_query and intent.rewritten_query != query:
+                self._log.info(f"查询改写: {query[:40]} → {intent.rewritten_query[:60]}")
             
             # 存储 schema 模式特有的字段
             if intent_dict.get("agg_column"):
@@ -850,6 +833,19 @@ class SemanticParser:
         
         self._log.warn(f"JSON 解析失败: {response[:200]}")
         return {}
+    
+    @staticmethod
+    def _format_chat_history(chat_history: list[dict[str, str]] | None) -> str:
+        """格式化历史对话，直接拼接 user/assistant 多轮文本供 LLM 理解上下文。"""
+        if not chat_history:
+            return ""
+        
+        lines = ["\n## 历史对话"]
+        for msg in chat_history:
+            role = "用户" if msg["role"] == "user" else "助手"
+            lines.append(f"{role}: {msg['content']}")
+        lines.append("")
+        return "\n".join(lines)
     
     def get_system_prompt(self) -> str:
         return "你是意图提取器，将自然语言查询转换为结构化 JSON。"

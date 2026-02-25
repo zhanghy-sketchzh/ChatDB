@@ -22,6 +22,7 @@ from enum import Enum
 from chatdb.agents.base import BaseAgent, AgentContext, AgentResult, AgentStatus
 from chatdb.core.react_state import ReActState
 from chatdb.llm.base import BaseLLM, _extract_json_from_text as extract_json
+from chatdb.tools.unix import UnixTool
 from chatdb.utils.logger import get_component_logger
 
 
@@ -166,8 +167,20 @@ class AnalysisTask:
 
 @dataclass
 class AnalysisPlan:
-    """分析计划（DAG 拓扑结构）"""
+    """
+    分析计划（DAG 拓扑结构）
+    
+    支持持久化：
+    - to_dict() / from_dict() 用于 JSON 序列化
+    - 元信息字段（original_query, rewritten_query, created_at）支持跨轮次复用
+    """
     tasks: list[AnalysisTask] = field(default_factory=list)
+
+    # 持久化元信息（跨轮次复用时需要）
+    original_query: str = ""
+    rewritten_query: str = ""
+    created_at: str = ""
+    status: str = "in_progress"  # in_progress / completed
 
     @property
     def task_map(self) -> dict[str, AnalysisTask]:
@@ -182,11 +195,16 @@ class AnalysisPlan:
     def mark_completed(self, task_id: str) -> None:
         if task := self.task_map.get(task_id):
             task.status = "completed"
+        # 自动更新计划整体状态
+        if self.is_done():
+            self.status = "completed"
 
     def mark_skipped(self, task_id: str, reason: str = "") -> None:
         if task := self.task_map.get(task_id):
             task.status = "skipped"
             task.skip_reason = reason
+        if self.is_done():
+            self.status = "completed"
 
     def mark_failed(self, task_id: str, error: str = "") -> None:
         if task := self.task_map.get(task_id):
@@ -205,6 +223,10 @@ class AnalysisPlan:
     def is_done(self) -> bool:
         return all(t.status in ("completed", "failed", "skipped") for t in self.tasks)
 
+    def has_pending_tasks(self) -> bool:
+        """是否还有未完成的任务"""
+        return any(t.status == "pending" for t in self.tasks)
+
     def get_ready_tasks(self, temp_results: Optional[dict] = None) -> list[AnalysisTask]:
         """获取依赖已满足的 pending 任务"""
         ready = []
@@ -219,6 +241,51 @@ class AnalysisPlan:
                 ready.append(task)
         ready.sort(key=lambda t: t.priority, reverse=True)
         return ready
+
+    def progress_summary(self) -> str:
+        """生成进度摘要（用于跨轮次上下文注入）"""
+        completed = sum(1 for t in self.tasks if t.status == "completed")
+        total = len(self.tasks)
+        current = self.get_ready_tasks()
+        
+        lines = [f"计划进度: {completed}/{total} 任务已完成"]
+        if current:
+            lines.append(f"下一步: [{current[0].type.value}] {current[0].description}")
+        elif self.is_done():
+            lines.append("所有任务已完成")
+        
+        # 已完成任务摘要
+        done_tasks = [t for t in self.tasks if t.status == "completed"]
+        if done_tasks:
+            lines.append("已完成:")
+            for t in done_tasks:
+                result_note = f" → {t.meta.get('result_file', '')}" if t.meta.get("result_file") else ""
+                lines.append(f"  ✓ [{t.type.value}] {t.description[:40]}{result_note}")
+        
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为字典（用于 JSON 持久化）"""
+        return {
+            "original_query": self.original_query,
+            "rewritten_query": self.rewritten_query,
+            "created_at": self.created_at,
+            "status": self.status,
+            "tasks": [t.to_dict() for t in self.tasks],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AnalysisPlan":
+        """从字典反序列化"""
+        plan = cls(
+            original_query=data.get("original_query", ""),
+            rewritten_query=data.get("rewritten_query", ""),
+            created_at=data.get("created_at", ""),
+            status=data.get("status", "in_progress"),
+        )
+        for task_data in data.get("tasks", []):
+            plan.tasks.append(AnalysisTask.from_dict(task_data))
+        return plan
 
     def to_display(self, ready_task_ids: Optional[set[str]] = None) -> str:
         """格式化展示计划"""
@@ -278,7 +345,7 @@ class PlannerAgent(BaseAgent):
     - 直接使用 Intent.task_type，避免二次推断不一致
     """
 
-    def __init__(self, llm: BaseLLM):
+    def __init__(self, llm: BaseLLM, unix_tool: UnixTool | None = None):
         super().__init__(
             name="Planner",
             llm=llm,
@@ -287,6 +354,7 @@ class PlannerAgent(BaseAgent):
         self._log = get_component_logger("Planner")
         self._analysis_plan: Optional[AnalysisPlan] = None
         self._data_constraints: dict[str, Any] = {}
+        self.unix = unix_tool or UnixTool(workspace=".", readonly=True)
 
     def clear_history(self) -> None:
         self._analysis_plan = None
@@ -350,7 +418,7 @@ class PlannerAgent(BaseAgent):
         intent_summary = {
             "metrics": intent.metrics,
             "dimensions": intent.dimensions,
-            "conditions": [c for c in intent.conditions if c.get("type") == "ref"],
+            "conditions": intent.conditions,  # 包含所有条件（ref + custom），避免指代消解结果丢失
             "task_type": task_type.value,
         }
 
@@ -360,20 +428,29 @@ class PlannerAgent(BaseAgent):
         
         # ★ 根据任务类型选择对应的 Prompt 模板
         task_specific_prompt = self._get_task_specific_prompt(task_type)
+        
+        # 历史对话上下文
+        history_section = ""
+        if context.chat_history:
+            history_lines = ["## 历史对话"]
+            for msg in context.chat_history:
+                role = "用户" if msg["role"] == "user" else "助手"
+                history_lines.append(f"{role}: {msg['content']}")
+            history_section = "\n".join(history_lines) + "\n\n"
+
 
         prompt = f"""## 角色
 你是资深数据分析师，需要为用户问题设计**优雅、鲁棒**的分析计划。
 
 ## 用户问题
 {state.user_query}
-
-## 分析场景（由意图提取阶段识别）
+{history_section}## 分析场景（由意图提取阶段识别）
 - **{task_type.label}** ({task_type.value}): {task_type.description}
 
 ## 已解析的意图
 {json.dumps(intent_summary, ensure_ascii=False, indent=2)}
 
-## 已绑定的数据约束（自动应用到 SQL）
+## 数据筛选条件（参考，来自业务配置）
 {resolved_filters}
 
 ## 数据 Schema
@@ -601,7 +678,7 @@ WHERE 条件
         return "\n".join(lines)
 
     def _build_schema_info(self, state: ReActState, context: AgentContext) -> str:
-        available_tables = context.available_tables or []
+        available_tables = state.available_tables or []
         if not available_tables:
             return state.schema_text[:800] if state.schema_text else "（无 Schema 信息）"
 
@@ -691,35 +768,63 @@ WHERE 条件
     # 查看执行结果
     # ============================================================
 
-    def inspect_temp_results(self, state: ReActState) -> str:
-        """查看 temp_results"""
-        if not state.temp_results:
+    async def inspect_temp_results(
+        self,
+        state: ReActState,
+        collected_results: dict[str, list[dict[str, Any]]] | None = None,
+        preview_lines: int = 20,
+    ) -> str:
+        """通过 UnixTool 观察任务执行结果
+
+        当存在 _file_ref 时，使用 UnixTool 读取 scratch 文件的前 N 行，
+        让 Planner 看到真实数据而非仅靠摘要字符串做决策。
+
+        Args:
+            state: ReActState
+            collected_results: 已收集结果
+            preview_lines: 每个文件预览的行数
+        """
+        results = collected_results if collected_results is not None else state.temp_results
+        if not results:
             return "（尚无）"
 
-        lines = []
-        for task_id, results in state.temp_results.items():
+        lines: list[str] = []
+        for task_id, task_results in results.items():
             lines.append(f"### 任务: {task_id}")
-            for i, r in enumerate(results):
+            for i, r in enumerate(task_results):
                 subtask = r.get("subtask", f"步骤{i+1}")
                 row_count = r.get("row_count", 0)
-                examples = r.get("examples", [])
                 stats = r.get("stats", {})
                 issues = r.get("issues", [])
                 sql = r.get("sql", "")
+                file_ref = r.get("_file_ref")
 
                 lines.append(f"  [{subtask}] 返回 {row_count} 行")
 
-                # SQL 错误时显示失败的 SQL
                 has_sql_error = any("error:" in issue for issue in issues)
                 if has_sql_error and sql:
                     sql_preview = sql[:300] + "..." if len(sql) > 300 else sql
                     lines.append(f"  **失败的SQL**: `{sql_preview}`")
 
-                if examples:
-                    lines.append("  示例:")
-                    for ex in examples[:3]:
-                        items = list(ex.items())[:4]
-                        lines.append(f"    - {', '.join(f'{k}={v}' for k, v in items)}")
+                if file_ref:
+                    file_path = file_ref.get("path", "")
+                    preview = await self._read_file_preview(file_path, preview_lines)
+                    if preview:
+                        lines.append(f"  数据预览:\n{preview}")
+                    else:
+                        summary = file_ref.get("summary", "")
+                        if summary:
+                            lines.append(f"  摘要: {summary}")
+                    if file_path:
+                        lines.append(f"  完整数据: {file_path}")
+                else:
+                    examples = r.get("examples", [])
+                    if examples:
+                        lines.append("  示例:")
+                        for ex in examples[:3]:
+                            items = list(ex.items())[:4]
+                            lines.append(f"    - {', '.join(f'{k}={v}' for k, v in items)}")
+
                 if stats:
                     lines.append(f"  统计: {', '.join(f'{k}={v}' for k, v in list(stats.items())[:5])}")
                 if issues:
@@ -727,52 +832,97 @@ WHERE 条件
             lines.append("")
         return "\n".join(lines).strip()
 
-    def summarize_results_for_planner(self, state: ReActState) -> str:
+    async def _read_file_preview(self, file_path: str, max_lines: int = 20) -> str:
+        """通过 UnixTool 读取 scratch 文件的前 N 行作为数据预览"""
+        if not file_path:
+            return ""
+        result = await self.unix.execute(
+            action="read_file", path=file_path,
+            start_line=1, end_line=max_lines,
+        )
+        if result.success:
+            content = result.data.get("content", "")
+            total = result.data.get("total_lines", 0)
+            if total > max_lines:
+                content += f"\n    ... 共 {total} 行，已截取前 {max_lines} 行"
+            return content
+        return ""
+
+    async def summarize_results_for_planner(
+        self, state: ReActState, collected_results: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> str:
         """为决策 LLM 生成数据摘要"""
-        if not state.temp_results:
+        results = collected_results if collected_results is not None else state.temp_results
+        if not results:
             return "暂无执行结果"
-        return "## 已执行任务的数据摘要\n" + self.inspect_temp_results(state)
+        inspection = await self.inspect_temp_results(state, collected_results)
+        return "## 已执行任务的数据摘要\n" + inspection
 
     # ============================================================
     # 决策与调整
     # ============================================================
 
-    async def decide_next_action(self, state: ReActState, context: AgentContext) -> dict[str, Any]:
-        """根据 temp_results 决定下一步"""
+    async def decide_next_action(
+        self, state: ReActState, context: AgentContext,
+        collected_results: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> dict[str, Any]:
+        """根据已收集的结果决定下一步
+        
+        Args:
+            state: ReActState
+            context: AgentContext
+            collected_results: Orchestrator 传入的已收集结果（显式消息）
+        """
+        results = collected_results if collected_results is not None else state.temp_results
+
         if not self._analysis_plan:
             return {"action": "done", "reason": "no_plan"}
 
         if self._analysis_plan.is_done():
             return {"action": "done", "reason": "plan_completed"}
 
-        ready_tasks = self._analysis_plan.get_ready_tasks(state.temp_results)
+        ready_tasks = self._analysis_plan.get_ready_tasks(results)
         current_task = ready_tasks[0] if ready_tasks else None
 
         if not current_task:
             return {"action": "done", "reason": "no_current_task"}
 
         # 无结果时直接继续
-        if not state.temp_results:
+        if not results:
             return {"action": "continue", "task": current_task}
 
         # 调用 LLM 决策
-        data = await self._llm_decide(state, current_task, ready_tasks)
-        return self._apply_decision(data, current_task, state)
+        data = await self._llm_decide(state, current_task, ready_tasks, collected_results)
+        return self._apply_decision(data, current_task, state, collected_results)
 
     async def _llm_decide(
-        self, state: ReActState, current_task: AnalysisTask, ready_tasks: list[AnalysisTask]
+        self, state: ReActState, current_task: AnalysisTask,
+        ready_tasks: list[AnalysisTask],
+        collected_results: dict[str, list[dict[str, Any]]] | None = None,
+        _tool_observation: str = "",
+        _depth: int = 0,
     ) -> dict[str, Any]:
-        """LLM 决策"""
-        data_summary = self.summarize_results_for_planner(state)
+        """LLM 决策，支持工具调用循环
+
+        当 LLM 选择 E（使用工具）时，执行工具调用并将结果回传，
+        重新进入决策，最多循环 3 次。
+        """
+        data_summary = await self.summarize_results_for_planner(state, collected_results)
         ready_ids = {t.id for t in ready_tasks}
         plan_display = self._analysis_plan.to_display(ready_ids) if self._analysis_plan else ""
         issues = self._detect_issues(data_summary)
+        tool_instructions = self.unix.get_tool_instructions()
+
+        observation_section = ""
+        if _tool_observation:
+            observation_section = f"\n## 工具观察结果\n```\n{_tool_observation}\n```\n"
 
         system_prompt = """你是数据分析决策专家。根据执行结果决定下一步。
 关键原则：
 1. 空结果 ≠ 失败，先诊断是 SQL 问题还是数据真的为空
 2. SQL 报错时分析错误信息，给出修复建议
-3. 输出 JSON"""
+3. 当摘要信息不足以判断时，可使用工具读取完整数据再决策
+4. 输出 JSON"""
 
         prompt = f"""## 用户问题
 {state.user_query}
@@ -783,6 +933,10 @@ WHERE 条件
 {data_summary}
 
 {issues}
+{observation_section}
+---
+
+{tool_instructions}
 
 ---
 
@@ -792,6 +946,7 @@ WHERE 条件
 **B. 插入任务**：遇到问题，需要插入 validation/clarify 任务处理
 **C. 跳过任务**：前提不成立，跳过部分后续任务
 **D. 结束**：可以给出结论
+**E. 使用工具**：需要更多信息，调用工具观察数据后再决策
 
 ## 输出格式
 
@@ -799,7 +954,8 @@ WHERE 条件
 选 B（插入）: {{"decision": "B", "reason": "...", "adjustment": {{"insert_task": {{"type": "validation", "description": "..."}}}}}}
 选 B（重试）: {{"decision": "B", "reason": "...", "adjustment": {{"retry_task": {{"task_id": "...", "fix_hint": "..."}}}}}}
 选 C: {{"decision": "C", "reason": "...", "adjustment": {{"skip_tasks": ["task_id"]}}}}
-选 D: {{"decision": "D", "reason": "...", "conclusion": "..."}}"""
+选 D: {{"decision": "D", "reason": "...", "conclusion": "..."}}
+选 E: {{"decision": "E", "tool_call": {{"name": "read_file|list_dir|search|file_stat", "args": {{...}}}}}}"""
 
         try:
             response = await self.llm.chat(
@@ -810,11 +966,35 @@ WHERE 条件
             json_str = extract_json(response)
             if json_str:
                 data = json.loads(json_str)
-                self._log.info(f"决策: {data.get('decision', '?')} - {data.get('reason', '')}")
+                decision = data.get("decision", "A")
+                self._log.info(f"决策: {decision} - {data.get('reason', '')}")
+
+                if decision == "E" and _depth < 3:
+                    observation = await self._execute_tool_call(data.get("tool_call", {}))
+                    return await self._llm_decide(
+                        state, current_task, ready_tasks, collected_results,
+                        _tool_observation=observation, _depth=_depth + 1,
+                    )
                 return data
         except Exception as e:
             self._log.warn(f"决策解析失败: {e}")
         return {"decision": "A", "reason": "解析失败，默认继续"}
+
+    async def _execute_tool_call(self, tool_call: dict[str, Any]) -> str:
+        """执行 LLM 请求的工具调用，返回观察结果文本"""
+        name = tool_call.get("name", "")
+        args = tool_call.get("args", {})
+        if not name:
+            return "错误：未指定工具名称"
+
+        self._log.info(f"执行工具调用: {name}({args})")
+        result = await self.unix.invoke(name, **args)
+        if result.success:
+            data = result.data
+            if "content" in data:
+                return data["content"][:3000]
+            return json.dumps(data, ensure_ascii=False, indent=2)[:3000]
+        return f"工具调用失败: {result.error}"
 
     def _detect_issues(self, data_summary: str) -> str:
         """检测执行结果中的问题"""
@@ -839,14 +1019,16 @@ WHERE 条件
         return "\n\n".join(lines)
 
     def _apply_decision(
-        self, data: dict[str, Any], current_task: AnalysisTask, state: ReActState
+        self, data: dict[str, Any], current_task: AnalysisTask, state: ReActState,
+        collected_results: dict[str, list[dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         """应用决策结果"""
+        results = collected_results if collected_results is not None else state.temp_results
         decision = data.get("decision", "A")
         reason = data.get("reason", "")
 
         if decision == "A":
-            next_task = self._get_next_task(state.temp_results)
+            next_task = self._get_next_task(results)
             if next_task:
                 return {"action": "continue", "task": next_task}
             return {"action": "done", "reason": "plan_completed"}
@@ -867,7 +1049,7 @@ WHERE 条件
                             "retry_hint": retry.meta.get("retry_hint", ""),
                             "adjustment_applied": adjust_result}
 
-            next_task = self._get_next_task(state.temp_results)
+            next_task = self._get_next_task(results)
             if next_task:
                 return {"action": "continue", "task": next_task, "adjustment_applied": adjust_result}
             return {"action": "done", "reason": "调整后无可执行任务"}
@@ -875,7 +1057,7 @@ WHERE 条件
         elif decision == "C":
             adjustment = data.get("adjustment", {})
             self.apply_adjustment(adjustment, state)
-            next_task = self._get_next_task(state.temp_results)
+            next_task = self._get_next_task(results)
             if next_task:
                 return {"action": "continue", "task": next_task}
             return {"action": "done", "reason": "跳过后无可执行任务"}

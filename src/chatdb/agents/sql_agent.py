@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 from chatdb.agents.base import BaseAgent, AgentContext, AgentResult, AgentStatus
 from chatdb.config.metrics_loader import preprocess_yaml_config
+from chatdb.core.messages import TaskRequest, TaskResponse, TaskResultEntry
 from chatdb.core.react_state import ReActState
 from chatdb.database.base import BaseDatabaseConnector
 from chatdb.llm.base import BaseLLM
@@ -203,7 +204,7 @@ def get_task_meta(task_type: SQLTaskType) -> SQLTaskMeta:
 
 # Handler 类型签名
 SQLTaskHandler = Callable[
-    ["SQLAgent", ReActState, AgentContext, dict[str, Any]],
+    ["SQLAgent", ReActState, AgentContext, TaskRequest, TaskResponse],
     Awaitable[None]
 ]
 
@@ -246,13 +247,13 @@ class SQLAgentThought:
 
 @dataclass
 class TaskResult:
-    """任务执行结果（写入 temp_results）"""
+    """任务执行结果（兼容旧接口，内部已迁移到 TaskResultEntry）"""
     subtask: str
     sql: str = ""
     row_count: int = 0
-    examples: list[dict[str, Any]] = field(default_factory=list)  # 前 N 行样例
-    stats: dict[str, Any] = field(default_factory=dict)           # 描述性统计
-    issues: list[str] = field(default_factory=list)               # 问题/警告
+    examples: list[dict[str, Any]] = field(default_factory=list)
+    stats: dict[str, Any] = field(default_factory=dict)
+    issues: list[str] = field(default_factory=list)
     
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -263,6 +264,17 @@ class TaskResult:
             "stats": self.stats,
             "issues": self.issues,
         }
+
+    def to_entry(self) -> TaskResultEntry:
+        """转换为 TaskResultEntry"""
+        return TaskResultEntry(
+            subtask=self.subtask,
+            sql=self.sql,
+            row_count=self.row_count,
+            examples=self.examples,
+            stats=self.stats,
+            issues=self.issues,
+        )
 
 
 @dataclass
@@ -405,7 +417,7 @@ class SQLAgent(BaseAgent):
 
     def _build_task_context(
         self,
-        task: dict[str, Any],
+        request: TaskRequest,
         task_type: SQLTaskType,
         state: ReActState,
         *,
@@ -442,17 +454,20 @@ class SQLAgent(BaseAgent):
             time_granularity = meta.default_time_granularity
         
         # ★ 提取 Planner 的 SQL 修复建议
-        task_meta = task.get("meta", {})
-        retry_hint = task_meta.get("retry_hint", "")
-        retry_count = task_meta.get("retry_count", 0)
+        retry_hint = request.meta.get("retry_hint", "")
+        retry_count = request.meta.get("retry_count", 0)
+        
+        # 优先使用 request 中的 parent_results_summary
+        if not parent_results_summary and request.parent_results_summary:
+            parent_results_summary = request.parent_results_summary
         
         ctx = {
             # 基础任务信息
-            "task_id": task.get("id", ""),
+            "task_id": request.task_id,
             "task_type": task_type.value,
-            "description": task.get("description", ""),
-            "notes": task.get("notes", []),
-            "depends_on": task.get("depends_on", []),
+            "description": request.description,
+            "notes": list(request.notes),
+            "depends_on": list(request.depends_on),
             
             # SQLAgent 补充的执行提示
             "time_granularity": time_granularity,
@@ -480,6 +495,43 @@ class SQLAgent(BaseAgent):
         if extra:
             ctx.update(extra)
         return ctx
+
+    @staticmethod
+    def _resolve_dimension_column(dim_id: str, yml_config: dict[str, Any]) -> str:
+        """将维度 ID 解析为实际列名（如 dim_product → 考核产品）"""
+        dims = yml_config.get("dimensions", {})
+        if dim_id in dims:
+            return dims[dim_id].get("column", dim_id)
+        return dim_id
+
+    @staticmethod
+    def _custom_condition_to_sql(col: str, op: str, val: Any, yml_config: dict[str, Any]) -> str | None:
+        """
+        将 custom condition 转换为 DuckDB SQL 表达式。
+        
+        自动将维度 ID（如 dim_product）解析为真实列名（如 考核产品）。
+        """
+        real_col = SQLAgent._resolve_dimension_column(col, yml_config)
+        quoted = f'"{real_col}"'
+        op = (op or "=").upper()
+
+        if op == "IN":
+            if isinstance(val, str):
+                values = [v.strip() for v in val.split(",") if v.strip()]
+            elif isinstance(val, (list, tuple)):
+                values = [str(v) for v in val]
+            else:
+                values = [str(val)]
+            if not values:
+                return None
+            vals_str = ", ".join(f"'{v}'" for v in values)
+            return f"{quoted} IN ({vals_str})"
+        elif op in ("=", "!=", "<>", ">", "<", ">=", "<="):
+            op_str = "!=" if op == "<>" else op
+            return f"{quoted} {op_str} '{val}'"
+        elif op == "LIKE":
+            return f"{quoted} LIKE '{val}'"
+        return None
 
     def _expand_derived_metric(
         self, 
@@ -754,62 +806,74 @@ class SQLAgent(BaseAgent):
                                 "description": f_def.get("description", ""),
                             })
         
+        # ★ 追加 intent 中的 custom 条件（如多轮对话指代消解产生的 IN 条件）
+        if state.intent:
+            for cond in state.intent.get_custom_filters():
+                col = cond.get("column", "")
+                op = (cond.get("op") or cond.get("operator", "=")).upper()
+                val = cond.get("value")
+                if not col or val is None:
+                    continue
+                sql_expr = self._custom_condition_to_sql(col, op, val, yml_config)
+                if sql_expr:
+                    required_filters.append({
+                        "id": f"custom_{col}",
+                        "label": f"用户指定筛选: {col}",
+                        "expr": sql_expr,
+                        "description": "来自用户查询的自定义筛选条件（如多轮对话指代消解）",
+                    })
+
         state.required_filters = required_filters
-        
+
         agg_preview = metric_def.get('agg', '')[:50] if metric_def.get('agg') else ''
         self._log.info(f"注入指标定义: {metric_name} ({metric_type}), agg={agg_preview}..., "
                        f"required_filters={len(required_filters)}个")
 
-    async def run_task(self, state: ReActState, context: AgentContext, task: dict[str, Any]) -> None:
+    async def run_task(
+        self,
+        state: ReActState,
+        context: AgentContext,
+        request: TaskRequest,
+    ) -> TaskResponse:
         """
         执行 Planner 给的分析任务（核心接口）
         
-        重构后使用注册表分发，支持插件式扩展。
+        通过显式消息通信：
+        - 输入: TaskRequest（Orchestrator 构建，包含任务描述和上游结果摘要）
+        - 输出: TaskResponse（SQLAgent 返回，Orchestrator 决定如何存储）
         
-        ReAct 回放只记录关键信息：
-        - THINK: 分析思路
-        - ACT: 执行的 SQL
-        - OBSERVE: 执行结果
+        SQLAgent 不再直接写入 state.temp_results，
+        由 Orchestrator 收到 TaskResponse 后集中管理。
         
         Args:
-            state: ReAct 状态
-            context: Agent 上下文
-            task: Planner 任务
+            state: ReAct 状态（SQLAgent 只读数据层字段 + 写执行期临时状态）
+            context: Agent 上下文（API 兼容层）
+            request: 任务请求消息
         
-        结果写入 state.temp_results[task_id]
+        Returns:
+            TaskResponse: 执行结果消息
         """
         self._thoughts = []
-        task_id = task.get("id", "unknown")
-        raw_type = task.get("type", "basic")
-        description = task.get("description", "")
-        notes = task.get("notes", [])
+        response = TaskResponse(task_id=request.task_id)
         
         # 注入领域配置
         if self.config:
             state.yml_config = self.config.raw_config
-            context.yml_config = self.config.raw_config
             if not state.table_name:
                 state.table_name = self.config.table_name
         
-        # ★ 关键：检查是否是重试任务
-        task_meta = task.get("meta", {})
-        retry_count = task_meta.get("retry_count", 0)
-        retry_hint = task_meta.get("retry_hint", "")
-        
-        # 初始化或清空 temp_results
+        # 重试时清除旧执行状态
+        retry_count = request.meta.get("retry_count", 0)
         if retry_count > 0:
-            self._log.info(f"重试任务 {task_id}（第 {retry_count} 次），清除旧结果")
-            state.temp_results[task_id] = []
+            self._log.info(f"重试任务 {request.task_id}（第 {retry_count} 次）")
             state.execution_error = None
             state.error = None
-        elif task_id not in state.temp_results:
-            state.temp_results[task_id] = []
         
         # 类型解析：字符串 → 枚举（类型安全）
         try:
-            task_type = SQLTaskType(raw_type)
+            task_type = SQLTaskType(request.task_type)
         except ValueError:
-            self._log.warn(f"未知任务类型: {raw_type}，使用 basic")
+            self._log.warn(f"未知任务类型: {request.task_type}，使用 basic")
             task_type = SQLTaskType.BASIC
         
         # 获取 handler（注册表分发）
@@ -819,60 +883,64 @@ class SQLAgent(BaseAgent):
             handler = get_task_handler(SQLTaskType.BASIC)
         
         # THINK: 记录分析思路
-        state.think(description)
+        state.think(request.description)
         
-        # 执行 handler
+        # 执行 handler（handler 将结果追加到 response.results）
         try:
             if handler:
-                await handler(self, state, context, task)
+                await handler(self, state, context, request, response)
             else:
                 self._log.error("无法找到任何 handler，执行最简查询")
-                await self._fallback_basic_query(state, context, task)
+                await self._fallback_basic_query(state, context, request, response)
         except Exception as e:
             self._log.error(f"任务执行失败: {e}")
-            result = TaskResult(subtask="error", issues=[str(e)])
-            state.temp_results[task_id].append(result.to_dict())
+            response.success = False
+            response.error = str(e)
+            response.results.append(TaskResultEntry(subtask="error", issues=[str(e)]))
         
         # 进入下一个 ReAct 步骤
         state.next_step()
+        return response
     
     async def _fallback_basic_query(
-        self, state: ReActState, context: AgentContext, task: dict[str, Any]
+        self, state: ReActState, context: AgentContext,
+        request: TaskRequest, response: TaskResponse,
     ) -> None:
         """兜底的基础查询（当没有注册 handler 时）"""
-        task_id = task.get("id", "basic")
         self._inject_metric_definition(state)
-        context.current_task = self._build_task_context(
-            task, SQLTaskType.BASIC, state,
+        state.current_task = self._build_task_context(
+            request, SQLTaskType.BASIC, state,
             intent_hint="执行基础查询，获取核心指标",
         )
         await self._sql_tool.run_workflow(state, context)
         result = self._collect_result("basic_query", state)
-        state.temp_results[task_id].append(result.to_dict())
+        response.results.append(result)
 
     # ============================================================
     # 任务执行器（已迁移到模块级 handler 函数）
     # 以下方法保留为内部工具方法
     # ============================================================
 
-    def _get_parent_results_summary(self, state: ReActState, task: dict[str, Any]) -> str:
-        """获取上游任务结果摘要（供子节点参考）"""
-        depends_on = task.get("depends_on", [])
-        if not depends_on or not state.temp_results:
+    def _get_parent_results_summary(self, request: TaskRequest) -> str:
+        """从 TaskRequest 获取上游任务结果摘要"""
+        # 优先使用 Orchestrator 预构建的摘要
+        if request.parent_results_summary:
+            return request.parent_results_summary
+        
+        # 从 previous_results 构建（兜底）
+        if not request.previous_results:
             return ""
         
         summaries = []
-        for parent_id in depends_on:
-            parent_results = state.temp_results.get(parent_id, [])
-            for r in parent_results:
-                stats = r.get("stats", {})
-                if stats.get("available_years"):
-                    summaries.append(f"可用年份: {stats['available_years']}")
-                if stats.get("top_contributor"):
-                    summaries.append(f"top贡献: {stats['top_contributor']}")
-                row_count = r.get("row_count", 0)
-                if row_count:
-                    summaries.append(f"上游返回 {row_count} 行")
+        for r in request.previous_results:
+            stats = r.get("stats", {})
+            if stats.get("available_years"):
+                summaries.append(f"可用年份: {stats['available_years']}")
+            if stats.get("top_contributor"):
+                summaries.append(f"top贡献: {stats['top_contributor']}")
+            row_count = r.get("row_count", 0)
+            if row_count:
+                summaries.append(f"上游返回 {row_count} 行")
         
         return "; ".join(summaries) if summaries else ""
 
@@ -880,13 +948,13 @@ class SQLAgent(BaseAgent):
     # 结果收集与统计
     # ============================================================
 
-    def _collect_result(self, subtask: str, state: ReActState) -> TaskResult:
+    def _collect_result(self, subtask: str, state: ReActState) -> TaskResultEntry:
         """
-        收集 SQL 执行结果，生成 TaskResult
+        收集 SQL 执行结果，生成 TaskResultEntry
         
         包含：样例行 + 描述性统计 + 问题诊断
         """
-        result = TaskResult(subtask=subtask)
+        result = TaskResultEntry(subtask=subtask)
         result.sql = state.current_sql or ""
         
         # ★ 重要：先检查执行错误，即使 execute_result 为空也要记录错误信息
@@ -951,13 +1019,9 @@ class SQLAgent(BaseAgent):
                 return float(val)
         return 0.0
 
-    def _get_previous_results(self, state: ReActState, exclude_task: str = "") -> list[dict[str, Any]]:
-        """获取之前的任务结果"""
-        results = []
-        for task_id, task_results in state.temp_results.items():
-            if task_id != exclude_task:
-                results.extend(task_results)
-        return results
+    def _get_previous_results(self, request: TaskRequest) -> list[dict[str, Any]]:
+        """从 TaskRequest 获取之前的任务结果"""
+        return list(request.previous_results)
 
     # ============================================================
     # 兼容旧接口
@@ -972,31 +1036,29 @@ class SQLAgent(BaseAgent):
         """
         执行 SQL 分析流程（兼容旧接口）
         
-        如果有 instructions，转换为 task 格式调用 run_task
+        如果有 instructions，转换为 TaskRequest 格式调用 run_task
         """
         self._thoughts = []
         
         # 确保有基本信息
         if self.config:
             state.yml_config = self.config.raw_config
-            context.yml_config = self.config.raw_config
             if not state.table_name:
                 state.table_name = self.config.table_name
         
-        # 有指令时，转换为 task 格式
+        # 有指令时，转换为 TaskRequest 格式
         if instructions:
-            task: dict[str, Any] = {
-                "id": instructions.get("step", "task"),
-                "type": self._map_task_type(instructions.get("task", "")),
-                "description": instructions.get("task", ""),
-                "notes": [],
-            }
-            # 如果有 instructions 子字段，加入 notes
-            if instructions.get("instructions"):
-                notes_list: list[str] = task["notes"]
-                notes_list.append(str(instructions["instructions"]))
+            request = TaskRequest(
+                task_id=instructions.get("step", "task"),
+                task_type=self._map_task_type(instructions.get("task", "")),
+                description=instructions.get("task", ""),
+                notes=tuple([str(instructions["instructions"])]) if instructions.get("instructions") else (),
+            )
             
-            await self.run_task(state, context, task)
+            response = await self.run_task(state, context, request)
+            # 兼容：将结果写回 state.temp_results
+            if response.results:
+                state.temp_results[request.task_id] = response.to_results_dicts()
             return
         
         # 无指令时，使用基础流程
@@ -1118,21 +1180,20 @@ async def handle_basic_task(
     agent: SQLAgent,
     state: ReActState,
     context: AgentContext,
-    task: dict[str, Any],
+    request: TaskRequest,
+    response: TaskResponse,
 ) -> None:
     """执行基础查询任务
     
     根据 Intent 中的时间粒度提示 LLM 如何分组。
     LLM 会根据 column_profiles（列元信息）自行推理合适的分组列。
     """
-    task_id = task.get("id", "basic")
-    
     # 注入指标定义
     agent._inject_metric_definition(state)
     
     # 构建任务上下文（LLM 根据 Intent 和 column_profiles 自行推理分组方式）
-    context.current_task = agent._build_task_context(
-        task, SQLTaskType.BASIC, state,
+    state.current_task = agent._build_task_context(
+        request, SQLTaskType.BASIC, state,
     )
     
     # 执行 SQL
@@ -1146,7 +1207,7 @@ async def handle_basic_task(
         total = sum(agent._get_numeric_value(ex) for ex in result.examples)
         result.stats["total_value"] = total
     
-    state.temp_results[task_id].append(result.to_dict())
+    response.results.append(result)
 
 
 @register_sql_task_handler(SQLTaskType.TREND)
@@ -1154,17 +1215,16 @@ async def handle_trend_task(
     agent: SQLAgent,
     state: ReActState,
     context: AgentContext,
-    task: dict[str, Any],
+    request: TaskRequest,
+    response: TaskResponse,
 ) -> None:
     """执行趋势分析任务"""
-    task_id = task.get("id", "trend")
-    
     # 注入指标定义
     agent._inject_metric_definition(state)
     
     # 构建任务上下文
-    context.current_task = agent._build_task_context(
-        task, SQLTaskType.TREND, state,
+    state.current_task = agent._build_task_context(
+        request, SQLTaskType.TREND, state,
         time_granularity="year",
         intent_hint="按年聚合总流水，观察年度变化趋势，需要 GROUP BY 时间列并按时间排序",
     )
@@ -1184,7 +1244,7 @@ async def handle_trend_task(
     if result.examples:
         years = [ex.get("年") or ex.get("year") for ex in result.examples if ex.get("年") or ex.get("year")]
         result.stats["available_years"] = years
-        result.stats["year_count"] = len(years)  # 统一字段名
+        result.stats["year_count"] = len(years)
         
         # 计算增长率（如果有多年数据）
         if len(result.examples) >= 2:
@@ -1195,7 +1255,7 @@ async def handle_trend_task(
         if len(years) <= 1:
             result.issues.append("only_single_year")
     
-    state.temp_results[task_id].append(result.to_dict())
+    response.results.append(result)
 
 
 @register_sql_task_handler(SQLTaskType.SOURCE)
@@ -1203,11 +1263,10 @@ async def handle_source_task(
     agent: SQLAgent,
     state: ReActState,
     context: AgentContext,
-    task: dict[str, Any],
+    request: TaskRequest,
+    response: TaskResponse,
 ) -> None:
     """执行来源分析任务（按维度拆解）"""
-    task_id = task.get("id", "source")
-    
     # 注入指标定义
     agent._inject_metric_definition(state)
     
@@ -1219,7 +1278,7 @@ async def handle_source_task(
         priority_dims = ["国内/海外", "投资公司标签", "产品大类"]
     
     # 获取上游任务结果摘要
-    parent_summary = agent._get_parent_results_summary(state, task)
+    parent_summary = agent._get_parent_results_summary(request)
     
     # 对每个维度尝试分析
     for dim in priority_dims[:3]:
@@ -1227,8 +1286,8 @@ async def handle_source_task(
             continue
         
         # 构建任务上下文
-        context.current_task = agent._build_task_context(
-            task, SQLTaskType.SOURCE, state,
+        state.current_task = agent._build_task_context(
+            request, SQLTaskType.SOURCE, state,
             current_dimension=dim,
             intent_hint=f"按维度「{dim}」拆解来源构成，GROUP BY 该维度并按数值降序排序，找出主要贡献来源",
             parent_results_summary=parent_summary,
@@ -1269,7 +1328,7 @@ async def handle_source_task(
         elif result.row_count == 1:
             result.issues.append("single_category")
         
-        state.temp_results[task_id].append(result.to_dict())
+        response.results.append(result)
         
         # 如果有有效结果，可以停止
         if result.row_count > 1:
@@ -1281,26 +1340,24 @@ async def handle_drilldown_task(
     agent: SQLAgent,
     state: ReActState,
     context: AgentContext,
-    task: dict[str, Any],
+    request: TaskRequest,
+    response: TaskResponse,
 ) -> None:
     """执行下钻分析任务"""
-    task_id = task.get("id", "drilldown")
-    
-    # 从 temp_results 获取上一步结果
-    prev_results = agent._get_previous_results(state, exclude_task=task_id)
-    parent_summary = agent._get_parent_results_summary(state, task)
+    # 从 TaskRequest 获取上游结果
+    prev_results = agent._get_previous_results(request)
+    parent_summary = agent._get_parent_results_summary(request)
     
     if not prev_results:
-        result = TaskResult(subtask="drilldown", issues=["no_previous_result"])
-        state.temp_results[task_id].append(result.to_dict())
+        response.results.append(TaskResultEntry(subtask="drilldown", issues=["no_previous_result"]))
         return
     
     # 注入指标定义
     agent._inject_metric_definition(state)
     
     # 构建任务上下文
-    context.current_task = agent._build_task_context(
-        task, SQLTaskType.DRILLDOWN, state,
+    state.current_task = agent._build_task_context(
+        request, SQLTaskType.DRILLDOWN, state,
         intent_hint="在上一步结果基础上进一步细分，增加筛选条件或更细粒度的维度",
         parent_results_summary=parent_summary,
         extra={"previous_results": prev_results},
@@ -1313,13 +1370,12 @@ async def handle_drilldown_task(
     result = agent._collect_result("drilldown", state)
     
     # 统一 stats 字段（下钻特有）
-    # 尝试从上游获取 top_ratio 作为 parent_top_ratio
     for pr in prev_results:
         if pr.get("stats", {}).get("top_ratio"):
             result.stats["parent_top_ratio"] = pr["stats"]["top_ratio"]
             break
     
-    state.temp_results[task_id].append(result.to_dict())
+    response.results.append(result)
 
 
 @register_sql_task_handler(SQLTaskType.COMPARISON)
@@ -1327,20 +1383,19 @@ async def handle_comparison_task(
     agent: SQLAgent,
     state: ReActState,
     context: AgentContext,
-    task: dict[str, Any],
+    request: TaskRequest,
+    response: TaskResponse,
 ) -> None:
     """执行对比分析任务"""
-    task_id = task.get("id", "comparison")
-    
     # 注入指标定义
     agent._inject_metric_definition(state)
     
     # 获取上游结果摘要
-    parent_summary = agent._get_parent_results_summary(state, task)
+    parent_summary = agent._get_parent_results_summary(request)
     
     # 构建任务上下文
-    context.current_task = agent._build_task_context(
-        task, SQLTaskType.COMPARISON, state,
+    state.current_task = agent._build_task_context(
+        request, SQLTaskType.COMPARISON, state,
         intent_hint="对比两个时间段或条件下的指标，计算差值或增长率",
         parent_results_summary=parent_summary,
     )
@@ -1360,7 +1415,7 @@ async def handle_comparison_task(
                 result.stats["growth_rate"] = round((values[1] - values[0]) / values[0], 4)
             result.stats["comparison_base"] = values[0]
     
-    state.temp_results[task_id].append(result.to_dict())
+    response.results.append(result)
 
 
 @register_sql_task_handler(SQLTaskType.SUMMARY)
@@ -1368,14 +1423,11 @@ async def handle_summary_task(
     agent: SQLAgent,
     state: ReActState,
     context: AgentContext,
-    task: dict[str, Any],
+    request: TaskRequest,
+    response: TaskResponse,
 ) -> None:
     """处理总结任务（由 Orchestrator 处理，此处仅记录）"""
-    task_id = task.get("id", "summary")
-    
-    # 记录一个空结果，标明此任务已处理
-    result = TaskResult(subtask="summary", issues=["handled_by_orchestrator"])
-    state.temp_results[task_id].append(result.to_dict())
+    response.results.append(TaskResultEntry(subtask="summary", issues=["handled_by_orchestrator"]))
 
 
 @register_sql_task_handler(SQLTaskType.VALIDATION)
@@ -1383,7 +1435,8 @@ async def handle_validation_task(
     agent: SQLAgent,
     state: ReActState,
     context: AgentContext,
-    task: dict[str, Any],
+    request: TaskRequest,
+    response: TaskResponse,
 ) -> None:
     """
     执行数据验证/诊断任务
@@ -1394,9 +1447,6 @@ async def handle_validation_task(
     2. 逐步添加条件，看哪个条件导致数据为空
     3. 检查关键字段的值分布
     """
-    task_id = task.get("id", "validation")
-    description = task.get("description", "")
-    
     table_name = state.table_name
     
     # 诊断 SQL 列表（简单查询，不是业务计算）
@@ -1410,16 +1460,13 @@ async def handle_validation_task(
     })
     
     # 2. 检查关键筛选字段的值分布
-    # 从 Intent 中获取筛选条件相关的字段
     filter_fields = set()
     
-    # 从 Intent 的 filter_refs 提取字段名
     if state.intent and hasattr(state.intent, 'filter_refs'):
         for ref in state.intent.filter_refs:
             if hasattr(ref, 'column') and ref.column:
                 filter_fields.add(ref.column)
     
-    # 从 available_columns 获取列名列表
     available_col_names = set()
     if state.available_columns:
         for col in state.available_columns:
@@ -1427,34 +1474,29 @@ async def handle_validation_task(
             if col_name:
                 available_col_names.add(col_name)
     
-    # 常见的可能导致空结果的字段（只添加存在的字段）
     common_filter_fields = ["产品大类", "数据集来源", "大盘报表项", "统一剔除标签", "考核口径", "特殊口径"]
     for f in common_filter_fields:
         if f in available_col_names:
             filter_fields.add(f)
     
-    # 为每个筛选字段生成值分布查询
-    for field in list(filter_fields)[:5]:  # 最多检查 5 个字段
+    for fld in list(filter_fields)[:5]:
         diagnostic_sqls.append({
-            "name": f"values_{field}",
-            "sql": f'SELECT "{field}", COUNT(*) as cnt FROM "{table_name}" GROUP BY "{field}" ORDER BY cnt DESC LIMIT 10',
-            "desc": f"字段 [{field}] 的值分布"
+            "name": f"values_{fld}",
+            "sql": f'SELECT "{fld}", COUNT(*) as cnt FROM "{table_name}" GROUP BY "{fld}" ORDER BY cnt DESC LIMIT 10',
+            "desc": f"字段 [{fld}] 的值分布"
         })
     
     # 执行诊断查询
-    results = []
     for diag in diagnostic_sqls:
         try:
             rows = await agent.db_connector.execute_query(diag["sql"])
-            result = TaskResult(
+            result = TaskResultEntry(
                 subtask=diag["name"],
                 sql=diag["sql"],
                 row_count=len(rows),
                 examples=rows[:10] if rows else [],
             )
-            results.append(result)
             
-            # 记录诊断发现
             if diag["name"] == "total_rows" and rows:
                 total = rows[0].get("cnt", 0)
                 if total == 0:
@@ -1468,17 +1510,13 @@ async def handle_validation_task(
                     result.issues.append("no_values")
                     
         except Exception as e:
-            result = TaskResult(
+            result = TaskResultEntry(
                 subtask=diag["name"],
                 sql=diag["sql"],
                 row_count=0,
                 issues=[f"query_error: {str(e)[:100]}"],
             )
-            results.append(result)
-    
-    # 汇总诊断结果
-    for r in results:
-        state.temp_results[task_id].append(r.to_dict())
+        response.results.append(result)
 
 
 @register_sql_task_handler(SQLTaskType.RATIO)
@@ -1486,7 +1524,8 @@ async def handle_ratio_task(
     agent: SQLAgent,
     state: ReActState,
     context: AgentContext,
-    task: dict[str, Any],
+    request: TaskRequest,
+    response: TaskResponse,
 ) -> None:
     """
     执行占比分析任务
@@ -1502,20 +1541,13 @@ async def handle_ratio_task(
     FROM 表
     WHERE 全局条件
     ```
-    
-    关键点：
-    - 分子条件放 CASE WHEN（由 LLM 在生成 SQL 时智能识别）
-    - 全局条件放 WHERE
-    - 口径设计已合并到 generate_sql 的 prompt 中，无需单独步骤
     """
-    task_id = task.get("id", "ratio")
-    
     # 注入指标定义
     agent._inject_metric_definition(state)
     
     # 构建任务上下文
-    context.current_task = agent._build_task_context(
-        task, SQLTaskType.RATIO, state,
+    state.current_task = agent._build_task_context(
+        request, SQLTaskType.RATIO, state,
         intent_hint="计算占比，LLM 需智能判断：分子条件用 CASE WHEN，全局条件用 WHERE，输出占比百分比",
     )
     
@@ -1527,7 +1559,6 @@ async def handle_ratio_task(
     
     # 统一 stats 字段（占比特有）
     if result.examples:
-        # 尝试从结果中提取占比相关字段
         for ex in result.examples:
             for key, val in ex.items():
                 if "占比" in key or "ratio" in key.lower() or "percent" in key.lower():
@@ -1541,7 +1572,7 @@ async def handle_ratio_task(
                     if isinstance(val, (int, float)):
                         result.stats["denominator"] = val
     
-    state.temp_results[task_id].append(result.to_dict())
+    response.results.append(result)
 
 
 @register_sql_task_handler(SQLTaskType.RANKING)
@@ -1549,32 +1580,20 @@ async def handle_ranking_task(
     agent: SQLAgent,
     state: ReActState,
     context: AgentContext,
-    task: dict[str, Any],
+    request: TaskRequest,
+    response: TaskResponse,
 ) -> None:
     """
     执行排名分析任务
     
     核心目标：按指标排序，找出 TopN 或 BottomN
-    
-    SQL 模式：
-    ```sql
-    SELECT 维度列, SUM(指标) as 指标值
-    FROM 表
-    WHERE 条件
-    GROUP BY 维度列
-    ORDER BY 指标值 DESC
-    LIMIT N
-    ```
     """
-    task_id = task.get("id", "ranking")
-    task_desc = task.get("description", "")
-    
     # 注入指标定义
     agent._inject_metric_definition(state)
     
     # 获取排名参数（从 Intent 中）
     order_by = None
-    limit = 10  # 默认 Top10
+    limit = 10
     
     if state.intent:
         order_by = getattr(state.intent, "order_by", None)
@@ -1585,8 +1604,8 @@ async def handle_ranking_task(
         direction = order_by.get("direction", "DESC")
     
     # 构建任务上下文
-    context.current_task = agent._build_task_context(
-        task, SQLTaskType.RANKING, state,
+    state.current_task = agent._build_task_context(
+        request, SQLTaskType.RANKING, state,
         intent_hint=f"按指标{'降序' if direction == 'DESC' else '升序'}排序，返回 Top{limit}，需要 GROUP BY 维度 ORDER BY 指标 {direction} LIMIT {limit}",
         extra={"limit": limit, "order_direction": direction},
     )
@@ -1602,10 +1621,8 @@ async def handle_ranking_task(
     result.stats["direction"] = direction
     
     if result.examples:
-        # 记录排名结果
         result.stats["top_items"] = len(result.examples)
         
-        # 找到数值列，记录最大/最小值
         for ex in result.examples:
             for key, val in ex.items():
                 if isinstance(val, (int, float)) and not isinstance(val, bool):
@@ -1614,4 +1631,4 @@ async def handle_ranking_task(
                     result.stats["bottom_value"] = val
                     break
     
-    state.temp_results[task_id].append(result.to_dict())
+    response.results.append(result)

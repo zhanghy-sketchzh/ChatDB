@@ -241,19 +241,50 @@ class ToolRegistry:
     def get_function_schemas(
         self,
         agent_name: str | None = None,
+        expand_subtools: bool = True,
     ) -> list[dict[str, Any]]:
         """
-        获取工具的 Function Schema（用于 OpenAI Function Calling）
-        
+        获取工具的 Function Schema（用于 LLM Function Calling）
+
         Args:
             agent_name: 只获取该 Agent 可用的工具
+            expand_subtools: 若为 True，将子工具展开为独立函数；否则返回顶层 schema
         """
         if agent_name:
             tools = self.get_for_agent(agent_name)
         else:
             tools = self.list_tools()
-        
-        return [tool.to_function_schema() for tool in tools]
+
+        schemas: list[dict[str, Any]] = []
+        for tool in tools:
+            sub_schemas = tool.get_subtool_schemas() if expand_subtools else []
+            if sub_schemas:
+                schemas.extend(sub_schemas)
+            else:
+                schemas.append(tool.to_function_schema())
+        return schemas
+
+    def get_tool_instructions(self, agent_name: str | None = None) -> str:
+        """
+        生成 LLM 可读的完整工具使用说明（含子工具详情）
+
+        与 get_tools_description 的区别：
+        - get_tools_description: 概要描述
+        - get_tool_instructions: 完整指令集，包含每个子工具的参数说明
+        """
+        if agent_name:
+            tools = self.get_for_agent(agent_name)
+        else:
+            tools = self.list_tools()
+
+        if not tools:
+            return "无可用工具"
+
+        sections = ["# 可用工具指令集\n"]
+        for tool in tools:
+            sections.append(tool.get_tool_instructions())
+            sections.append("")
+        return "\n".join(sections)
     
     # ============================================================
     # 工具调用
