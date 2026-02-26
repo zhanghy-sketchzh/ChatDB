@@ -206,34 +206,37 @@ class ScratchPadManager:
         从完整结果生成紧凑摘要（用于 Planner prompt）
 
         摘要策略：
-        - 行数 + Top N 值 + 统计信息
-        - 控制在 200 字符以内
+        - 行数 + Top N（维度=指标） + 变化趋势洞察
+        - 控制在 400 字符以内
         """
-        parts = []
+        parts: list[str] = []
         row_count = full_result.get("row_count", 0)
         parts.append(f"共 {row_count} 行")
 
-        # 从 examples 提取 Top 值
         examples = full_result.get("examples", [])
         if examples:
-            # 找到数值列，展示 Top3
             top_items = self._extract_top_items(examples, n=3)
             if top_items:
                 parts.append(f"Top: {top_items}")
+            
+            # 时序变化洞察（多行数值数据时自动计算）
+            trend_insight = self._extract_trend_insight(examples)
+            if trend_insight:
+                parts.append(trend_insight)
 
-        # 从 stats 提取关键统计
+        # 从 stats 提取关键统计（排除易误导的聚合字段）
         stats = full_result.get("stats", {})
-        stat_parts = []
-        for key, val in list(stats.items())[:3]:
-            if key == "row_count":
-                continue
-            stat_parts.append(f"{key}={val}")
+        skip_keys = {"row_count", "available_years", "year_count"}
+        stat_parts = [
+            f"{k}={v}" for k, v in list(stats.items())[:3]
+            if k not in skip_keys
+        ]
         if stat_parts:
             parts.append(", ".join(stat_parts))
 
         summary = "; ".join(parts)
-        if len(summary) > 300:
-            summary = summary[:297] + "..."
+        if len(summary) > 400:
+            summary = summary[:397] + "..."
         return summary
 
     @staticmethod
@@ -242,38 +245,70 @@ class ScratchPadManager:
         if not examples:
             return ""
 
-        # 找到第一个字符串列（维度）和第一个数值列（指标）
-        dim_col = None
-        val_col = None
+        dim_col, val_col = None, None
         for key, val in examples[0].items():
             if dim_col is None and isinstance(val, str):
                 dim_col = key
-            if val_col is None and isinstance(val, (int, float)) and not isinstance(val, bool):
+            if val_col is None and isinstance(val, float):
                 val_col = key
             if dim_col and val_col:
                 break
 
-        if not dim_col or not val_col:
-            # 没有明确的维度+指标，返回前 N 行的第一个字段值
-            items = []
-            for ex in examples[:n]:
-                first_val = list(ex.values())[0] if ex else "?"
-                items.append(str(first_val))
+        # 整数维度列（如年份）不应被当作指标
+        if not dim_col:
+            for key, val in examples[0].items():
+                if isinstance(val, int) and not isinstance(val, bool):
+                    dim_col = key
+                    break
+
+        if not val_col:
+            items = [str(list(ex.values())[0]) for ex in examples[:n] if ex]
             return ", ".join(items)
 
-        items = []
+        items: list[str] = []
         for ex in examples[:n]:
-            dim_val = ex.get(dim_col, "?")
+            dim_val = ex.get(dim_col, "?") if dim_col else "?"
             num_val = ex.get(val_col, 0)
-            # 格式化大数字
             if isinstance(num_val, (int, float)) and abs(num_val) >= 1e8:
                 items.append(f"{dim_val}={num_val/1e8:.2f}亿")
             elif isinstance(num_val, (int, float)) and abs(num_val) >= 1e4:
                 items.append(f"{dim_val}={num_val/1e4:.2f}万")
             else:
                 items.append(f"{dim_val}={num_val}")
-
         return ", ".join(items)
+
+    @staticmethod
+    def _extract_trend_insight(examples: list[dict[str, Any]]) -> str:
+        """从时序数据中提取变化趋势洞察（最大涨幅/跌幅）"""
+        if len(examples) < 2:
+            return ""
+
+        dim_col, val_col = None, None
+        for key, val in examples[0].items():
+            if val_col is None and isinstance(val, float):
+                val_col = key
+            elif dim_col is None:
+                dim_col = key
+
+        if not dim_col or not val_col:
+            return ""
+
+        max_drop_pct, max_drop_label = 0.0, ""
+        for i in range(1, len(examples)):
+            prev = examples[i - 1].get(val_col, 0)
+            curr = examples[i].get(val_col, 0)
+            if not isinstance(prev, (int, float)) or not isinstance(curr, (int, float)) or prev == 0:
+                continue
+            pct = (curr - prev) / prev
+            if pct < max_drop_pct:
+                max_drop_pct = pct
+                prev_dim = examples[i - 1].get(dim_col, "?")
+                curr_dim = examples[i].get(dim_col, "?")
+                max_drop_label = f"{prev_dim}→{curr_dim}"
+
+        if max_drop_pct < -0.01:
+            return f"最大降幅: {max_drop_label}（{abs(max_drop_pct):.1%}）"
+        return ""
 
     def generate_planner_summary(
         self,
@@ -328,7 +363,7 @@ class ScratchPadManager:
                             lines.append(f"    - {', '.join(f'{k}={v}' for k, v in items)}")
 
                 if stats:
-                    stat_items = list(stats.items())[:5]
+                    stat_items = list(stats.items())
                     lines.append(f"  统计: {', '.join(f'{k}={v}' for k, v in stat_items)}")
                 if issues:
                     lines.append(f"  备注: {', '.join(issues)}")

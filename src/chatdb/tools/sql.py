@@ -310,10 +310,8 @@ class SQLTool:
                         summary = summary[:100] + "..."
                     line += f" -- {summary}"
             else:
-                # 降级：使用旧的 sample_values
-                sample_values = col.get("sample_values", col.get("unique_values_top10", []))
-                if sample_values:
-                    line += f"  -- 示例: {', '.join(str(v) for v in sample_values[:5])}"
+                # 没有 column_profiles，不提供额外信息
+                pass
             
             lines.append(line)
         
@@ -407,8 +405,8 @@ class SQLTool:
         
         lines = []
         for fid in filter_refs:
-            # 识别指标型筛选器（以 metric_ 开头或包含指标相关关键词）
-            if fid.startswith("metric_") or any(kw in fid for kw in ["flow", "gross", "profit", "cost", "revenue"]):
+            # 识别指标型筛选器（以 metric_ 开头，基于 YAML 配置结构识别）
+            if fid.startswith("metric_"):
                 if fid in filters_config:
                     f = filters_config[fid]
                     expr = f.get("expr", "")
@@ -632,6 +630,9 @@ class SQLTool:
             rules.append(
                 '**任务描述解读**：description 中的词汇（如"市场费""今年"）是上下文说明，其对应的筛选条件已在"建议 WHERE 条件"中，不要重复添加'
             )
+            rules.append(
+                '**禁止越权**：SQL 只实现"任务描述"中明确要求的动作。不要自作主张做额外分析（找极值、下钻、排名等）'
+            )
         rules.append("只输出 JSON，不要其他文字")
         return "\n".join(f"{i}. {r}" for i, r in enumerate(rules, 1))
 
@@ -734,8 +735,14 @@ class SQLTool:
             where_section = f"## 建议 WHERE 条件\n以下条件直接用于 WHERE 子句（可追加 AND，不可删改）：\n\n{chr(10).join(where_parts)}"
 
         # ── 4. 结构化意图摘要 ──
+        # ★ task_type 优先使用当前任务的类型（而非全局 intent 的主类型）
+        effective_task_type = (
+            current_task.get("task_type", intent.task_type)
+            if current_task
+            else intent.task_type
+        )
         intent_section = f"""## 结构化意图
-- task_type: {intent.task_type}
+- task_type: {effective_task_type}
 - metrics: {intent.metrics}
 - dimensions: {intent.dimensions}"""
 
@@ -743,9 +750,12 @@ class SQLTool:
         user_query = getattr(state, "user_query", "") if state else ""
         task_instruction = self._build_task_instruction(current_task, user_query)
 
-        # ── 6. 用户查询 ──
+        # ── 6. 用户查询（多任务时精简，避免泄露完整意图导致越权）──
         rewritten = getattr(intent, "rewritten_query", "") or ""
-        if rewritten and rewritten != intent.raw_query:
+        if current_task and current_task.get("description"):
+            # 多步计划：只展示当前任务描述作为查询上下文
+            query_section = f"## 用户查询（当前任务视角）\n{current_task['description']}"
+        elif rewritten and rewritten != intent.raw_query:
             query_section = f"## 用户查询\n{rewritten}\n（原始: {intent.raw_query}）"
         else:
             query_section = f"## 用户查询\n{intent.raw_query}"
@@ -799,6 +809,7 @@ class SQLTool:
         task_desc = current_task.get("description", "")
         task_notes = current_task.get("notes", [])
         current_dim = current_task.get("current_dimension", "")
+        available_dims = current_task.get("available_dimensions", [])
         time_granularity = current_task.get("time_granularity", "")
         intent_hint = current_task.get("intent_hint", "")
         parent_summary = current_task.get("parent_results_summary", "")
@@ -806,28 +817,20 @@ class SQLTool:
         retry_hint = current_task.get("retry_hint", "")
         retry_count = current_task.get("retry_count", 0)
 
-        # ── 过滤 notes：只保留与 SQL 生成相关的技术参数，排除后续步骤意图 ──
-        sql_relevant_notes = []
-        downstream_keywords = ("后续", "下一步", "用于", "为了", "传给", "供")
-        for n in task_notes:
-            n_str = str(n)
-            if not any(kw in n_str for kw in downstream_keywords):
-                sql_relevant_notes.append(n_str)
-
         inst = f"""
 ## 当前分析任务
 - 任务 ID: {task_id}
 - 任务类型: {task_type}
 - 任务描述: {task_desc}
 
-### ★ 任务边界约束（必须遵守）
-- **只完成上述"任务描述"中明确要求的分析动作**，不要做任何额外分析
-- **禁止越权**：如果任务描述是"按年聚合总流水"，就只返回年度聚合数据，不要进一步查找最大/最小值、不要下钻到产品/子维度明细
-- **一个任务 = 一个 SQL = 一种分析动作**：不要用 CTE 把多个不同目的的查询串联起来
-- 后续的深入分析（找极值、下钻、对比等）由其他任务负责，不需要你在这一步完成
+### ★ 任务边界（必须遵守）
+**只完成上述"任务描述"中的动作，禁止越权：**
+- 不要做任务描述之外的额外分析（如找极值、下钻明细、对比等）
+- 不要用 CTE 串联多个不同目的的查询
+- 后续分析由其他任务负责，不需要你在这一步完成
 """
-        if sql_relevant_notes:
-            inst += f"- 注意事项: {'; '.join(sql_relevant_notes)}\n"
+        if task_notes:
+            inst += f"- 注意事项: {'; '.join(str(n) for n in task_notes)}\n"
         if current_dim:
             inst += f"- 当前分析维度: {current_dim}\n"
         if time_granularity:
@@ -835,7 +838,24 @@ class SQLTool:
         if depends_on:
             inst += f"- 依赖任务: {', '.join(depends_on)}\n"
         if parent_summary:
-            inst += f"- 上游结果摘要: {parent_summary}\n"
+            # ★ 分离 Planner 分析结论（高优先级）和原始上游数据（参考）
+            planner_conclusion_lines = []
+            upstream_data_lines = []
+            for line in parent_summary.split("\n"):
+                if line.startswith("[Planner 分析结论]"):
+                    planner_conclusion_lines.append(line.replace("[Planner 分析结论] ", ""))
+                else:
+                    upstream_data_lines.append(line)
+            
+            if planner_conclusion_lines:
+                inst += f"""
+### ★ Planner 承上启下分析（务必参考）
+{chr(10).join(planner_conclusion_lines)}
+"""
+            if upstream_data_lines:
+                upstream_text = "\n".join(upstream_data_lines).strip()
+                if upstream_text:
+                    inst += f"- 上游结果摘要: {upstream_text}\n"
 
         if retry_hint:
             inst += f"""
@@ -849,32 +869,38 @@ class SQLTool:
 {intent_hint}
 """
 
-        # ── 各任务类型的详细规则 ──
+        # ── 各任务类型的参考规则（指导性，根据具体任务描述灵活调整） ──
         if task_type == "trend":
             inst += """
-### 趋势分析规则
-- 必须按时间维度（年/季/月/周/日）GROUP BY
-- 结果按时间**升序**排序（ORDER BY 时间列 ASC）
-- 只生成 1 个趋势 SQL
+### 趋势分析参考
+- 通常按时间维度（年/季/月/周/日）GROUP BY
+- 通常按时间升序排列（ORDER BY 时间列 ASC），但具体排序方向以任务描述为准
+- 只生成 1 个 SQL
 """
         elif task_type == "source":
-            dim_hint = f"「{current_dim}」" if current_dim else "指定维度"
+            dims_hint = "、".join(f"「{d}」" for d in available_dims) if available_dims else "任务描述中指定的维度"
             inst += f"""
-### 来源/构成分析规则
-- 必须按维度 {dim_hint} GROUP BY
-- 结果按数值**降序**排序（看 top 贡献）
-- 只生成 1 个按 {dim_hint} 分组的 SQL
+### 来源/构成分析参考
+- 可用的分组维度: {dims_hint}
+- 根据任务描述选择最合适的维度进行 GROUP BY
+- 通常按数值降序排序（看 top 贡献），但具体排序以任务描述为准
+- 只生成 1 个 SQL
 """
         elif task_type == "comparison":
             inst += """
-### 对比分析规则
-- 需要对比两个时间段或两个条件
-- 计算差值或增长率：(当期 - 基期) / 基期 * 100
+### 对比分析参考
+- 对比两个时间段或两个条件的差异
+- 计算差值和/或增长率：(当期 - 基期) / NULLIF(基期, 0) * 100
 - 结果应包含：基期值、当期值、变化值/增长率
+- 可用 LAG/LEAD 窗口函数或子查询实现
+- ★ 排序方向必须严格匹配任务描述的语义：
+  - "下降最多/跌幅最大" → ORDER BY 变化值 ASC（取最负的值）
+  - "增长最多/涨幅最大" → ORDER BY 变化值 DESC（取最正的值）
+  - 禁止使用 ABS() 排序，因为 ABS 会混淆增长和下降的方向
 """
         elif task_type == "drilldown":
             inst += """
-### 下钻分析规则
+### 下钻分析参考
 - 在上一步结果基础上进一步细分
 - 增加更细粒度的维度或筛选条件
 - 保留上游的筛选条件
@@ -925,9 +951,9 @@ FROM 表名 WHERE <全局条件>
 """
         elif task_type == "ranking":
             inst += """
-### 排名分析规则
+### 排名分析参考
 - 按指标 GROUP BY 维度后排序
-- 使用 ORDER BY 指标 DESC/ASC
+- 使用 ORDER BY 指标 DESC/ASC（根据任务描述决定方向）
 - 使用 LIMIT N 限制返回数量
 """
         return inst
@@ -955,9 +981,6 @@ FROM 表名 WHERE <全局条件>
                 return candidates
         except Exception as e:
             self._log.error(f"LLM 生成失败: {e}")
-        fallback_sql = self._build_rule_based_sql(intent, yml_config, table_schema, state)
-        if fallback_sql:
-            return [SQLCandidate(sql=fallback_sql, reason="基于规则模板生成", confidence=0.6)]
         return []
 
     async def generate_sql(

@@ -131,10 +131,7 @@ class AnalysisTask:
 
     def __post_init__(self) -> None:
         if isinstance(self.type, str):
-            try:
-                self.type = TaskType(self.type)
-            except ValueError:
-                self.type = TaskType.BASIC
+            self.type = TaskType(self.type)
         if self.priority == 0 and isinstance(self.type, TaskType):
             self.priority = self.type.priority_boost
 
@@ -404,8 +401,7 @@ class PlannerAgent(BaseAgent):
         - 任务类型识别已合并到 SemanticParser，避免二次推断
         """
         if not state.intent:
-            self._log.warn("无 Intent，使用默认计划")
-            return self._get_default_plan()
+            raise ValueError("无 Intent，无法生成分析计划（SemanticParser 可能失败）")
 
         if state.yml_config:
             load_task_types_from_config(state.yml_config)
@@ -414,39 +410,51 @@ class PlannerAgent(BaseAgent):
             self._log.info("other 模式，跳过分析流程")
             return self._get_other_plan(state)
 
-        # === 直接从 Intent 获取 task_type（由 SemanticParser 识别）===
-        task_type_str = state.intent.task_type or "basic"
-        try:
-            task_type = TaskType(task_type_str)
-        except ValueError:
-            self._log.warn(f"未知任务类型: {task_type_str}，使用 basic")
-            task_type = TaskType.BASIC
+        # === 从 Intent 获取 task_types（由 SemanticParser 识别）===
+        task_types: list[TaskType] = []
+        for ts in state.intent.task_types:
+            try:
+                task_types.append(TaskType(ts))
+            except ValueError:
+                self._log.warn(f"未知任务类型: {ts}，跳过")
+        if not task_types:
+            raise ValueError("SemanticParser 未返回任何有效 task_type，无法生成计划")
         
-        self._log.info(f"任务类型: {task_type.label} ({task_type.value}) [来自 SemanticParser]")
+        primary_type = task_types[0]
+        if len(task_types) > 1:
+            labels = ", ".join(f"{t.label}({t.value})" for t in task_types)
+            self._log.info(f"复合任务类型: [{labels}] [来自 SemanticParser]")
+        else:
+            self._log.info(f"任务类型: {primary_type.label} ({primary_type.value}) [来自 SemanticParser]")
 
         # === 生成任务计划 ===
-        plan = await self._generate_plan_with_llm(state, context, task_type)
+        plan = await self._generate_plan_with_llm(state, context, task_types)
         if plan and plan.tasks:
             self._analysis_plan = plan
             return plan
 
-        self._log.warn("LLM 生成失败，使用默认计划")
-        return self._get_default_plan()
+        raise RuntimeError("LLM 规划失败，未能生成有效的分析计划")
 
     async def _generate_plan_with_llm(
-        self, state: ReActState, context: AgentContext, task_type: TaskType = TaskType.BASIC
+        self, state: ReActState, context: AgentContext, task_types: list[TaskType] | None = None
     ) -> Optional[AnalysisPlan]:
         """
         LLM 生成分析任务 DAG
         
-        根据任务类型（来自 SemanticParser），选择对应的 Prompt 模板，生成精准的任务计划。
+        支持单类型和复合类型（多步骤混合分析场景）。
         """
+        if not task_types:
+            raise ValueError("task_types 列表不能为空，SemanticParser 应至少返回一种任务类型")
+        
+        is_composite = len(task_types) > 1
+        primary_type = task_types[0]
+        
         intent = state.intent
         intent_summary = {
             "metrics": intent.metrics,
             "dimensions": intent.dimensions,
-            "conditions": intent.conditions,  # 包含所有条件（ref + custom），避免指代消解结果丢失
-            "task_type": task_type.value,
+            "conditions": intent.conditions,
+            "task_types": [t.value for t in task_types],
         }
 
         resolved_filters = self._resolve_filter_refs(state, intent.filter_refs)
@@ -456,8 +464,10 @@ class PlannerAgent(BaseAgent):
         # 检索增强上下文（来自 ContextRetriever）
         retrieval_section = self._build_retrieval_section(state)
         
-        # ★ 根据任务类型选择对应的 Prompt 模板
-        task_specific_prompt = self._get_task_specific_prompt(task_type)
+        # ★ 根据任务类型选择对应的 Prompt 模板（复合类型时拼接所有相关模板）
+        task_specific_prompt = "\n\n---\n\n".join(
+            self._get_task_specific_prompt(t) for t in task_types
+        )
         
         # 历史对话上下文
         history_section = ""
@@ -468,15 +478,31 @@ class PlannerAgent(BaseAgent):
                 history_lines.append(f"{role}: {msg['content']}")
             history_section = "\n".join(history_lines) + "\n\n"
 
+        # ── 构建分析场景描述 ──
+        if is_composite:
+            scene_lines = "## 分析场景（复合任务，由意图提取阶段识别）\n本次分析涉及多种分析类型，每个子任务应使用最匹配的类型：\n"
+            for t in task_types:
+                scene_lines += f"- **{t.label}** ({t.value}): {t.description}\n"
+        else:
+            scene_lines = f"## 分析场景（由意图提取阶段识别）\n- **{primary_type.label}** ({primary_type.value}): {primary_type.description}\n"
+
+        # ── 构建输出格式和规则 ──
+        if is_composite:
+            available_types = "|".join(t.value for t in task_types)
+            type_rule = f"""1. 可用的任务类型为 **{available_types}**，**每个子任务必须独立选择最匹配的类型**
+   - 选择依据是**该子任务自身要做的事**，不是用户问题的整体类型
+   - 例如：用户问"趋势 + 找跌幅最大的产品"，第一步 trend 看趋势，第二步 comparison 找年份变化，第三步 comparison 按产品算变化量排序（不是 source，因为涉及两期变化）"""
+            type_placeholder = available_types
+        else:
+            type_rule = f"1. 任务类型已确定为 **{primary_type.value}**，直接使用该类型"
+            type_placeholder = primary_type.value
 
         prompt = f"""## 角色
 你是资深数据分析师，需要为用户问题设计**优雅、鲁棒**的分析计划。
 
 ## 用户问题
 {state.user_query}
-{history_section}## 分析场景（由意图提取阶段识别）
-- **{task_type.label}** ({task_type.value}): {task_type.description}
-
+{history_section}{scene_lines}
 ## 已解析的意图
 {json.dumps(intent_summary, ensure_ascii=False, indent=2)}
 
@@ -504,7 +530,7 @@ class PlannerAgent(BaseAgent):
   "tasks": [
     {{
       "id": "唯一标识",
-      "type": "{task_type.value}",
+      "type": "{type_placeholder}",
       "description": "完整的分析指令",
       "depends_on": [],
       "notes": ["执行提示"]
@@ -514,30 +540,25 @@ class PlannerAgent(BaseAgent):
 ```
 
 ## 规则
-1. 任务类型已确定为 **{task_type.value}**，直接使用该类型
+{type_rule}
 2. 简单问题一个任务解决，不要过度拆解
 3. 复杂问题最多 3-5 个任务
 4. 不要使用 validation/clarify 类型（执行时遇到问题才用）
+5. **type 决定下游 SQL 引擎的行为模式**，选错会导致 SQL 规则不匹配：
+   - `trend`: 按时间 GROUP BY + ASC → 适合"看随时间变化走势"
+   - `comparison`: LAG/窗口函数计算差值/增长率 → 适合"对比两期差异、找增减幅度最大的项"
+   - `ranking`: ORDER BY + LIMIT → 适合"找 TopN / 最大最小"（基于绝对值排名，不涉及变化量计算）
+   - `source`: 按维度 GROUP BY + DESC → 适合"按XX拆解构成/贡献"（**仅单期**，不涉及变化量计算）
+   - `ratio`: CASE WHEN 算占比 → 适合"占多少比例"
+   - `basic`: 简单聚合
 
-## ★ 任务隔离原则（极其重要）
-每个任务是独立的执行单元，必须严格遵守以下隔离规则：
-
-1. **description 只描述当前步骤的唯一动作**
-   - ✅ "按年聚合总流水，查看年度趋势"
-   - ❌ "按年聚合总流水，找出下降最多的年份，再按产品拆解"（越权——包含了后续任务的工作）
-
-2. **notes 只包含当前任务的技术参数**
-   - ✅ ["时间粒度: 年", "排序: 按时间升序"]
-   - ❌ ["后续需要找出下降最多的年份"]（越权——泄露了后续步骤意图）
-
-3. **禁止在 description / notes 中透露后续任务的分析目标**
-   - 每个任务的执行者只能看到自己的 description 和 notes
-   - 如果 task_1 的描述暗示了 task_2 要做的事，执行者会"一步到位"做完所有步骤，导致结果格式与预期不符
-   - 后续任务的衔接通过 depends_on 和上游结果摘要自动完成，无需在描述中提前说明
-
-4. **"做什么"和"为什么"分离**
-   - description = 做什么（当前步骤的具体动作）
-   - 为什么做 = 由 analysis_approach 字段整体描述，不要塞进单个任务"""
+## ★ 任务隔离原则
+每个任务是独立执行单元，执行者**只能看到自己的 description 和 notes**：
+- **description 只描述当前步骤的动作**，禁止提及后续步骤要做的事
+  - ✅ "按年聚合总流水，查看年度趋势"
+  - ❌ "按年聚合总流水，找出下降最多的年份并按产品拆解"（越权）
+- **notes 只写当前任务的技术参数**（如时间粒度、排序方向），不要写"后续需要…""用于…"
+- 任务间衔接通过 depends_on + 上游结果自动传递，无需在描述中提前说明"""
 
         try:
             response = await self.llm.chat(
@@ -561,24 +582,6 @@ class PlannerAgent(BaseAgent):
             self._log.info(f"LLM 生成 {len(tasks_data)} 个任务")
             plan = self._parse_tasks(tasks_data) if tasks_data else None
             
-            # ★ 多任务计划自动追加 summary 总结节点
-            if plan and len(plan.tasks) > 1:
-                all_task_ids = [t.id for t in plan.tasks]
-                # summary 依赖所有叶子节点（没有被其他任务依赖的任务）
-                depended_on = set()
-                for t in plan.tasks:
-                    depended_on.update(t.depends_on)
-                leaf_ids = [tid for tid in all_task_ids if tid not in depended_on]
-                summary_task = AnalysisTask(
-                    id="final_summary",
-                    type=TaskType.SUMMARY,
-                    description="汇总所有任务的查询结果，综合回答用户问题",
-                    depends_on=leaf_ids,
-                    notes=["基于前序任务的数据结果生成最终总结"],
-                )
-                plan.tasks.append(summary_task)
-                self._log.info(f"自动追加 summary 节点 (deps: {leaf_ids})")
-            
             return plan
 
         except Exception as e:
@@ -589,16 +592,19 @@ class PlannerAgent(BaseAgent):
         """
         根据任务类型返回特定的 Prompt 模板
         
-        每种任务类型有其特定的执行要点和 SQL 模式。
+        每种任务类型有其特定的执行要点、SQL 模式和适用场景。
+        类型选择直接影响下游 SQL 引擎行为，务必选择最匹配的类型。
         """
         prompts = {
-            TaskType.RATIO: """## 占比分析要点
+            TaskType.RATIO: """## 占比分析 (ratio)
 
+**适用场景**：计算"A 占 B 的百分比"
+**不适用**：单纯对比增减、排名、趋势
+
+**SQL 模式**：CASE WHEN 算分子，WHERE 控全局，或 CTE + TOP N
 **核心**：一个 SQL 算出"部分/总体"比例，不要拆成多个任务
-- 分子条件放 CASE WHEN，全局条件放 WHERE
-- TOP N 占比：用 CTE 先 GROUP BY + ORDER BY 取 TOP N，再 CASE WHEN IN 算分子
 
-**任务输出示例**：
+**任务示例**：
 ```json
 {
   "id": "ratio_1",
@@ -608,48 +614,39 @@ class PlannerAgent(BaseAgent):
 }
 ```""",
 
-            TaskType.COMPARISON: """## 对比分析要点
+            TaskType.COMPARISON: """## 对比分析 (comparison)
 
-**核心目标**：对比两个时间段/条件的指标差异
+**适用场景**：需要**计算两期差值或增长率**的分析，包括：
+- 同比/环比对比，计算增长率/变化幅度
+- 找出"下降最多""增长最快""跌幅最大"的项（无论按什么维度分组）
+- 按维度分组后计算各自的变化量并排序
+**不适用**：单纯看走势（用 trend），单纯排名不涉及变化量（用 ranking），单纯拆解构成（用 source）
 
-**SQL 模式**（同比）：
-```sql
-SELECT 
-    当前期指标,
-    上期指标,
-    (当前期 - 上期) / 上期 * 100 as 增长率
-FROM (子查询或 LAG 窗口函数)
-```
+**SQL 模式**：LAG/LEAD 窗口函数或子查询计算差值、增长率
 
-**一步到位原则**：
-- 同比/环比用一个 SQL 完成，用 LAG/LEAD 或子查询
-- 不要拆成"先算今年、再算去年"两个任务
+**★ 核心判断**：只要涉及"变化/增减/跌幅/涨幅/同比/环比"，就必须用 comparison
+- "找出跌幅最大的产品" → comparison（按产品 GROUP BY 两期数据，LAG 算变化量后排序）
+- "哪些产品流水下降最多" → comparison（需要对比两年数据，不是单期拆解）
+- "按产品拆解流水构成" → source（不涉及变化量）
 
-**任务输出示例**：
+**任务示例**：
 ```json
 {
   "id": "comparison_1",
   "type": "comparison",
-  "description": "计算2025年Q1手游流水的同比增长率，对比2024年Q1",
-  "notes": ["对比方式: yoy(同比)", "基准期: 2024年Q1", "当前期: 2025年Q1"]
+  "description": "对比2023和2024年各产品流水，找出流水下降幅度最大的产品",
+  "notes": ["对比方式: 同比", "分组维度: 产品", "排序: 按变化值升序取最小", "需要计算差值和增长率"]
 }
 ```""",
 
-            TaskType.RANKING: """## 排名分析要点
+            TaskType.RANKING: """## 排名分析 (ranking)
 
-**核心目标**：找出 TopN 或 BottomN
+**适用场景**：找出 TopN / BottomN，按某个指标排序取极值
+**不适用**：需要计算变化幅度再排序（用 comparison），需要看时间趋势（用 trend）
 
-**SQL 模式**：
-```sql
-SELECT 维度列, SUM(指标) as 指标值
-FROM 表
-WHERE 条件
-GROUP BY 维度列
-ORDER BY 指标值 DESC
-LIMIT N
-```
+**SQL 模式**：GROUP BY 维度 + ORDER BY 指标 DESC/ASC + LIMIT N
 
-**任务输出示例**：
+**任务示例**：
 ```json
 {
   "id": "ranking_1",
@@ -659,20 +656,14 @@ LIMIT N
 }
 ```""",
 
-            TaskType.TREND: """## 趋势分析要点
+            TaskType.TREND: """## 趋势分析 (trend)
 
-**核心目标**：观察指标随时间的变化
+**适用场景**：观察指标随时间的变化走势（逐年/逐月/逐日）
+**不适用**：对比两期差异（用 comparison），按维度拆解（用 source），找极值（用 ranking）
 
-**SQL 模式**：
-```sql
-SELECT 时间列, SUM(指标) as 指标值
-FROM 表
-WHERE 条件
-GROUP BY 时间列
-ORDER BY 时间列 ASC
-```
+**SQL 模式**：GROUP BY 时间列 + ORDER BY 时间 ASC
 
-**任务输出示例**：
+**任务示例**：
 ```json
 {
   "id": "trend_1",
@@ -682,41 +673,35 @@ ORDER BY 时间列 ASC
 }
 ```""",
 
-            TaskType.SOURCE: """## 来源分析要点
+            TaskType.SOURCE: """## 来源分析 (source)
 
-**核心目标**：按维度拆解，找出主要贡献来源
+**适用场景**：按维度拆解**单期**的构成，找出主要贡献来源/占比分布
+**不适用**：涉及"变化/增减/跌幅/涨幅"等需要计算两期差值的分析（用 comparison），需要时间趋势（用 trend）
 
-**SQL 模式**：
-```sql
-SELECT 维度列, SUM(指标) as 指标值
-FROM 表
-WHERE 条件
-GROUP BY 维度列
-ORDER BY 指标值 DESC
-```
+**SQL 模式**：GROUP BY 维度列 + ORDER BY 指标 DESC
 
-**任务输出示例**：
+**正反例**：
+- "按产品拆解2024年流水构成" → ✅ source（单期绝对值拆解）
+- "找出哪些产品流水下降最多" → ❌ 不是 source，应用 comparison（需要两期数据计算变化）
+
+**任务示例**：
 ```json
 {
   "id": "source_1",
   "type": "source",
-  "description": "按产品大类拆解流水来源，找出主要贡献类型",
-  "notes": ["分组维度: 产品大类", "计算贡献度占比"]
+  "description": "按产品拆解2024年流水构成，找出各产品的流水金额",
+  "notes": ["分组维度: 产品", "排序: 按流水降序"]
 }
 ```""",
 
-            TaskType.BASIC: """## 基础查询要点
+            TaskType.BASIC: """## 基础查询 (basic)
 
-**核心目标**：简单聚合，获取单一指标值
+**适用场景**：简单聚合，获取单一数值
+**不适用**：需要分组、排序、对比、趋势等复杂分析
 
-**SQL 模式**：
-```sql
-SELECT SUM(指标) as 指标值
-FROM 表
-WHERE 条件
-```
+**SQL 模式**：SELECT SUM/COUNT/AVG(指标) FROM 表 WHERE 条件
 
-**任务输出示例**：
+**任务示例**：
 ```json
 {
   "id": "basic_1",
@@ -854,8 +839,6 @@ WHERE 条件
         tasks = [
             AnalysisTask(id="basic_query", type=TaskType.BASIC,
                          description="执行基础查询，获取核心指标"),
-            AnalysisTask(id="final_summary", type=TaskType.SUMMARY,
-                         description="总结查询结果，回答用户问题"),
         ]
         plan = AnalysisPlan(tasks=tasks)
         self._analysis_plan = plan
@@ -921,7 +904,7 @@ WHERE 条件
                 if sql:
                     lines.append(f"  SQL: `{sql}`")
                 if stats:
-                    lines.append(f"  统计: {', '.join(f'{k}={v}' for k, v in list(stats.items())[:5])}")
+                    lines.append(f"  统计: {', '.join(f'{k}={v}' for k, v in stats.items())}")
                 if issues:
                     lines.append(f"  备注: {', '.join(issues)}")
             lines.append("")
@@ -1007,7 +990,8 @@ WHERE 条件
 2. SQL 报错时分析错误信息，用 B（重试）给出修复建议
 3. 数据摘要中已包含查询结果（完整数据或前30行），直接基于这些数据做决策
 4. decision 字段只能是单个字母：A、B、C、D
-5. 输出 JSON"""
+5. 选 A 时必须输出 transition_context：基于已完成任务的数据，告诉下一步任务关键发现和应聚焦的条件
+6. 输出 JSON"""
 
         prompt = f"""## 用户问题
 {state.user_query}
@@ -1024,13 +1008,16 @@ WHERE 条件
 ## 决策选项
 
 **A. 继续**：结果正常，按计划执行下一任务。**当还有待执行任务（→○）且当前任务数据正常时，必须选此项**
+  - ★ 必须输出 transition_context：总结已完成步骤的关键发现，为下一步提供聚焦建议
+  - transition_context 应包含：(1) 上游数据的关键结论 (2) 下一步应关注/限定的具体条件或范围
+  - 例如：上游发现2024年流水下降最多，下一步对比应只看2023和2024两年的数据，找出哪些产品在2024年跌幅最大
 **B. 插入/重试任务**：遇到问题（SQL 错误、数据异常），需要插入 validation 任务或重试失败的任务
 **C. 跳过任务**：前提不成立，跳过部分后续任务
 **D. 结束**：所有任务已完成，可以给出结论。**仅在没有任何待执行任务（→○）时才能选此项**
 
 ## 输出格式（decision 字段必须是单个大写字母）
 
-选 A: {{"decision": "A", "reason": "..."}}
+选 A: {{"decision": "A", "reason": "...", "transition_context": "基于上游结果的关键发现 + 下一步应聚焦的条件/范围"}}
 选 B（插入）: {{"decision": "B", "reason": "...", "adjustment": {{"insert_task": {{"type": "validation", "description": "..."}}}}}}
 选 B（重试）: {{"decision": "B", "reason": "...", "adjustment": {{"retry_task": {{"task_id": "...", "fix_hint": "..."}}}}}}
 选 C: {{"decision": "C", "reason": "...", "adjustment": {{"skip_tasks": ["task_id"]}}}}
@@ -1109,7 +1096,12 @@ WHERE 条件
         if decision == "A":
             next_task = self._get_next_task(results)
             if next_task:
-                return {"action": "continue", "task": next_task}
+                result = {"action": "continue", "task": next_task}
+                # ★ 传递承上启下的分析结论，供下游任务参考
+                transition_context = data.get("transition_context", "")
+                if transition_context:
+                    result["transition_context"] = transition_context
+                return result
             return {"action": "done", "reason": "plan_completed"}
 
         elif decision == "B":

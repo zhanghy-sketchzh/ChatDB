@@ -251,7 +251,7 @@ class AgentOrchestrator:
                     "table": state.table_name,
                 }
             else:
-                orch_log.warn("语义解析未返回 Intent，继续执行")
+                raise ValueError("语义解析未返回 Intent，无法继续执行分析流程")
             tracker.end_step(sp_step, sp_output)
             
             # ============================================================
@@ -317,13 +317,22 @@ class AgentOrchestrator:
             # ============================================================
             # 4. 生成总结
             # ============================================================
-            if not state.summary and (state.has_result or state.error_type == ErrorType.NO_DATA):
+            # ★ 多阶段分析：无条件走 summary（即使 Planner 提前 D 结束）
+            # ★ 单阶段分析：仅在没有 summary 时生成
+            need_summary = (
+                state.temp_results  # 多阶段：始终需要 summary
+                or (not state.summary and (state.has_result or state.error_type == ErrorType.NO_DATA))
+            )
+            if need_summary:
                 sum_input: dict[str, Any] = {
                     "has_result": state.has_result,
                     "row_count": state.execute_result.get("row_count", 0) if state.execute_result else 0,
                 }
                 if state.executed_sqls:
                     sum_input["sql_count"] = len(state.executed_sqls)
+                if state.temp_results:
+                    sum_input["multi_stage"] = True
+                    sum_input["task_count"] = len(state.temp_results)
                 sum_step = tracker.start_step("summarize", sum_input)
                 state = await self._generate_summary(state, query)
                 tracker.end_step(sum_step, {"summary": (state.summary or "")[:200]})
@@ -406,28 +415,9 @@ class AgentOrchestrator:
                 orch_log.info("没有更多任务")
                 break
             
-            # 2. 过滤：summary 任务单独处理
-            summary_task = None
-            exec_tasks = []
-            for t in ready_tasks:
-                if t.type.value == "summary":
-                    summary_task = t
-                else:
-                    exec_tasks.append(t)
-            
-            # 如果只有 summary 任务，标记完成并退出
-            if summary_task and not exec_tasks:
-                if self.planner.analysis_plan:
-                    self.planner.analysis_plan.mark_completed(summary_task.id)
-                self._persist_task_completion(
-                    scratch_session_id, summary_task.id, "completed",
-                )
-                orch_log.info("到达总结节点，结束计划执行")
-                break
-            
-            # 3. 死循环检测 + validation 限制
+            # 2. 死循环检测 + validation 限制
             filtered_tasks = []
-            for t in exec_tasks:
+            for t in ready_tasks:
                 if state.mark_task_repeat(t.id):
                     orch_log.warn(f"任务 {t.id} 重复执行，强制标记失败")
                     if self.planner.analysis_plan:
@@ -540,7 +530,7 @@ class AgentOrchestrator:
             is_parallel=is_parallel,
         )
         
-        request = self._build_task_request(task_dict, collected_results)
+        request = self._build_task_request(task_dict, collected_results, state)
         
         try:
             response = await self._sql_agent.run_task(state, context, request)
@@ -637,6 +627,7 @@ class AgentOrchestrator:
         self,
         task_dict: dict[str, Any],
         collected_results: dict[str, list[dict[str, Any]]],
+        state: "ReActState | None" = None,
     ) -> TaskRequest:
         """
         构建 TaskRequest 消息（包含上游结果摘要 + 文件引用）
@@ -647,9 +638,16 @@ class AgentOrchestrator:
         """
         depends_on = task_dict.get("depends_on", [])
         
-        # 为依赖任务构建结果摘要（含状态标注）
-        parent_summary_parts = []
-        all_previous = []
+        parent_summary_parts: list[str] = []
+        all_previous: list[dict[str, Any]] = []
+        
+        # ★ 注入 Planner 的承上启下分析（如果有）
+        if state and state.transition_context:
+            parent_summary_parts.append(
+                f"[Planner 分析结论] {state.transition_context}"
+            )
+            # 用完后清空，避免影响更后面的任务
+            state.transition_context = ""
         
         # 标注依赖任务状态，让下游 Agent 感知
         if self.planner.analysis_plan:
@@ -661,30 +659,48 @@ class AgentOrchestrator:
                         + (f"({dep_task.skip_reason})" if dep_task.skip_reason else "")
                     )
         
+        INLINE_ROW_LIMIT = 30
+        
         for dep_id in depends_on:
             for r in collected_results.get(dep_id, []):
                 stats = r.get("stats", {})
                 file_ref = r.get("_file_ref")
+                row_count = r.get("row_count", 0)
+                examples = r.get("examples", [])
+                
+                # ★ 回退：examples 为空但文件存在时，从文件读取
+                if not examples and file_ref:
+                    examples = self._read_examples_from_file(file_ref)
                 
                 if stats.get("available_years"):
                     parent_summary_parts.append(f"可用年份: {stats['available_years']}")
                 if stats.get("top_contributor"):
                     parent_summary_parts.append(f"top贡献: {stats['top_contributor']}")
-                if r.get("row_count"):
-                    parent_summary_parts.append(f"上游返回 {r['row_count']} 行")
                 
-                # 添加文件引用信息到摘要
-                if file_ref:
-                    summary = file_ref.get("summary", "")
-                    file_path = file_ref.get("path", "")
-                    if summary:
-                        parent_summary_parts.append(f"[{dep_id}] {summary}")
-                    if file_path:
-                        parent_summary_parts.append(f"完整数据: {file_path}")
+                # 内联上游数据
+                if examples:
+                    display_rows = examples if row_count <= INLINE_ROW_LIMIT else examples[:INLINE_ROW_LIMIT]
+                    data_lines = [f"[{dep_id}] 上游返回 {row_count} 行，数据如下:"]
+                    for ex in display_rows:
+                        row_str = ", ".join(f"{k}={v}" for k, v in ex.items())
+                        data_lines.append(f"  - {row_str}")
+                    if row_count > INLINE_ROW_LIMIT:
+                        data_lines.append(f"  ... 共 {row_count} 行，已展示前 {INLINE_ROW_LIMIT} 行")
+                    parent_summary_parts.append("\n".join(data_lines))
+                    
+                    # ★ 分析推导：从上游数据中提取可操作的洞察
+                    insights = self._derive_upstream_insights(dep_id, examples)
+                    if insights:
+                        parent_summary_parts.append(f"[{dep_id}] 关键洞察: {insights}")
+                elif row_count:
+                    parent_summary_parts.append(f"上游返回 {row_count} 行")
+                    if file_ref:
+                        summary = file_ref.get("summary", "")
+                        if summary:
+                            parent_summary_parts.append(f"[{dep_id}] {summary}")
                 
                 all_previous.append(r)
         
-        # 如果没有显式依赖，收集所有之前的结果（用于 drilldown 等）
         if not depends_on:
             task_id = task_dict.get("id", "")
             for tid, results in collected_results.items():
@@ -693,9 +709,80 @@ class AgentOrchestrator:
         
         return TaskRequest.from_planner_task(
             task_dict,
-            parent_results_summary="; ".join(parent_summary_parts),
+            parent_results_summary="\n".join(parent_summary_parts),
             previous_results=all_previous,
         )
+    
+    def _read_examples_from_file(self, file_ref: dict[str, Any]) -> list[dict[str, Any]]:
+        """从 scratch pad 文件回退读取 examples"""
+        file_path = file_ref.get("path", "")
+        if not file_path:
+            return []
+        full_data = self._scratch_pad.read_task_result(file_path)
+        if not full_data:
+            return []
+        return full_data.get("examples", [])
+    
+    @staticmethod
+    def _derive_upstream_insights(
+        dep_id: str,
+        examples: list[dict[str, Any]],
+    ) -> str:
+        """
+        从上游数据推导关键洞察（如最大变化点）
+        
+        对时序类数据自动计算变化量，找出极值点，
+        让下游任务能直接获取可操作的分析结论。
+        """
+        if len(examples) < 2:
+            return ""
+        
+        # 识别维度列（字符串/整数年份）和指标列（浮点数值）
+        dim_col, val_col = None, None
+        for key, val in examples[0].items():
+            if val_col is None and isinstance(val, float):
+                val_col = key
+            elif dim_col is None:
+                dim_col = key
+        
+        if not dim_col or not val_col:
+            return ""
+        
+        # 计算相邻行的变化
+        changes: list[tuple[Any, Any, float, float]] = []
+        for i in range(1, len(examples)):
+            prev_val = examples[i - 1].get(val_col, 0)
+            curr_val = examples[i].get(val_col, 0)
+            if not isinstance(prev_val, (int, float)) or not isinstance(curr_val, (int, float)):
+                continue
+            delta = curr_val - prev_val
+            pct = delta / prev_val if prev_val else 0
+            changes.append((
+                examples[i - 1].get(dim_col),
+                examples[i].get(dim_col),
+                delta, pct,
+            ))
+        
+        if not changes:
+            return ""
+        
+        # 找最大增幅和最大降幅
+        parts: list[str] = []
+        max_drop = min(changes, key=lambda c: c[2])
+        max_rise = max(changes, key=lambda c: c[2])
+        
+        if max_drop[2] < 0:
+            parts.append(
+                f"{max_drop[0]}→{max_drop[1]}下降最多"
+                f"（降幅{abs(max_drop[3]):.1%}）"
+            )
+        if max_rise[2] > 0 and max_rise != max_drop:
+            parts.append(
+                f"{max_rise[0]}→{max_rise[1]}增长最多"
+                f"（增幅{max_rise[3]:.1%}）"
+            )
+        
+        return "；".join(parts)
 
     @staticmethod
     def _store_response(
@@ -752,8 +839,9 @@ class AgentOrchestrator:
             conclusion = decision.get("conclusion", "")
             orch_log.info(f"Planner 决定结束: {reason}")
             if conclusion:
-                orch_log.info(f"Planner 结论: {conclusion[:100]}...")
-                state.summary = conclusion
+                orch_log.info(f"Planner 结论（供 summary 参考）: {conclusion[:100]}...")
+                # ★ 不写入 state.summary，留给后续 summary 流程统一生成
+                state.planner_conclusion = conclusion
             return True
         
         if action == "adjust":
@@ -777,6 +865,11 @@ class AgentOrchestrator:
         
         # action == "continue" 或未知值：默认继续下一任务
         state.reset_adjust()
+        # ★ 将 Planner 的承上启下分析存入 state，供下一步 SQL Agent 参考
+        transition_context = decision.get("transition_context", "")
+        if transition_context:
+            state.transition_context = transition_context
+            orch_log.info(f"Planner 承上启下: {transition_context[:120]}...")
         return False
 
     # ============================================================
@@ -1279,12 +1372,18 @@ class AgentOrchestrator:
                         lines.append(f"  ... 共 {len(examples)} 行，已展示前 30 行")
                 
                 if stats:
-                    stats_str = ", ".join(f"{k}={v}" for k, v in list(stats.items())[:5])
+                    stats_str = ", ".join(f"{k}={v}" for k, v in stats.items())
                     lines.append(f"统计: {stats_str}")
                 
                 if issues:
                     lines.append(f"备注: {', '.join(issues)}")
             
+            lines.append("")
+        
+        # ★ 如果 Planner 有结论，作为参考信息注入
+        if state.planner_conclusion:
+            lines.append("### Planner 分析结论（供参考）")
+            lines.append(state.planner_conclusion)
             lines.append("")
         
         return "\n".join(lines)

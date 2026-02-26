@@ -191,11 +191,10 @@ SQL_TASK_META: dict[SQLTaskType, SQLTaskMeta] = {
 
 
 def get_task_meta(task_type: SQLTaskType) -> SQLTaskMeta:
-    """获取任务类型的元信息（带默认值）"""
-    return SQL_TASK_META.get(task_type, SQLTaskMeta(
-        label="未知任务",
-        description="未定义的任务类型",
-    ))
+    """获取任务类型的元信息"""
+    if task_type not in SQL_TASK_META:
+        raise KeyError(f"未注册的任务类型: {task_type.value}，请在 SQL_TASK_META 中添加定义")
+    return SQL_TASK_META[task_type]
 
 
 # =============================================================================
@@ -441,13 +440,19 @@ class SQLAgent(BaseAgent):
         # 获取任务元信息
         meta = get_task_meta(task_type)
         
-        # 如果没有指定 intent_hint，使用元信息中的模板
-        if not intent_hint and meta.intent_hint_template:
-            intent_hint = meta.intent_hint_template.format(
-                granularity=time_granularity or meta.default_time_granularity or "year",
-                dimension=current_dimension or "维度",
-                metric=getattr(state, "current_metric", "指标"),
-            )
+        # intent_hint 优先级：调用方显式指定 > 任务描述（description 已足够具体） > 元信息模板
+        # 避免用刚性模板覆盖任务的具体语义
+        if not intent_hint:
+            # 任务描述已经足够具体时，直接用描述作为执行意图
+            task_desc = request.description or ""
+            if task_desc and len(task_desc) > 10:
+                intent_hint = task_desc
+            elif meta.intent_hint_template:
+                intent_hint = meta.intent_hint_template.format(
+                    granularity=time_granularity or meta.default_time_granularity or "year",
+                    dimension=current_dimension or "维度",
+                    metric=getattr(state, "current_metric", "指标"),
+                )
         
         # 如果需要时间但没指定粒度，使用默认
         if meta.requires_time and not time_granularity:
@@ -882,25 +887,19 @@ class SQLAgent(BaseAgent):
         try:
             task_type = SQLTaskType(request.task_type)
         except ValueError:
-            self._log.warn(f"未知任务类型: {request.task_type}，使用 basic")
-            task_type = SQLTaskType.BASIC
+            raise ValueError(f"未知任务类型: {request.task_type}，有效类型: {[t.value for t in SQLTaskType]}")
         
         # 获取 handler（注册表分发）
         handler = get_task_handler(task_type)
         if not handler:
-            self._log.warn(f"任务类型 {task_type.value} 未注册 handler，降级 basic")
-            handler = get_task_handler(SQLTaskType.BASIC)
+            raise RuntimeError(f"任务类型 {task_type.value} 未注册 handler，请使用 @register_sql_task_handler 注册")
         
         # THINK: 记录分析思路
         state.think(request.description)
         
         # 执行 handler（handler 将结果追加到 response.results）
         try:
-            if handler:
-                await handler(self, state, context, request, response)
-            else:
-                self._log.error("无法找到任何 handler，执行最简查询")
-                await self._fallback_basic_query(state, context, request, response)
+            await handler(self, state, context, request, response)
         except Exception as e:
             self._log.error(f"任务执行失败: {e}")
             response.success = False
@@ -911,20 +910,6 @@ class SQLAgent(BaseAgent):
         state.next_step()
         return response
     
-    async def _fallback_basic_query(
-        self, state: ReActState, context: AgentContext,
-        request: TaskRequest, response: TaskResponse,
-    ) -> None:
-        """兜底的基础查询（当没有注册 handler 时）"""
-        self._inject_metric_definition(state)
-        state.current_task = self._build_task_context(
-            request, SQLTaskType.BASIC, state,
-            intent_hint="执行基础查询，获取核心指标",
-        )
-        await self._sql_tool.run_workflow(state, context)
-        result = self._collect_result("basic_query", state)
-        response.results.append(result)
-
     # ============================================================
     # 任务执行器（已迁移到模块级 handler 函数）
     # 以下方法保留为内部工具方法
@@ -995,7 +980,7 @@ class SQLAgent(BaseAgent):
         return result
 
     def _compute_stats(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
-        """计算描述性统计"""
+        """对所有数值列计算描述性统计（sum/min/max/avg）"""
         if not rows:
             return {}
         
@@ -1003,21 +988,20 @@ class SQLAgent(BaseAgent):
             "row_count": len(rows),
         }
         
-        # 找到数值列
+        # 找到所有数值列
         numeric_cols = []
         for key, val in rows[0].items():
             if isinstance(val, (int, float)) and not isinstance(val, bool):
                 numeric_cols.append(key)
         
         # 对每个数值列计算统计
-        for col in numeric_cols[:3]:  # 最多 3 个数值列
+        for col in numeric_cols:
             values = [row.get(col, 0) for row in rows if row.get(col) is not None]
             if values:
                 stats[f"{col}_sum"] = sum(values)
                 stats[f"{col}_min"] = min(values)
                 stats[f"{col}_max"] = max(values)
-                if len(values) > 0:
-                    stats[f"{col}_avg"] = sum(values) / len(values)
+                stats[f"{col}_avg"] = sum(values) / len(values)
         
         return stats
 
@@ -1057,9 +1041,12 @@ class SQLAgent(BaseAgent):
         
         # 有指令时，转换为 TaskRequest 格式
         if instructions:
+            task_type_str = instructions.get("task_type", instructions.get("type", ""))
+            if not task_type_str:
+                raise ValueError("instructions 中缺少 task_type 字段")
             request = TaskRequest(
                 task_id=instructions.get("step", "task"),
-                task_type=self._map_task_type(instructions.get("task", "")),
+                task_type=task_type_str,
                 description=instructions.get("task", ""),
                 notes=tuple([str(instructions["instructions"])]) if instructions.get("instructions") else (),
             )
@@ -1074,17 +1061,7 @@ class SQLAgent(BaseAgent):
         self._think(f"开始 SQL 分析: {state.user_query[:50]}...", state)
         await self._sql_tool.run_workflow(state, context)
 
-    def _map_task_type(self, task_name: str) -> str:
-        """将任务名映射为任务类型"""
-        mapping = {
-            "计算整体指标": "basic",
-            "计算趋势": "trend",
-            "按维度拆解": "source",
-            "对比分析": "comparison",
-            "下钻分析": "drilldown",
-            "生成总结": "summary",
-        }
-        return mapping.get(task_name, "basic")
+
 
     async def execute(self, context: AgentContext) -> AgentResult:
         """兼容 BaseAgent 接口"""
@@ -1184,6 +1161,7 @@ def create_sql_agent(
 # 注册式 Handler 函数（模块级）
 # =============================================================================
 
+
 @register_sql_task_handler(SQLTaskType.BASIC)
 async def handle_basic_task(
     agent: SQLAgent,
@@ -1231,11 +1209,10 @@ async def handle_trend_task(
     # 注入指标定义
     agent._inject_metric_definition(state)
     
-    # 构建任务上下文
+    # 构建任务上下文（不硬编码 intent_hint，让 description 优先逻辑生效）
     state.current_task = agent._build_task_context(
         request, SQLTaskType.TREND, state,
         time_granularity="year",
-        intent_hint="按年聚合总流水，观察年度变化趋势，需要 GROUP BY 时间列并按时间排序",
     )
     
     # 适度修正 Intent：趋势分析强制按年聚合
@@ -1279,69 +1256,61 @@ async def handle_source_task(
     # 注入指标定义
     agent._inject_metric_definition(state)
     
-    # 从配置获取优先维度
-    priority_dims = []
+    # ★ 收集所有可用维度（不选择，全部传给 LLM 判断）
+    yml_config = state.yml_config or {}
+    available_dims: list[str] = []
+    
+    # 从 intent.dimensions 解析
+    if state.intent and state.intent.dimensions:
+        for dim_id in state.intent.dimensions:
+            col = SQLAgent._resolve_dimension_column(dim_id, yml_config)
+            if col and col not in available_dims:
+                available_dims.append(col)
+    
+    # 从配置补充
     if agent.config:
-        priority_dims = agent.config.get_priority_dimensions("source_analysis")
-    if not priority_dims:
-        priority_dims = ["国内/海外", "投资公司标签", "产品大类"]
+        for col in agent.config.get_priority_dimensions("source_analysis"):
+            if col not in available_dims:
+                available_dims.append(col)
     
     # 获取上游任务结果摘要
     parent_summary = agent._get_parent_results_summary(request)
     
-    # 对每个维度尝试分析
-    for dim in priority_dims[:3]:
-        if dim in state.explored_dimensions:
-            continue
-        
-        # 构建任务上下文
-        state.current_task = agent._build_task_context(
-            request, SQLTaskType.SOURCE, state,
-            current_dimension=dim,
-            intent_hint=f"按维度「{dim}」拆解来源构成，GROUP BY 该维度并按数值降序排序，找出主要贡献来源",
-            parent_results_summary=parent_summary,
-        )
-        
-        # 适度修正 Intent
-        if state.intent:
-            if state.intent.time:
-                state.intent.time.pop("comparison", None)
-            if not state.intent.dimensions:
-                state.intent.dimensions = []
-            if dim not in state.intent.dimensions:
-                state.intent.dimensions.append(dim)
-        
-        # 执行维度分析
-        await agent._sql_tool.run_workflow(state, context)
-        
-        # 标记已探索
-        state.explored_dimensions.add(dim)
-        
-        # 收集结果
-        result = agent._collect_result(f"source_{dim}", state)
-        
-        # 统一 stats 字段（来源分析特有）
-        result.stats["category_count"] = result.row_count
-        
-        if result.examples and len(result.examples) > 1:
-            total = sum(agent._get_numeric_value(ex) for ex in result.examples)
-            if total > 0:
-                for ex in result.examples:
-                    val = agent._get_numeric_value(ex)
-                    ex["contribution_ratio"] = round(val / total, 4)
-                
-                # top 贡献者
-                top = max(result.examples, key=lambda x: x.get("contribution_ratio", 0))
-                result.stats["top_contributor"] = top
-                result.stats["top_ratio"] = top.get("contribution_ratio", 0)
-        elif result.row_count == 1:
-            result.issues.append("single_category")
-        
-        response.results.append(result)
-        
-        # 如果有有效结果，可以停止
-        if result.row_count > 1:
-            break
+    # ★ 将所有可用维度传入 context，由 SQL 生成 LLM 根据任务描述自行选择
+    state.current_task = agent._build_task_context(
+        request, SQLTaskType.SOURCE, state,
+        parent_results_summary=parent_summary,
+        extra={"available_dimensions": available_dims},
+    )
+    
+    # 清理 intent 中的时间对比标记（source 不做对比）
+    if state.intent and state.intent.time:
+        state.intent.time.pop("comparison", None)
+    
+    # 执行维度分析
+    await agent._sql_tool.run_workflow(state, context)
+    
+    # 收集结果
+    result = agent._collect_result("source", state)
+    
+    # 统一 stats 字段（来源分析特有）
+    result.stats["category_count"] = result.row_count
+    
+    if result.examples and len(result.examples) > 1:
+        total = sum(agent._get_numeric_value(ex) for ex in result.examples)
+        if total > 0:
+            for ex in result.examples:
+                val = agent._get_numeric_value(ex)
+                ex["contribution_ratio"] = round(val / total, 4)
+            
+            # top 贡献者
+            top = max(result.examples, key=lambda x: x.get("contribution_ratio", 0))
+            result.stats["top_contributor"] = top
+            result.stats["top_ratio"] = top.get("contribution_ratio", 0)
+    elif result.row_count == 1:
+        result.issues.append("single_category")
+    
+    response.results.append(result)
 
 
 @register_sql_task_handler(SQLTaskType.DRILLDOWN)
@@ -1364,10 +1333,9 @@ async def handle_drilldown_task(
     # 注入指标定义
     agent._inject_metric_definition(state)
     
-    # 构建任务上下文
+    # 构建任务上下文（不硬编码 intent_hint，让 description 优先逻辑生效）
     state.current_task = agent._build_task_context(
         request, SQLTaskType.DRILLDOWN, state,
-        intent_hint="在上一步结果基础上进一步细分，增加筛选条件或更细粒度的维度",
         parent_results_summary=parent_summary,
         extra={"previous_results": prev_results},
     )
@@ -1402,10 +1370,9 @@ async def handle_comparison_task(
     # 获取上游结果摘要
     parent_summary = agent._get_parent_results_summary(request)
     
-    # 构建任务上下文
+    # 构建任务上下文（不硬编码 intent_hint，让 description 优先逻辑生效）
     state.current_task = agent._build_task_context(
         request, SQLTaskType.COMPARISON, state,
-        intent_hint="对比两个时间段或条件下的指标，计算差值或增长率",
         parent_results_summary=parent_summary,
     )
     
@@ -1482,11 +1449,6 @@ async def handle_validation_task(
             col_name = col.get("name") if isinstance(col, dict) else getattr(col, "name", None)
             if col_name:
                 available_col_names.add(col_name)
-    
-    common_filter_fields = ["产品大类", "数据集来源", "大盘报表项", "统一剔除标签", "考核口径", "特殊口径"]
-    for f in common_filter_fields:
-        if f in available_col_names:
-            filter_fields.add(f)
     
     for fld in list(filter_fields)[:5]:
         diagnostic_sqls.append({
@@ -1566,20 +1528,12 @@ async def handle_ratio_task(
     # 收集结果
     result = agent._collect_result("ratio_analysis", state)
     
-    # 统一 stats 字段（占比特有）
+    # 统一 stats 字段（占比特有）：直接将所有数值列存入 stats
     if result.examples:
         for ex in result.examples:
             for key, val in ex.items():
-                if "占比" in key or "ratio" in key.lower() or "percent" in key.lower():
-                    if isinstance(val, (int, float)):
-                        result.stats["ratio"] = val
-                        break
-                elif "分子" in key or "numerator" in key.lower():
-                    if isinstance(val, (int, float)):
-                        result.stats["numerator"] = val
-                elif "分母" in key or "denominator" in key.lower():
-                    if isinstance(val, (int, float)):
-                        result.stats["denominator"] = val
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    result.stats[key] = val
     
     response.results.append(result)
 

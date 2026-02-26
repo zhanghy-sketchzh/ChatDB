@@ -182,6 +182,8 @@ class ReActState:
     
     # ===== 输出 =====
     summary: str = ""
+    planner_conclusion: str = ""               # Planner D 决策时的结论（供 summary 参考）
+    transition_context: str = ""               # Planner A 决策时的承上启下分析（供下一步 SQL Agent 参考）
     
     # ===== 任务 & 上下文（原 AgentContext 独有，迁移至此消除双写） =====
     current_task: dict[str, Any] | None = None   # 当前执行的 Planner 任务

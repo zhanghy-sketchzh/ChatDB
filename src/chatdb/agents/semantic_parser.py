@@ -56,7 +56,7 @@ class StructuredIntent:
     
     # === 核心字段 ===
     mode: str = "analysis"  # analysis / other
-    task_type: str = "basic"  # basic/ratio/comparison/ranking/trend/source
+    task_types: list[str] = field(default_factory=lambda: ["basic"])  # 任务类型列表（单类型或复合类型）
     tables: list[str] = field(default_factory=list)
     table_relation: str = "single"  # single / join / union
     
@@ -77,7 +77,7 @@ class StructuredIntent:
     def __post_init__(self):
         """初始化后处理"""
         self._migrate_legacy_fields()
-        self._sync_task_type()
+        self._sync_task_types()
     
     def _migrate_legacy_fields(self):
         """将旧版 filter_refs 和 filters 迁移到 conditions（去重）"""
@@ -102,14 +102,27 @@ class StructuredIntent:
                 if not dup:
                     self.conditions.append({"type": "custom", "column": col, "op": op, "value": val})
     
-    def _sync_task_type(self):
-        """同步 task_type 和 _analysis_type（向后兼容）"""
-        # 优先使用 task_type，同步到 _analysis_type
-        if self.task_type and self.task_type != "basic":
-            self._analysis_type = self.task_type
-        # 如果 _analysis_type 有值但 task_type 没有，则反向同步
-        elif self._analysis_type and not self.task_type:
-            self.task_type = self._analysis_type
+    def _sync_task_types(self):
+        """同步 task_types 和 _analysis_type（向后兼容）"""
+        primary = self.task_types[0] if self.task_types else "basic"
+        if primary and primary != "basic":
+            self._analysis_type = primary
+        elif self._analysis_type and primary == "basic":
+            self.task_types = [self._analysis_type]
+    
+    @property
+    def task_type(self) -> str:
+        """主任务类型（兼容下游 .task_type 访问）"""
+        return self.task_types[0] if self.task_types else "basic"
+    
+    @task_type.setter
+    def task_type(self, value: str) -> None:
+        """设置主任务类型时，替换 task_types 第一个元素"""
+        if self.task_types:
+            self.task_types[0] = value
+        else:
+            self.task_types = [value]
+        self._analysis_type = value
     
     @property
     def filter_refs(self) -> list[str]:
@@ -182,7 +195,7 @@ class StructuredIntent:
             "rewritten_query": self.rewritten_query,
             "table_name": self.table_name,
             "mode": self.mode,
-            "task_type": self.task_type,
+            "task_types": self.task_types,
             "tables": self.tables,
             "table_relation": self.table_relation,
             "metrics": self.metrics,
@@ -199,12 +212,20 @@ class StructuredIntent:
     
     @classmethod
     def from_dict(cls, data: dict[str, Any], raw_query: str = "") -> "StructuredIntent":
+        # task_type(s) 归一化：LLM 可能输出字符串或数组
+        # 兼容 to_dict() 输出的 "task_types" 和 LLM 输出的 "task_type" 两种键名
+        raw_tt = data.get("task_type") or data.get("task_types") or "basic"
+        if isinstance(raw_tt, list):
+            task_types = [str(t) for t in raw_tt] if raw_tt else ["basic"]
+        else:
+            task_types = [str(raw_tt)] if raw_tt else ["basic"]
+
         intent = cls(
             raw_query=raw_query,
             rewritten_query=data.get("rewritten_query", ""),
             table_name=data.get("table_name", ""),
             mode=data.get("mode", "analysis"),
-            task_type=data.get("task_type", "basic"),
+            task_types=task_types,
             tables=data.get("tables", []),
             table_relation=data.get("table_relation", "single"),
             metrics=data.get("metrics", []),
@@ -218,7 +239,7 @@ class StructuredIntent:
         # 兼容旧字段
         if data.get("qa_type") or data.get("intent_type"):
             intent._analysis_type = data.get("qa_type") or data.get("intent_type", "")
-            if not intent.task_type or intent.task_type == "basic":
+            if intent.task_type == "basic":
                 intent.task_type = intent._analysis_type
         return intent
     
@@ -453,14 +474,21 @@ class SemanticParser:
 
 ### 2. 意图提取（mode + task_type + metrics + dimensions + conditions）
 
-| task_type | 含义 | 典型关键词 |
-|-----------|------|------------|
-| ratio | 占比/比例 | "占比""比例""占多少" |
-| comparison | 对比 | "同比""环比""增长""对比" |
-| trend | 趋势 | "趋势""走势""逐月""逐年" |
-| ranking | 排名 | "Top""前N""排名""最高" |
-| source | 来源/构成 | "按XX分""各个""构成""分布" |
-| basic | 基础查询 | "是多少""总计""合计" |
+| task_type | 含义 | 判断标准 |
+|-----------|------|----------|
+| trend | 趋势 | 观察指标随时间的变化走势（逐年/逐月） |
+| comparison | 对比/变化 | 需要计算两期差值或增长率（同比/环比/跌幅/涨幅/下降最多/增长最快） |
+| source | 来源/构成 | 按维度拆解**单期**构成，不涉及变化量计算 |
+| ranking | 排名 | 基于绝对值的 TopN/BottomN 排序 |
+| ratio | 占比/比例 | 计算"部分/总体"百分比 |
+| basic | 基础查询 | 简单聚合，获取单一数值 |
+
+**★ comparison vs source 判断**：
+- 涉及"变化/增减/跌幅/涨幅/下降最多/增长最快" → comparison（即使同时有维度拆解）
+- 仅按维度拆解构成，不涉及变化量 → source
+
+**复合分析**：当问题涉及多步分析时，task_type 用数组表示涉及的所有类型。
+例如："近几年流水趋势，并找出下降最多的年份中哪些产品跌幅最大" → `["trend", "comparison", "comparison"]`（第二步找年份变化、第三步找产品变化，都涉及两期对比，都是 comparison）
 
 ### 3. conditions 填写规则
 
@@ -473,15 +501,16 @@ conditions 有两种类型，**务必区分**：
 
 ⚠️ **关键约束**：
 - 凡是能对应到「可用筛选器」中 ID 的条件，**必须**用 `ref` 类型，**禁止**用 `custom` 引用筛选器 ID
-- `custom` 的 `column` 必须是数据表的**真实列名**（如"年""考核产品"），不能填筛选器 ID 或维度 ID
+- `custom` 的 `column` 必须是数据表的**真实列名**（如"年""考核产品"），**禁止**填维度 ID（如 dim_year）或术语 ID（如 ieg_total）
 - 业务术语（如"IEG本部""一方报表"）对应的筛选器已预定义，用 `ref` 引用即可，无需自行构造
+- 维度 ID（dim_xxx）只填入 dimensions 字段，不要出现在 conditions 的 column 中
 
 ## 输出 JSON
 ```json
 {{
   "rewritten_query": "改写后的完整问题（自然语言）",
   "mode": "analysis|other",
-  "task_type": "basic|ratio|comparison|ranking|trend|source",
+  "task_type": "basic|ratio|comparison|ranking|trend|source（单类型用字符串；复合分析用数组 [\"trend\", \"comparison\"]）",
   "metrics": ["指标ID"],
   "dimensions": ["维度ID"],
   "conditions": [
@@ -530,11 +559,19 @@ conditions 有两种类型，**务必区分**：
             # 构建业务术语→筛选器的映射表
             term_to_filters = self._build_term_filter_map(yml_config.get("business_terms", []))
             
+            # 构建维度 ID → 真实列名映射（防止 LLM 在 custom 条件中误用维度 ID）
+            dims_column_map = {
+                dim_id: dim_def.get("column", dim_id)
+                for dim_id, dim_def in yml_config.get("dimensions", {}).items()
+                if dim_def.get("column")
+            }
+            
             # 校验并转换 conditions 中的 ref 类型 ID
             valid_filters = set(yml_config.get("filters", {}).keys())
             if intent.conditions:
                 intent.conditions = self._resolve_conditions(
-                    intent.conditions, valid_filters, term_to_filters
+                    intent.conditions, valid_filters, term_to_filters,
+                    dims_column_map=dims_column_map,
                 )
             
             self._log.observe(
@@ -545,8 +582,8 @@ conditions 有两种类型，**务必区分**：
             
         except Exception as e:
             self._log.error(f"意图提取失败: {e}")
-            return StructuredIntent(raw_query=query, table_name=table_name)
-    
+            raise
+
     async def _extract_intent_from_schema(
         self,
         query: str,
@@ -599,8 +636,7 @@ conditions 有两种类型，**务必区分**：
 {{
   "rewritten_query": "改写后的完整问题",
   "mode": "analysis|other",
-  "task_type": "basic|ratio|comparison|ranking|trend|source",
-  "tables": ["表名"],
+  "task_type": "basic|ratio|comparison|ranking|trend|source（单类型用字符串；复合分析用数组 [\"trend\", \"comparison\"]）",  "tables": ["表名"],
   "agg_column": "要聚合的数值列名（如 amount, price, count 等）",
   "agg_func": "SUM|COUNT|AVG|MAX|MIN",
   "group_by_columns": ["分组列名"],
@@ -615,11 +651,13 @@ conditions 有两种类型，**务必区分**：
 | 类型 | 关键词 | 示例问题 |
 |------|--------|----------|
 | **ratio** | 占比、比例、百分比 | "A在B中占多少" |
-| **comparison** | 同比、环比、增长、对比 | "今年比去年增长多少" |
-| **ranking** | Top、前N、排名、最高/低 | "销量最高的10个产品" |
+| **comparison** | 同比、环比、增长、对比、下降最多 | "今年比去年增长多少" |
+| **ranking** | Top、前N、排名、最高/低、最大/小 | "销量最高的10个产品" |
 | **trend** | 趋势、走势、逐月/年 | "最近一年的变化趋势" |
-| **source** | 按XX分、各个、构成、分布 | "各地区的销售额" |
+| **source** | 按XX分、各个、构成、分布、拆解 | "各地区的销售额" |
 | **basic** | 是多少、总计、合计 | "总销售额是多少" |
+
+**复合分析**：问题涉及多步骤时输出数组，如 `["trend", "comparison"]`。
 
 ## 列选择建议
 - **agg_column**: 选择数值类型列（INT, FLOAT, DECIMAL 等）
@@ -637,12 +675,19 @@ conditions 有两种类型，**务必区分**：
             
             intent_dict = self._parse_json_response(response)
             
+            # task_type(s) 归一化（同 from_dict）
+            raw_tt = intent_dict.get("task_type", "basic")
+            if isinstance(raw_tt, list):
+                tt_list = [str(t) for t in raw_tt] if raw_tt else ["basic"]
+            else:
+                tt_list = [str(raw_tt)] if raw_tt else ["basic"]
+
             intent = StructuredIntent(
                 raw_query=query,
                 rewritten_query=intent_dict.get("rewritten_query", ""),
                 table_name=table_name,
                 mode=intent_dict.get("mode", "analysis"),
-                task_type=intent_dict.get("task_type", "basic"),
+                task_types=tt_list,
                 tables=intent_dict.get("tables", [table_name] if table_name else []),
                 table_relation=intent_dict.get("table_relation", "single"),
             )
@@ -670,7 +715,7 @@ conditions 有两种类型，**务必区分**：
             
         except Exception as e:
             self._log.error(f"Schema意图提取失败: {e}")
-            return StructuredIntent(raw_query=query, table_name=table_name)
+            raise
     
     def _extract_columns_from_meta(self, tables_meta: list[dict[str, Any]], table_name: str) -> str:
         """从 tables_meta 提取列信息"""
@@ -785,33 +830,48 @@ conditions 有两种类型，**务必区分**：
         conditions: list[dict[str, Any]],
         valid_filters: set[str],
         term_to_filters: dict[str, list[str]],
+        dims_column_map: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         解析并转换 conditions 中的筛选器引用
         
         - ref 类型：校验 ID 是否为有效筛选器或业务术语
-        - custom 类型：自动纠正——若 column 匹配已知筛选器 ID 或业务术语，
-          转换为 ref 类型（防止 LLM 误将筛选器 ID 当列名输出）
+        - custom 类型：自动纠正——
+          1. column 匹配筛选器 ID → 转为 ref
+          2. column 匹配业务术语 → 展开为 ref
+          3. column 匹配维度 ID → 替换为真实列名（防止 LLM 误用维度 ID 作为列名）
+        
+        Args:
+            dims_column_map: 维度 ID → 真实列名映射，如 {"dim_year": "年"}
         """
         resolved = []
-        seen_filter_ids = set()  # 避免重复
+        seen_filter_ids = set()
+        dims_map = dims_column_map or {}
         
         for cond in conditions:
             if cond.get("type") != "ref":
-                # ★ 自动纠正：检查 custom 条件的 column 是否实为筛选器 ID 或术语
                 col = cond.get("column", "")
+                # 纠正 1: 筛选器 ID → ref
                 if col and col in valid_filters:
                     if col not in seen_filter_ids:
                         self._log.observe(f"自动纠正: custom '{col}' → ref（匹配已知筛选器）")
                         resolved.append({"type": "ref", "id": col})
                         seen_filter_ids.add(col)
                     continue
+                # 纠正 2: 业务术语 → ref 展开
                 if col and col in term_to_filters:
                     self._log.observe(f"自动纠正: custom '{col}' → 术语展开")
                     for filter_id in term_to_filters[col]:
                         if filter_id in valid_filters and filter_id not in seen_filter_ids:
                             resolved.append({"type": "ref", "id": filter_id})
                             seen_filter_ids.add(filter_id)
+                    continue
+                # 纠正 3: 维度 ID → 真实列名
+                if col and col in dims_map:
+                    real_col = dims_map[col]
+                    self._log.observe(f"自动纠正: custom column '{col}' → '{real_col}'（维度 ID → 真实列名）")
+                    corrected = {**cond, "column": real_col}
+                    resolved.append(corrected)
                     continue
                 # 真正的自定义条件，保留
                 resolved.append(cond)
