@@ -37,9 +37,8 @@ async def execute_query(
         logger.info(f"收到查询请求: {request.query[:50]}...")
 
         result = await orchestrator.process_query(
-            user_query=request.query,
-            skip_validation=request.skip_validation,
-            skip_summary=request.skip_summary,
+            query=request.query,
+            session_id=request.session_id,
         )
 
         return QueryResponse(**result)

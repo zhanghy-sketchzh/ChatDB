@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 from chatdb.agents.base import BaseAgent, AgentContext, AgentResult, AgentStatus
 from chatdb.config.metrics_loader import preprocess_yaml_config
 from chatdb.core.messages import TaskRequest, TaskResponse, TaskResultEntry
-from chatdb.core.react_state import ReActState
+from chatdb.core.react_state import ErrorType, ReActState
 from chatdb.database.base import BaseDatabaseConnector
 from chatdb.llm.base import BaseLLM
 from chatdb.tools.sql import SQLTool
@@ -862,12 +862,21 @@ class SQLAgent(BaseAgent):
             if not state.table_name:
                 state.table_name = self.config.table_name
         
-        # 重试时清除旧执行状态
+        # ★ 每个新任务开始时，清除上一个任务的残留执行状态
+        # 防止上一个任务的成功结果干扰 run_workflow 的重试循环判断
+        state.execute_result = None
+        state.execution_error = None
+        state.error = None
+        state.error_type = ErrorType.NONE
+        state.error_context = {}
+        state.current_sql = ""
+        state.final_sql = ""
+        state.refine_attempts = 0
+        
+        # 重试时的额外日志
         retry_count = request.meta.get("retry_count", 0)
         if retry_count > 0:
             self._log.info(f"重试任务 {request.task_id}（第 {retry_count} 次）")
-            state.execution_error = None
-            state.error = None
         
         # 类型解析：字符串 → 枚举（类型安全）
         try:

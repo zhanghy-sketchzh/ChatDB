@@ -7,6 +7,7 @@ from chatdb.core.react_state import ReActState, ReActPhase, ErrorType
 from chatdb.core.tracer import TaskTracer, TaskStep
 from chatdb.core.messages import TaskRequest, TaskResponse, TaskResultEntry, PlanDecision
 from chatdb.core.scratch_pad import ScratchPadManager
+from chatdb.core.context_retriever import ContextRetriever, RetrievalResult
 from chatdb.core.semantic_parse import SemanticParseTool
 from chatdb.core.summarize import SummarizeAnswerTool
 
@@ -44,6 +45,9 @@ __all__ = [
     "TaskStep",
     # Scratch Pad（文件暂存）
     "ScratchPadManager",
+    # Context Retriever（检索增强）
+    "ContextRetriever",
+    "RetrievalResult",
     # 流程步骤
     "SemanticParseTool",
     "SummarizeAnswerTool",

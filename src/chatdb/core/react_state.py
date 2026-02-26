@@ -173,6 +173,8 @@ class ReActState:
     sql_candidates: list[dict[str, Any]] = field(default_factory=list)
     current_sql: str = ""
     final_sql: str = ""
+    # 多步计划中所有已执行的 SQL（task_id → sql），用于完整记录
+    executed_sqls: dict[str, str] = field(default_factory=dict)
     
     # ===== 执行结果 =====
     execute_result: dict[str, Any] | None = None
@@ -222,6 +224,11 @@ class ReActState:
     # Orchestrator 在恢复/创建计划时设置，用于 debug 和上下文注入
     persistent_plan_path: str = ""              # scratch/{session_id}/plan.json 路径
     plan_resumed: bool = False                  # 是否从持久化计划恢复（而非重新生成）
+
+    # ===== 检索上下文（Context Retriever 注入）=====
+    # Orchestrator 在 _init_context 阶段一次性检索，后续各 Agent 按需取用
+    # 结构为 RetrievalResult（或 None 表示未启用检索）
+    retrieval_context: Any = None
     
     # ===== 分析型任务：结构化中间结果 =====
     need_more_analysis: bool = False       # LLM 评估：当前结果尚不足以完整回答用户问题

@@ -160,10 +160,18 @@ class SemanticParseTool(BaseTool):
         from chatdb.core.react_state import ReActPhase, ErrorType
         
         state.phase = ReActPhase.SEMANTIC_PARSE
+
+        # 检索增强：将 schema 召回结果追加到 schema_text
+        schema_text = state.schema_text
+        rc = getattr(state, "retrieval_context", None)
+        if rc is not None and hasattr(rc, "format_schema_hint"):
+            schema_hint = rc.format_schema_hint()
+            if schema_hint:
+                schema_text = f"{schema_text}\n\n{schema_hint}"
         
         result = await self.execute(
             user_query=state.user_query,
-            schema_text=state.schema_text,
+            schema_text=schema_text,
             table_name=state.table_name or "",
             available_tables=state.available_tables,
             chat_history=context.chat_history or None,

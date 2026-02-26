@@ -27,6 +27,8 @@ result = await orch.process_query("王者荣耀流水增长来自哪里")
 
 from pathlib import Path
 from typing import Any, Optional, Union
+import asyncio
+import copy
 import hashlib
 import time
 import uuid
@@ -40,10 +42,12 @@ from chatdb.agents.sql_agent import SQLAgent
 from chatdb.database.base import BaseDatabaseConnector
 from chatdb.database.schema import SchemaInspector
 from chatdb.llm.base import BaseLLM
-from chatdb.storage.chat_history import ChatHistoryDB, ChatHistoryManager, HistoryConfig
+from chatdb.storage.chat_history import ChatHistoryManager, HistoryConfig
+from chatdb.storage.task_history import TaskHistoryDB, TaskTracker, TaskStatus
 from chatdb.tools import ToolRegistry, UnixTool
 from chatdb.core.semantic_parse import SemanticParseTool
 from chatdb.core.summarize import SummarizeAnswerTool
+from chatdb.core.context_retriever import ContextRetriever, RetrievalResult
 from chatdb.utils.logger import logger, set_log_level_to_debug, enable_llm_debug, task_log, get_component_logger
 from chatdb.utils.common import select_best_table, build_schema_text, get_tables_info, format_rows
 
@@ -75,6 +79,9 @@ class AgentOrchestrator:
         # 会话记忆配置
         history_db_path: Optional[Union[str, Path]] = None,
         history_config: Optional[HistoryConfig] = None,
+        # 检索增强配置（Context Engineering）
+        text_index: Any = None,
+        example_store: Any = None,
     ):
         self.llm = llm
         self.db_connector = db_connector
@@ -103,20 +110,35 @@ class AgentOrchestrator:
         # 文件系统工具（供 Planner 观察 scratch 数据）
         self._unix_tool = UnixTool(workspace=".", readonly=True)
 
-        # Planner（生成分析型 ToDo，持有 UnixTool 观察结果）
-        self.planner = PlannerAgent(llm, unix_tool=self._unix_tool)
+        # Planner（生成分析型 ToDo，数据直接内联到上下文）
+        self.planner = PlannerAgent(llm)
         
-        # ===== 会话记忆 =====
+        # ===== 统一历史 DB（tasks + agent_steps + plan_nodes + llm_calls）=====
+        _history_db_path = history_db_path or "data/pilot/history.db"
+        _history_db = TaskHistoryDB(_history_db_path) if _history_db_path else None
+        
+        # 会话记忆（基于同一 TaskHistoryDB）
         self._history_manager: ChatHistoryManager | None = None
-        if history_db_path:
-            db = ChatHistoryDB(history_db_path)
+        if _history_db:
             self._history_manager = ChatHistoryManager(
-                db, history_config or HistoryConfig()
+                _history_db, history_config or HistoryConfig()
             )
             self._history_manager.set_agent("orchestrator")
         
+        # 任务追踪（共用同一 DB 实例）
+        self._task_tracker = TaskTracker(_history_db)
+        
+        # 注入 LLM 调用回调，自动记录每次 LLM 请求
+        self.llm._on_llm_call = self._task_tracker.log_llm_call
+        
         # ===== Scratch Pad（文件暂存）=====
         self._scratch_pad = ScratchPadManager(base_path="data/scratch")
+
+        # ===== Context Retriever（检索增强）=====
+        self._context_retriever = ContextRetriever(
+            text_index=text_index,
+            example_store=example_store,
+        )
         
         # ===== Schema 缓存 =====
         self._schema_cache: dict[str, Any] | None = None
@@ -176,6 +198,10 @@ class AgentOrchestrator:
         # scratch session ID（用于文件暂存目录）
         scratch_session_id = session_id or uuid.uuid4().hex[:12]
         
+        # ===== 任务追踪：开始 =====
+        tracker = self._task_tracker
+        tracker.start_task(scratch_session_id, query)
+        
         # ===== 会话记忆：加载历史 =====
         chat_history = self._load_chat_history(session_id, orch_log)
         if chat_history:
@@ -188,6 +214,7 @@ class AgentOrchestrator:
             # SemanticParser 同时完成：指代消解、问题补全、意图提取
             # ============================================================
             orch_log.info("1. [前置] 语义解析...")
+            sp_step = tracker.start_step("semantic_parse", {"query": query})
             await self._semantic_parse_tool(state, context)
             
             # 取出改写后的查询，替换后续流程中的 user_query
@@ -197,21 +224,38 @@ class AgentOrchestrator:
                 state.user_query = rewritten
                 context.user_query = rewritten
                 state.rewritten_query = rewritten  # type: ignore[attr-defined]
+                tracker.set_rewritten_query(rewritten)
+                
+                # ===== 用改写后的 query 重新检索 =====
+                if self._context_retriever.has_text_index or self._context_retriever.has_example_store:
+                    retrieval = self._context_retriever.retrieve_all(
+                        rewritten, table_name=state.table_name,
+                    )
+                    if not retrieval.is_empty():
+                        state.retrieval_context = retrieval
+                        orch_log.debug(f"改写后重新检索: {len(retrieval.value_matches)} 值匹配, "
+                                       f"{len(retrieval.few_shot_examples)} 示例")
             
+            sp_output: dict[str, Any] = {}
             if state.intent:
-                # 简化：使用 intent_type 属性（由 Planner 设置分析模式后才有意义）
                 task_log.intent(
                     intent_type=state.intent.intent_type,
                     metrics=state.intent.metrics or [],
                     dimensions=state.intent.dimensions or [],
                     filters=state.intent.filter_refs or [],
                 )
+                sp_output = {
+                    "intent_type": state.intent.intent_type,
+                    "metrics": state.intent.metrics or [],
+                    "dimensions": state.intent.dimensions or [],
+                    "table": state.table_name,
+                }
             else:
                 orch_log.warn("语义解析未返回 Intent，继续执行")
+            tracker.end_step(sp_step, sp_output)
             
             # ============================================================
             # 1.5 检查是否为非数据分析请求
-            # 使用 is_other_query() 方法判断
             # ============================================================
             if state.intent and state.intent.is_other_query():
                 orch_log.info("检测到非数据分析请求（mode=other），直接生成响应...")
@@ -221,21 +265,45 @@ class AgentOrchestrator:
                 result = self._build_result(state, query, start_time)
                 self._save_to_history(session_id, query, state.summary or "", state)
                 self._cache_result(session_id, query, result)
+                tracker.end_task(summary=state.summary or "")
                 return result
             
             # ============================================================
             # 2. Planner 生成分析计划（或恢复持久化计划）
             # ============================================================
+            planner_step = tracker.start_step("planner", {"query": state.user_query})
             plan = await self._get_or_create_plan(
                 state, context, scratch_session_id, query, orch_log,
             )
             orch_log.info(f"分析计划:\n{plan.to_display()}")
+            tracker.set_plan(plan.to_display())
+            tracker.end_step(planner_step, {
+                "task_count": len(plan.tasks),
+                "plan": plan.to_display(),
+            })
             
             # ============================================================
             # 3. 按计划执行 SQLAgent
             # ============================================================
             orch_log.info(f"3. SQL 分析流程... (Agent: {self._sql_agent.display_name})")
+            exec_step = tracker.start_step("sql_execute", {
+                "plan_task_count": len(plan.tasks),
+                "plan_tasks": [t.id for t in plan.tasks],
+            })
             await self._execute_plan(state, context, orch_log, scratch_session_id)
+            # 收集执行结果摘要
+            exec_output: dict[str, Any] = {}
+            if state.executed_sqls:
+                exec_output["sql_count"] = len(state.executed_sqls)
+                exec_output["task_ids"] = list(state.executed_sqls.keys())
+            elif state.final_sql or state.current_sql:
+                exec_output["sql_count"] = 1
+                exec_output["sql_preview"] = (state.final_sql or state.current_sql)[:200]
+            if state.execute_result:
+                exec_output["row_count"] = state.execute_result.get("row_count", 0)
+            if state.error:
+                exec_output["error"] = str(state.error)[:200]
+            tracker.end_step(exec_step, exec_output or None)
             
             # Task View: SQL
             if state.current_sql:
@@ -250,7 +318,15 @@ class AgentOrchestrator:
             # 4. 生成总结
             # ============================================================
             if not state.summary and (state.has_result or state.error_type == ErrorType.NO_DATA):
+                sum_input: dict[str, Any] = {
+                    "has_result": state.has_result,
+                    "row_count": state.execute_result.get("row_count", 0) if state.execute_result else 0,
+                }
+                if state.executed_sqls:
+                    sum_input["sql_count"] = len(state.executed_sqls)
+                sum_step = tracker.start_step("summarize", sum_input)
                 state = await self._generate_summary(state, query)
+                tracker.end_step(sum_step, {"summary": (state.summary or "")[:200]})
             
             # 标记完成
             if state.has_result or state.summary:
@@ -263,10 +339,25 @@ class AgentOrchestrator:
             result = self._build_result(state, query, start_time)
             self._save_to_history(session_id, query, state.summary or "", state)
             self._cache_result(session_id, query, result)
+            
+            # 合并所有执行过的 SQL（多步骤时记录完整）
+            if state.executed_sqls:
+                all_sql_parts = [
+                    f"-- [{tid}]\n{sql}" for tid, sql in state.executed_sqls.items()
+                ]
+                combined_sql = "\n\n".join(all_sql_parts)
+            else:
+                combined_sql = state.final_sql or state.current_sql
+            
+            tracker.end_task(
+                final_sql=combined_sql,
+                summary=state.summary or "",
+            )
             return result
             
         except Exception as e:
             logger.error(f"[Orchestrator] 处理失败: {e}")
+            tracker.end_task(error=str(e))
             return {
                 "success": False, "query": query, "sql": state.current_sql,
                 "result": [], "error": str(e),
@@ -289,8 +380,9 @@ class AgentOrchestrator:
         3. collected_results 只保存摘要 + 文件引用（不保存全量数据）
         4. Orchestrator 将 collected_results 传给 Planner → Planner 基于摘要决策
         
-        Agent 之间不直接共享可变状态，由 Orchestrator 路由消息。
-        大数据通过文件传递，prompt 只传摘要和文件路径。
+        并行执行：
+        - 同一层的 ready 任务（依赖均已满足）使用 asyncio.gather 并行执行
+        - 每批任务完成后统一做一次 Planner 决策
         
         状态管理：
         - collected_results: Orchestrator 本地变量（精简版：摘要 + 文件引用）
@@ -308,63 +400,188 @@ class AgentOrchestrator:
                 state.temp_results = collected_results
         
         while state.plan_step < state.max_plan_steps:
-            current_step = state.inc_plan_step()
-            
-            # 1. 获取当前任务
-            current_task = self.planner.get_current_task(collected_results)
-            if not current_task:
+            # 1. 获取所有 ready 任务
+            ready_tasks = self.planner.get_ready_tasks(collected_results)
+            if not ready_tasks:
                 orch_log.info("没有更多任务")
                 break
             
-            task_dict = current_task.to_dict()
-            task_id = task_dict.get("id", "")
-            task_type = task_dict.get("type", "")
+            # 2. 过滤：summary 任务单独处理
+            summary_task = None
+            exec_tasks = []
+            for t in ready_tasks:
+                if t.type.value == "summary":
+                    summary_task = t
+                else:
+                    exec_tasks.append(t)
             
-            # 2. 死循环检测
-            if state.mark_task_repeat(task_id):
-                orch_log.warn(f"任务 {task_id} 重复执行，强制跳过")
-                self.planner.advance_plan(collected_results)
-                continue
-            
-            # 3. validation 任务数量限制
-            if task_type == "validation":
-                if not state.bump_validation():
-                    orch_log.warn("validation 任务达到上限，跳过更多诊断")
-                    self.planner.advance_plan(collected_results)
-                    continue
-            
-            orch_log.info(f"执行任务 {current_step}: [{task_type}] {task_dict['description'][:50]}...")
-            
-            # 4. summary 任务由 Orchestrator 处理
-            if task_type == "summary":
-                self.planner.advance_plan(collected_results)
-                continue
-            
-            # 5. 构建 TaskRequest 消息（Orchestrator → SQLAgent）
-            request = self._build_task_request(task_dict, collected_results)
-            
-            try:
-                # 6. SQLAgent 执行任务，返回 TaskResponse 消息
-                response = await self._sql_agent.run_task(state, context, request)
-                
-                # 7. Orchestrator 写入 Scratch Pad 文件 + 存储精简结果
-                self._store_response_to_scratch(
-                    collected_results, response,
-                    scratch_session_id,
+            # 如果只有 summary 任务，标记完成并退出
+            if summary_task and not exec_tasks:
+                if self.planner.analysis_plan:
+                    self.planner.analysis_plan.mark_completed(summary_task.id)
+                self._persist_task_completion(
+                    scratch_session_id, summary_task.id, "completed",
                 )
+                orch_log.info("到达总结节点，结束计划执行")
+                break
+            
+            # 3. 死循环检测 + validation 限制
+            filtered_tasks = []
+            for t in exec_tasks:
+                if state.mark_task_repeat(t.id):
+                    orch_log.warn(f"任务 {t.id} 重复执行，强制标记失败")
+                    if self.planner.analysis_plan:
+                        self.planner.analysis_plan.mark_failed(t.id, "重复执行超限")
+                    continue
+                if t.type.value == "validation":
+                    if not state.bump_validation():
+                        orch_log.warn("validation 任务达到上限，跳过更多诊断")
+                        if self.planner.analysis_plan:
+                            self.planner.analysis_plan.mark_skipped(t.id, "validation上限")
+                        continue
+                filtered_tasks.append(t)
+            
+            if not filtered_tasks:
+                continue
+            
+            # 4. 并行或串行执行
+            if len(filtered_tasks) == 1:
+                # 单任务：串行执行（保持原有逻辑）
+                task = filtered_tasks[0]
+                current_step = state.inc_plan_step()
+                task_dict = task.to_dict()
+                task_id = task_dict.get("id", "")
+                task_type = task_dict.get("type", "")
+                orch_log.info(f"执行任务 {current_step}: [{task_type}] {task_dict['description'][:80]}...")
                 
-                # 同步到 state.temp_results（兼容旧接口）
-                state.temp_results = collected_results
+                await self._execute_single_task(
+                    state, context, task, collected_results,
+                    orch_log, scratch_session_id,
+                )
+            else:
+                # 多任务：并行执行（每个任务使用独立的 state 深拷贝避免冲突）
+                task_ids = [t.id for t in filtered_tasks]
+                orch_log.info(f"并行执行 {len(filtered_tasks)} 个任务: {task_ids}")
                 
-                # 8. 将结果传给 Planner 查看（基于摘要，不传全量数据）
-                temp_summary = await self.planner.inspect_temp_results(state, collected_results)
-                if temp_summary:
-                    orch_log.debug(f"temp_results 摘要:\n{temp_summary[:200]}...")
+                # 先批量分配 step 编号（在 await 前完成，避免并发修改 exec_meta）
+                task_steps: dict[str, int] = {}
+                for t in filtered_tasks:
+                    task_steps[t.id] = state.inc_plan_step()
                 
-                # 标记当前任务完成
-                self.planner.advance_plan(collected_results)
+                async def _run_one(t: Any) -> None:
+                    step = task_steps[t.id]
+                    td = t.to_dict()
+                    orch_log.info(f"  [并行] 任务 {step}: [{td.get('type', '')}] {td['description'][:80]}...")
+                    # 使用 deepcopy 确保嵌套可变对象（exec_meta, thoughts, error_context 等）完全隔离
+                    task_state = copy.deepcopy(state)
+                    task_state.execute_result = None
+                    task_state.current_sql = ""
+                    task_state.final_sql = ""
+                    task_state.execution_error = None
+                    task_state.error = None
+                    task_state.error_type = ErrorType.NONE
+                    task_state.error_context = {}
+                    await self._execute_single_task(
+                        task_state, context, t, collected_results,
+                        orch_log, scratch_session_id,
+                        is_parallel=True,
+                    )
+                    # 回写最后执行的 SQL 到主 state（用于日志/调试）
+                    if task_state.current_sql:
+                        state.current_sql = task_state.current_sql
+                    if task_state.final_sql:
+                        state.final_sql = task_state.final_sql
+                    if task_state.execute_result:
+                        state.execute_result = task_state.execute_result
+                    # 合并多步 SQL 记录
+                    state.executed_sqls.update(task_state.executed_sqls)
                 
-                # 持久化任务完成状态到 plan.json
+                await asyncio.gather(*[_run_one(t) for t in filtered_tasks])
+            
+            # 5. 同步 temp_results
+            state.temp_results = collected_results
+            
+            # 6. Planner 决策（一批任务完成后统一决策一次）
+            decision = await self.planner.decide_next_action(state, context, collected_results)
+            if await self._handle_planner_decision(state, context, decision, orch_log):
+                break
+        
+        # 最终同步
+        state.temp_results = collected_results
+        
+        if collected_results:
+            orch_log.info(f"完成 {len(collected_results)} 个任务的数据收集")
+
+    async def _execute_single_task(
+        self,
+        state: ReActState,
+        context: AgentContext,
+        task: Any,
+        collected_results: dict[str, list[dict[str, Any]]],
+        orch_log,
+        scratch_session_id: str,
+        is_parallel: bool = False,
+    ) -> None:
+        """执行单个任务（从原 _execute_plan 循环体提取）"""
+        task_dict = task.to_dict()
+        task_id = task_dict.get("id", "")
+        task_type = task_dict.get("type", "query")
+        task_desc = task_dict.get("description", "")
+        depends_on = task_dict.get("depends_on", [])
+        
+        # ===== 追踪：开始 plan node =====
+        tracker = self._task_tracker
+        node_id = tracker.start_node(
+            step_id=tracker.active_step_id or "",
+            plan_task_id=task_id,
+            task_type=task_type,
+            description=task_desc,
+            depends_on=depends_on,
+            is_parallel=is_parallel,
+        )
+        
+        request = self._build_task_request(task_dict, collected_results)
+        
+        try:
+            response = await self._sql_agent.run_task(state, context, request)
+            
+            self._store_response_to_scratch(
+                collected_results, response,
+                scratch_session_id,
+            )
+            
+            task_has_error = self._check_task_has_error(response, collected_results, task_id)
+            
+            temp_summary = await self.planner.inspect_temp_results(state, collected_results)
+            if temp_summary:
+                orch_log.debug(f"temp_results 摘要:\n{temp_summary[:200]}...")
+            
+            # 收集 node 结果信息
+            node_sql = state.current_sql or ""
+            node_row_count = 0
+            node_sample: list[dict[str, Any]] = []
+            for r in collected_results.get(task_id, []):
+                node_sql = node_sql or r.get("sql", "")
+                node_row_count += r.get("row_count", 0)
+                node_sample.extend(r.get("examples", [])[:5])
+            
+            if task_has_error:
+                orch_log.warn(f"任务 {task_id} 存在 SQL 执行错误，交由 Planner 决策")
+                if self.planner.analysis_plan:
+                    self.planner.analysis_plan.mark_failed(task_id, task_has_error)
+                self._persist_task_completion(
+                    scratch_session_id, task_id, "failed",
+                )
+                tracker.end_node(node_id, sql=node_sql, row_count=node_row_count,
+                                 result_sample=node_sample[:5], error=task_has_error)
+            else:
+                # 记录成功执行的 SQL 到 state.executed_sqls（多步骤完整记录）
+                if node_sql:
+                    state.executed_sqls[task_id] = node_sql
+                
+                if self.planner.analysis_plan:
+                    self.planner.analysis_plan.mark_completed(task_id)
+                
                 result_file = ""
                 for r in collected_results.get(task_id, []):
                     ref = r.get("_file_ref", {})
@@ -374,25 +591,47 @@ class AgentOrchestrator:
                 self._persist_task_completion(
                     scratch_session_id, task_id, "completed", result_file,
                 )
-                
-                # 9. Planner 决策（接收精简版 collected_results）
-                decision = await self.planner.decide_next_action(state, context, collected_results)
-                if await self._handle_planner_decision(state, context, decision, orch_log):
-                    break
-                
-            except Exception as e:
-                orch_log.warn(f"任务执行失败: {e}")
-                self.planner.mark_task_failed(str(e), collected_results)
-                self.planner.advance_plan(collected_results)
-                self._persist_task_completion(
-                    scratch_session_id, task_id, "failed",
-                )
+                tracker.end_node(node_id, sql=node_sql, row_count=node_row_count,
+                                 result_sample=node_sample[:5])
+            
+        except Exception as e:
+            orch_log.warn(f"任务 {task_id} 执行失败: {e}")
+            if self.planner.analysis_plan:
+                self.planner.analysis_plan.mark_failed(task_id, str(e))
+            self._persist_task_completion(
+                scratch_session_id, task_id, "failed",
+            )
+            tracker.end_node(node_id, error=str(e))
+
+    @staticmethod
+    def _check_task_has_error(
+        response: Any,
+        collected_results: dict[str, list[dict[str, Any]]],
+        task_id: str,
+    ) -> str:
+        """检查任务执行结果是否包含 SQL 错误。
         
-        # 最终同步
-        state.temp_results = collected_results
+        Returns:
+            错误描述字符串（空字符串表示无错误）
+        """
+        # 1. 检查 TaskResponse 级别的错误
+        if hasattr(response, 'error') and response.error:
+            return response.error
+        if hasattr(response, 'success') and response.success is False:
+            return response.error or "任务执行失败"
         
-        if collected_results:
-            orch_log.info(f"完成 {len(collected_results)} 个任务的数据收集")
+        # 2. 检查 collected_results 中该任务的 issues
+        for r in collected_results.get(task_id, []):
+            issues = r.get("issues", [])
+            for issue in issues:
+                if isinstance(issue, str) and (
+                    issue.startswith("sql_error:") or
+                    issue.startswith("error:") or
+                    "no_execute_result" in issue
+                ):
+                    return issue
+        
+        return ""
 
     def _build_task_request(
         self,
@@ -408,9 +647,20 @@ class AgentOrchestrator:
         """
         depends_on = task_dict.get("depends_on", [])
         
-        # 为依赖任务构建结果摘要
+        # 为依赖任务构建结果摘要（含状态标注）
         parent_summary_parts = []
         all_previous = []
+        
+        # 标注依赖任务状态，让下游 Agent 感知
+        if self.planner.analysis_plan:
+            for dep_id in depends_on:
+                dep_task = self.planner.analysis_plan.get_task(dep_id)
+                if dep_task and dep_task.status in ("failed", "skipped"):
+                    parent_summary_parts.append(
+                        f"⚠ [{dep_id}] 状态={dep_task.status}"
+                        + (f"({dep_task.skip_reason})" if dep_task.skip_reason else "")
+                    )
+        
         for dep_id in depends_on:
             for r in collected_results.get(dep_id, []):
                 stats = r.get("stats", {})
@@ -622,16 +872,21 @@ class AgentOrchestrator:
                 continue
             # 构建精简版结果（与 _store_response_to_scratch 格式一致）
             summary = self._scratch_pad._generate_summary(full_data)
+            row_count = full_data.get("row_count", 0)
+            all_examples = full_data.get("examples", [])
+            # ★ 少量数据保留全部行，大量数据保留前 30 行
+            inline_threshold = 30
+            examples_slim = all_examples if row_count <= inline_threshold else all_examples[:inline_threshold]
             slim = {
                 "subtask": full_data.get("subtask", ""),
                 "sql": full_data.get("sql", ""),
-                "row_count": full_data.get("row_count", 0),
-                "examples": full_data.get("examples", [])[:5],
+                "row_count": row_count,
+                "examples": examples_slim,
                 "stats": full_data.get("stats", {}),
                 "issues": full_data.get("issues", []),
                 "_file_ref": {
                     "path": result_file,
-                    "full_row_count": full_data.get("row_count", 0),
+                    "full_row_count": row_count,
                     "summary": summary,
                 },
             }
@@ -696,6 +951,16 @@ class AgentOrchestrator:
         state.schema_text = schema_text
         state.table_name = select_best_table(query, tables_info)
         state.available_tables = tables_info
+
+        # ===== 检索增强（Context Engineering）=====
+        # 初次检索（原始 query），辅助 SemanticParser 识别意图
+        # 语义解析后会用改写 query 重新检索，更新 Planner / SQLTool 的上下文
+        if self._context_retriever.has_text_index or self._context_retriever.has_example_store:
+            retrieval = self._context_retriever.retrieve_all(
+                query, table_name=state.table_name,
+            )
+            if not retrieval.is_empty():
+                state.retrieval_context = retrieval
         
         return AgentContext(
             user_query=query,
@@ -726,25 +991,11 @@ class AgentOrchestrator:
         summary: str,
         state: ReActState,
     ) -> None:
-        """将本轮结果保存到会话历史"""
-        if not self._history_manager or not session_id:
+        """将本轮结果保存到会话历史（写入 tasks 表的 assistant_output 字段）"""
+        if not session_id:
             return
         
-        # 构建 metadata：保存关键中间结果供后续轮次参考
-        metadata: dict[str, Any] = {}
-        if state.intent and hasattr(state.intent, "to_dict"):
-            metadata["intent"] = state.intent.to_dict()
-        if state.table_name:
-            metadata["table_name"] = state.table_name
-        if state.final_sql or state.current_sql:
-            metadata["sql"] = state.final_sql or state.current_sql
-        if state.temp_results:
-            metadata["task_results_summary"] = {
-                tid: len(results) for tid, results in state.temp_results.items()
-            }
-        
-        # 构建 assistant_output：summary + 关键结果数据 + SQL
-        # 关键：将查询结果中的关键值写入 output，供后续轮次指代消解使用
+        # 构建 assistant_output：summary + 关键结果数据 + SQL(s)
         output_parts = []
         if summary:
             output_parts.append(summary)
@@ -754,15 +1005,21 @@ class AgentOrchestrator:
         if result_data_brief:
             output_parts.append(result_data_brief)
         
-        sql = state.final_sql or state.current_sql
-        if sql:
-            output_parts.append(f"[SQL] {sql}")
+        # 附带所有执行过的 SQL（多步骤时完整记录）
+        if state.executed_sqls:
+            sql_parts = ["[执行SQL]"]
+            for tid, sql in state.executed_sqls.items():
+                sql_parts.append(f"  [{tid}] {sql}")
+            output_parts.append("\n".join(sql_parts))
+        else:
+            sql = state.final_sql or state.current_sql
+            if sql:
+                output_parts.append(f"[SQL] {sql}")
         
-        self._history_manager.add_interaction(
-            user_input=query,
-            assistant_output="\n".join(output_parts) if output_parts else "(无结果)",
-            metadata=metadata,
-        )
+        assistant_output = "\n".join(output_parts) if output_parts else "(无结果)"
+        
+        # 直接通过 tracker 写入 tasks 表的 assistant_output 字段
+        self._task_tracker.set_assistant_output(assistant_output)
     
     @staticmethod
     def _extract_result_data_brief(state: ReActState) -> str:
@@ -970,39 +1227,63 @@ class AgentOrchestrator:
     
     def _build_summary_context(self, state: ReActState) -> str:
         """
-        从 temp_results 构建总结上下文
+        从 temp_results + 分析计划 构建多阶段汇总上下文
         
-        Scratch Pad 模式下：从文件读取完整数据用于生成总结
-        （总结需要完整数据以确保准确性）
+        包含每个任务的：描述、SQL、查询结果，让 LLM 能智能综合所有分支结果。
         """
         # 展开文件引用为完整数据
         expanded = self._scratch_pad.expand_results(state.temp_results)
         
-        lines = ["## 分析结果汇总\n"]
+        # 获取计划中的任务描述信息
+        task_descriptions: dict[str, str] = {}
+        if self.planner.analysis_plan:
+            for t in self.planner.analysis_plan.tasks:
+                task_descriptions[t.id] = t.description
+        
+        lines = ["## 多阶段分析结果汇总\n"]
+        lines.append(f"用户问题: {state.user_query}\n")
+        
+        # 改写后的问题（如有）
+        rewritten = getattr(state, "rewritten_query", "")
+        if rewritten and rewritten != state.user_query:
+            lines.append(f"改写后的问题: {rewritten}\n")
         
         for task_id, results in expanded.items():
-            lines.append(f"### {task_id}")
-            for r in results:
+            desc = task_descriptions.get(task_id, "")
+            lines.append(f"### 阶段: {task_id}")
+            if desc:
+                lines.append(f"任务描述: {desc}")
+            
+            for i, r in enumerate(results):
                 subtask = r.get("subtask", "")
                 row_count = r.get("row_count", 0)
+                sql = r.get("sql", "")
                 examples = r.get("examples", [])
                 stats = r.get("stats", {})
                 issues = r.get("issues", [])
                 
-                lines.append(f"- 子任务: {subtask}, 行数: {row_count}")
+                if subtask:
+                    lines.append(f"子任务: {subtask}")
+                
+                if sql:
+                    lines.append(f"执行SQL:\n```sql\n{sql}\n```")
+                
+                lines.append(f"返回行数: {row_count}")
                 
                 if examples:
-                    lines.append("  示例数据:")
-                    for ex in examples[:5]:
-                        ex_str = ", ".join(f"{k}={v}" for k, v in list(ex.items())[:4])
-                        lines.append(f"    {ex_str}")
+                    lines.append("查询结果:")
+                    for ex in examples[:30]:
+                        ex_str = ", ".join(f"{k}={v}" for k, v in list(ex.items()))
+                        lines.append(f"  - {ex_str}")
+                    if len(examples) > 30:
+                        lines.append(f"  ... 共 {len(examples)} 行，已展示前 30 行")
                 
                 if stats:
                     stats_str = ", ".join(f"{k}={v}" for k, v in list(stats.items())[:5])
-                    lines.append(f"  统计: {stats_str}")
+                    lines.append(f"统计: {stats_str}")
                 
                 if issues:
-                    lines.append(f"  注意: {', '.join(issues)}")
+                    lines.append(f"备注: {', '.join(issues)}")
             
             lines.append("")
         

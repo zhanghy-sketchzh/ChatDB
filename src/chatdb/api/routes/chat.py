@@ -55,13 +55,15 @@ class ChatRequest(BaseModel):
     """Chat 请求"""
     query: str = Field(..., description="自然语言查询", min_length=1)
     db_path: str = Field(..., description="数据库或 CSV 文件路径")
+    session_id: str | None = Field(default=None, description="会话 ID（传入启用多轮对话记忆）")
     
     model_config = {
         "json_schema_extra": {
             "examples": [
                 {
                     "query": "今年奖金最高的人是谁",
-                    "db_path": "data/duckdb/excel_26253606.duckdb"
+                    "db_path": "data/duckdb/excel_26253606.duckdb",
+                    "session_id": "abc123"
                 },
                 {
                     "query": "有哪些产品大类",
@@ -119,7 +121,7 @@ async def chat_query(request: ChatRequest) -> ChatResponse:
         llm = LLMFactory.create(provider="hunyuan")
         orchestrator = AgentOrchestrator(llm, db, tables_meta=tables_meta)
         
-        result = await orchestrator.process_query(request.query)
+        result = await orchestrator.process_query(request.query, session_id=request.session_id)
         
         return ChatResponse(
             success=result.get("success", True),

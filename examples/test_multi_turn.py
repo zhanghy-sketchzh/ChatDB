@@ -36,6 +36,8 @@ async def main():
     from chatdb.database.csv import CSVConnector
     from chatdb.core.orchestrator import AgentOrchestrator
     from chatdb.llm.factory import LLMFactory
+    from chatdb.preprocessing.text_index import TextIndex
+    from chatdb.preprocessing.vector_store import ExampleVectorStore
     from chatdb.storage.chat_history import HistoryConfig
     from chatdb.utils.logger import (
         enable_llm_debug,
@@ -73,6 +75,18 @@ async def main():
         "这几个产品的流水分别占总流水的多少？",
     ]
 
+    # ===== 检索增强：加载 TextIndex + ExampleVectorStore =====
+    text_index_path = Path(csv_path).parent.parent / "pilot" / "text_index.db"
+    text_index = None
+    if text_index_path.exists():
+        text_index = TextIndex(db_path=str(text_index_path))
+        print(f"TextIndex: {text_index_path} (已加载)")
+    else:
+        print(f"TextIndex: {text_index_path} (未找到，跳过检索增强)")
+
+    example_store = ExampleVectorStore()
+    print(f"ExampleVectorStore: 内存模式 ({example_store.count} 条)")
+
     async with CSVConnector(csv_path) as db:
         print(f"表名: {db.table_name}, 行数: {db.import_info['row_count']}\n")
         llm = LLMFactory.create(provider="hunyuan")
@@ -83,6 +97,8 @@ async def main():
             debug=VERBOSE,
             history_db_path=history_db_path,
             history_config=HistoryConfig(num_history_runs=5),
+            text_index=text_index,
+            example_store=example_store,
         )
 
         for i, query in enumerate(queries, 1):

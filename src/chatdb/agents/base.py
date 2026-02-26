@@ -21,10 +21,10 @@ from typing import Any, TYPE_CHECKING
 
 from chatdb.llm.base import BaseLLM
 from chatdb.storage.chat_history import (
-    ChatHistoryDB,
     ChatHistoryManager,
     HistoryConfig,
 )
+from chatdb.storage.task_history import TaskHistoryDB
 
 if TYPE_CHECKING:
     from chatdb.tools.base import BaseTool, ToolResult
@@ -147,7 +147,7 @@ class BaseAgent(ABC):
                 enable_history_tool=enable_history_tool,
                 search_across_sessions=search_across_sessions,
             )
-            db = ChatHistoryDB(db_path)
+            db = TaskHistoryDB(db_path)
             self._history_manager = ChatHistoryManager(db, config)
             self._history_manager.set_agent(name)
 

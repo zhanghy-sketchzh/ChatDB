@@ -750,6 +750,12 @@ class SQLTool:
         else:
             query_section = f"## 用户查询\n{intent.raw_query}"
 
+        # ── 7. 检索增强：值匹配提示 ──
+        value_hint_section = ""
+        rc = getattr(state, "retrieval_context", None) if state else None
+        if rc is not None and hasattr(rc, "format_value_hint"):
+            value_hint_section = rc.format_value_hint()
+
         return f"""请根据以下信息生成可执行的 SQL。
 {task_instruction}
 {query_section}
@@ -765,6 +771,8 @@ class SQLTool:
 {metric_section}
 
 {where_section}
+
+{value_hint_section}
 
 ## DuckDB SQL 规范
 {get_duckdb_syntax_rules()}
@@ -798,14 +806,28 @@ class SQLTool:
         retry_hint = current_task.get("retry_hint", "")
         retry_count = current_task.get("retry_count", 0)
 
+        # ── 过滤 notes：只保留与 SQL 生成相关的技术参数，排除后续步骤意图 ──
+        sql_relevant_notes = []
+        downstream_keywords = ("后续", "下一步", "用于", "为了", "传给", "供")
+        for n in task_notes:
+            n_str = str(n)
+            if not any(kw in n_str for kw in downstream_keywords):
+                sql_relevant_notes.append(n_str)
+
         inst = f"""
 ## 当前分析任务
 - 任务 ID: {task_id}
 - 任务类型: {task_type}
 - 任务描述: {task_desc}
+
+### ★ 任务边界约束（必须遵守）
+- **只完成上述"任务描述"中明确要求的分析动作**，不要做任何额外分析
+- **禁止越权**：如果任务描述是"按年聚合总流水"，就只返回年度聚合数据，不要进一步查找最大/最小值、不要下钻到产品/子维度明细
+- **一个任务 = 一个 SQL = 一种分析动作**：不要用 CTE 把多个不同目的的查询串联起来
+- 后续的深入分析（找极值、下钻、对比等）由其他任务负责，不需要你在这一步完成
 """
-        if task_notes:
-            inst += f"- 注意事项: {'; '.join(str(n) for n in task_notes)}\n"
+        if sql_relevant_notes:
+            inst += f"- 注意事项: {'; '.join(sql_relevant_notes)}\n"
         if current_dim:
             inst += f"- 当前分析维度: {current_dim}\n"
         if time_granularity:
@@ -1618,6 +1640,9 @@ FROM 表名 WHERE <全局条件>
             if hasattr(context, "generated_sql"):
                 context.generated_sql = state.final_sql
         except Exception as e:
+            # ★ 执行失败时清除 execute_result，确保 has_result 返回 False
+            # 防止上一次成功的结果残留，导致 run_workflow 重试循环被跳过
+            state.execute_result = None
             state.execution_error = str(e)
             state.observe(f"失败: {str(e)[:80]}")
             error_type = self._classify_error(str(e))

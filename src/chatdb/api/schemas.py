@@ -19,6 +19,7 @@ class QueryRequest(BaseModel):
     db_type: Literal["postgresql", "mysql", "sqlite"] | None = Field(
         default=None, description="数据库类型"
     )
+    session_id: str | None = Field(default=None, description="会话 ID（传入启用多轮对话记忆）")
     skip_validation: bool = Field(default=False, description="是否跳过 SQL 验证")
     skip_summary: bool = Field(default=False, description="是否跳过结果总结")
 
@@ -28,6 +29,7 @@ class QueryRequest(BaseModel):
                 {
                     "query": "查询销售额最高的前10个产品",
                     "db_type": "postgresql",
+                    "session_id": None,
                     "skip_validation": False,
                     "skip_summary": False,
                 }

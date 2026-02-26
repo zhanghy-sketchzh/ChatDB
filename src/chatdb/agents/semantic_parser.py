@@ -436,7 +436,7 @@ class SemanticParser:
 ### 可用维度（参考）
 {available_dimensions}
 
-### 可用筛选器（参考）
+### 可用筛选器（预定义，ID 列表见下方）
 {available_filters}
 
 ### 业务规则（参考）
@@ -462,6 +462,20 @@ class SemanticParser:
 | source | 来源/构成 | "按XX分""各个""构成""分布" |
 | basic | 基础查询 | "是多少""总计""合计" |
 
+### 3. conditions 填写规则
+
+conditions 有两种类型，**务必区分**：
+
+| 类型 | 使用场景 | 格式 |
+|------|----------|------|
+| **ref** | 筛选条件能匹配上方「可用筛选器」列表中的某个 ID | `{{"type":"ref","id":"筛选器ID"}}` |
+| **custom** | 筛选条件**不在**上方列表中，需要自定义列名和值 | `{{"type":"custom","column":"实际列名","op":"运算符","value":"值"}}` |
+
+⚠️ **关键约束**：
+- 凡是能对应到「可用筛选器」中 ID 的条件，**必须**用 `ref` 类型，**禁止**用 `custom` 引用筛选器 ID
+- `custom` 的 `column` 必须是数据表的**真实列名**（如"年""考核产品"），不能填筛选器 ID 或维度 ID
+- 业务术语（如"IEG本部""一方报表"）对应的筛选器已预定义，用 `ref` 引用即可，无需自行构造
+
 ## 输出 JSON
 ```json
 {{
@@ -472,7 +486,7 @@ class SemanticParser:
   "dimensions": ["维度ID"],
   "conditions": [
     {{"type": "ref", "id": "筛选器ID"}},
-    {{"type": "custom", "column": "列名", "op": "=|!=|>|<|>=|<=|IN|LIKE", "value": "值"}}
+    {{"type": "custom", "column": "真实列名", "op": "=|!=|>|<|>=|<=|IN|LIKE", "value": "值"}}
   ]
 }}
 ```
@@ -775,17 +789,31 @@ class SemanticParser:
         """
         解析并转换 conditions 中的筛选器引用
         
-        - 如果 ref ID 是有效筛选器，直接保留
-        - 如果 ref ID 是业务术语，展开为对应的筛选器列表
-        - 如果都不是，记录警告并跳过
-        - 自定义条件（type=custom）直接保留
+        - ref 类型：校验 ID 是否为有效筛选器或业务术语
+        - custom 类型：自动纠正——若 column 匹配已知筛选器 ID 或业务术语，
+          转换为 ref 类型（防止 LLM 误将筛选器 ID 当列名输出）
         """
         resolved = []
         seen_filter_ids = set()  # 避免重复
         
         for cond in conditions:
             if cond.get("type") != "ref":
-                # 自定义条件，直接保留
+                # ★ 自动纠正：检查 custom 条件的 column 是否实为筛选器 ID 或术语
+                col = cond.get("column", "")
+                if col and col in valid_filters:
+                    if col not in seen_filter_ids:
+                        self._log.observe(f"自动纠正: custom '{col}' → ref（匹配已知筛选器）")
+                        resolved.append({"type": "ref", "id": col})
+                        seen_filter_ids.add(col)
+                    continue
+                if col and col in term_to_filters:
+                    self._log.observe(f"自动纠正: custom '{col}' → 术语展开")
+                    for filter_id in term_to_filters[col]:
+                        if filter_id in valid_filters and filter_id not in seen_filter_ids:
+                            resolved.append({"type": "ref", "id": filter_id})
+                            seen_filter_ids.add(filter_id)
+                    continue
+                # 真正的自定义条件，保留
                 resolved.append(cond)
                 continue
             

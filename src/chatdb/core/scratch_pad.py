@@ -112,16 +112,22 @@ class ScratchPadManager:
         summary = self._generate_summary(full_result)
 
         # 返回精简版结果（替代原来的全量数据）
+        row_count = result_entry.get("row_count", 0)
+        all_examples = result_entry.get("examples", [])
+        # ★ 少量数据保留全部行，大量数据保留前 30 行（供 Planner 直接内联到上下文）
+        inline_threshold = 30
+        examples_slim = all_examples if row_count <= inline_threshold else all_examples[:inline_threshold]
+        
         slim_result = {
             "subtask": result_entry.get("subtask", ""),
             "sql": result_entry.get("sql", ""),
-            "row_count": result_entry.get("row_count", 0),
-            "examples": result_entry.get("examples", [])[:5],  # 保留前 5 行样例
+            "row_count": row_count,
+            "examples": examples_slim,
             "stats": result_entry.get("stats", {}),
             "issues": result_entry.get("issues", []),
             "_file_ref": {
                 "path": str(file_path),
-                "full_row_count": result_entry.get("row_count", 0),
+                "full_row_count": row_count,
                 "summary": summary,
             },
         }

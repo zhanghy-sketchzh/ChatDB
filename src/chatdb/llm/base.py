@@ -54,6 +54,8 @@ class BaseLLM(ABC):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.extra_params = kwargs
+        # LLM 调用回调钩子：(caller_name, prompt, response, model, usage, duration_ms) -> None
+        self._on_llm_call: Any = None
 
     @abstractmethod
     async def generate(
@@ -90,7 +92,10 @@ class BaseLLM(ABC):
             messages.append(Message(role="system", content=system_prompt))
         messages.append(Message(role="user", content=prompt))
 
+        import time as _time
+        _t0 = _time.time()
         response = await self.generate(messages)
+        _duration_ms = int((_time.time() - _t0) * 1000)
         
         # LLM Debug 模式：输出完整的输入输出
         if is_llm_debug_enabled():
@@ -101,6 +106,21 @@ class BaseLLM(ABC):
                 response=response.content,
                 model=self.model,
             )
+        
+        # LLM 调用回调（用于 TaskTracker 记录）
+        if self._on_llm_call is not None:
+            try:
+                self._on_llm_call(
+                    caller_name=caller_name,
+                    prompt_preview=prompt[:500],
+                    response_preview=response.content[:500],
+                    model=response.model or self.model,
+                    input_tokens=response.usage.get("input_tokens", 0) or response.usage.get("prompt_tokens", 0),
+                    output_tokens=response.usage.get("output_tokens", 0) or response.usage.get("completion_tokens", 0),
+                    duration_ms=_duration_ms,
+                )
+            except Exception:
+                pass  # 回调失败不影响主流程
         
         return response.content
 
