@@ -131,3 +131,13 @@ class HealthResponse(BaseModel):
     database_connected: bool = False
 
 
+class ClarificationResponse(BaseModel):
+    """人类介入回复（用于 /query/continue 端点）"""
+
+    session_id: str = Field(..., description="run_context 中的 session_id")
+    step_id: int = Field(0, description="run_context 中的 step_id")
+    chosen_option: str = Field(..., description="用户选择的 option id")
+    extra_input: str | None = Field(None, description="用户自由输入的补充信息")
+    original_query: str = Field("", description="原始用户查询（用于恢复上下文）")
+
+

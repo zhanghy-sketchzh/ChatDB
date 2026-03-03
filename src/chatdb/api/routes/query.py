@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from chatdb.core import AgentOrchestrator
 from chatdb.api.dependencies import get_orchestrator
-from chatdb.api.schemas import QueryRequest, QueryResponse
+from chatdb.api.schemas import QueryRequest, QueryResponse, ClarificationResponse
 from chatdb.utils.exceptions import AgentError, ChatDBError
 from chatdb.utils.logger import logger
 
@@ -98,5 +98,46 @@ async def generate_sql_only(
 
     except Exception as e:
         logger.exception(f"SQL 生成错误: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/continue",
+    summary="继续被暂停的分析",
+    description="当查询返回 need_clarification 状态时，用户提交选择后调用此端点继续执行",
+)
+async def continue_query(
+    request: ClarificationResponse,
+    orchestrator: AgentOrchestrator = Depends(get_orchestrator),
+) -> dict:
+    """
+    继续被暂停的分析
+
+    - **session_id**: 上次查询返回的 run_context.session_id
+    - **chosen_option**: 用户选择的选项 ID
+    - **extra_input**: 用户自由输入（可选）
+    - **original_query**: 原始查询（用于恢复上下文）
+    """
+    try:
+        logger.info(f"继续分析: session={request.session_id}, option={request.chosen_option}")
+
+        # 将用户选择作为补充上下文，拼接到原始查询中重新执行
+        # 由 LLM 决定如何调整后续计划（不做硬编码映射）
+        clarification = f"（用户澄清：选择了「{request.chosen_option}」"
+        if request.extra_input:
+            clarification += f"，补充说明：{request.extra_input}"
+        clarification += "）"
+
+        resumed_query = f"{request.original_query} {clarification}" if request.original_query else clarification
+
+        result = await orchestrator.process_query(
+            query=resumed_query,
+            session_id=request.session_id,
+        )
+
+        return result
+
+    except Exception as e:
+        logger.exception(f"继续分析错误: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 

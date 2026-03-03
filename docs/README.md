@@ -6,10 +6,12 @@
 
 | 文档 | 说明 |
 |------|------|
-| [架构概述](./architecture.md) | 系统架构、目录结构、Agent/Tool 关系 |
+| [架构概述](./architecture.md) | 系统架构、目录结构、Agent/Tool 关系、Deep Research 模式 |
 | [YAML 配置](./yaml-config.md) | 业务口径配置规则 |
 | [Agent 与 Tool 详解](./agents.md) | 4 Agent + 3 Tool 的设计与实现 |
 | [数据预处理](./preprocessing.md) | 离线处理、Schema 生成、BM25 索引 |
+| [AG-UI 协议](./agui.md) | AG-UI SSE 事件流、端点、前端集成指南 |
+| [Deep Research 改造方案](./todo.md) | LLM-Native 深度分析 + 人类介入设计文档 |
 
 ## 快速开始
 
@@ -40,29 +42,44 @@ print(result["summary"])  # 自然语言总结
 用户查询
     │
     ▼
-┌─────────────────────────────────────────┐
-│           AgentOrchestrator             │
-│                                         │
-│  PLAN → PARSE → GENERATE → EVALUATE     │
-│                                         │
-│  ┌──────────┐ ┌────────────┐            │
-│  │ Planner  │→│ Semantic   │            │
-│  │          │ │ Parser     │            │
-│  └──────────┘ └────────────┘            │
-│       │              │                  │
-│       ▼              ▼                  │
-│  ┌────────────┐ ┌──────────────────┐   │
-│  │    SQL     │→│ Result Evaluator │   │
-│  │  Generator │ │                  │   │
-│  └────────────┘ │ Tools:           │   │
-│                 │ • execute_sql    │   │
-│                 │ • get_schema     │   │
-│                 │ • validate_sql   │   │
-│                 └──────────────────┘   │
-└─────────────────────────────────────────┘
+┌─ _quick_classify ──────────────────────────┐
+│  轻量 LLM 分类（~50 token）                 │
+│  → chat: 直接回复，跳过分析                  │
+│  → analysis / ambiguous: 进入分析流程        │
+└────────────────────────────────────────────┘
     │
     ▼
-SQL + 结果 + 总结
+┌─────────────────────────────────────────────┐
+│           AgentOrchestrator                  │
+│                                              │
+│  PARSE → PLAN → EXECUTE → SUMMARIZE          │
+│                    │                         │
+│   ┌────────────────┴─────────────────┐       │
+│   │  Planner decide 循环              │       │
+│   │  A 继续 / B 插入·重试             │       │
+│   │  C 跳过 / D 结束                  │       │
+│   │  E 人类介入（research_mode）       │       │
+│   └──────────────────────────────────┘       │
+│                                              │
+│  ┌──────────┐ ┌────────────┐                 │
+│  │ Planner  │→│ Semantic   │                 │
+│  │          │ │ Parser     │                 │
+│  └──────────┘ └────────────┘                 │
+│       │              │                       │
+│       ▼              ▼                       │
+│  ┌────────────┐ ┌──────────────────┐         │
+│  │    SQL     │→│ Result Evaluator │         │
+│  │  Generator │ │                  │         │
+│  └────────────┘ │ Tools:           │         │
+│                 │ • execute_sql    │         │
+│                 │ • get_schema     │         │
+│                 │ • validate_sql   │         │
+│                 └──────────────────┘         │
+└──────────────────────────┬──────────────────┘
+    │                      │
+    ▼                      ▼
+SQL + 结果 + 总结      AG-UI SSE 事件流
+                      （实时推送给前端）
 ```
 
 ## 架构概览

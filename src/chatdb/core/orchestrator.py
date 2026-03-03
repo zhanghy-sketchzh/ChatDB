@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 import asyncio
 import copy
+import json
 import time
 import uuid
 
@@ -227,6 +228,24 @@ class AgentOrchestrator:
         
         try:
             # ============================================================
+            # 0. [前置] 轻量分类：快速识别非数据分析问题
+            # 在所有重操作（虚拟字段检索、语义解析）之前，用极短的 LLM 调用判断问题类型
+            # ============================================================
+            query_type = await self._quick_classify(query, chat_history)
+            if query_type == "chat":
+                orch_log.info(f"前置分类: chat，走快速响应路径")
+                state = await self._handle_chat_query(state, context, orch_log)
+                result = self._build_result(state, query, start_time)
+                self._history.save_to_history(session_id, query, state.summary or "", state)
+                self._result_cache.put(session_id, query, result)
+                task_log.done(state.summary or "")
+                tracker.end_task(summary=state.summary or "")
+                if self._event_sink is not None:
+                    await self._event_sink.put(None)
+                    self._event_sink = None
+                return result
+            
+            # ============================================================
             # 0.5 [前置] 虚拟字段检索（在语义解析之前）
             # 将用户查询与 YML 虚拟字段做文本相似度匹配，召回结果注入后续各阶段 prompt
             # ============================================================
@@ -269,6 +288,11 @@ class AgentOrchestrator:
             
             sp_output: dict[str, Any] = {}
             if state.intent:
+                # ★ 读取 LLM 判断的 research_mode 写入 state
+                state.research_mode = getattr(state.intent, "research_mode", False)
+                if state.research_mode:
+                    orch_log.info("LLM 判断: research_mode=True（深度分析模式）")
+                
                 task_log.intent(
                     intent_type=state.intent.intent_type,
                     metrics=state.intent.metrics or [],
@@ -908,6 +932,17 @@ class AgentOrchestrator:
                 state.planner_conclusion = conclusion
             return True
         
+        if action == "intervention":
+            intervention = decision.get("intervention", {})
+            orch_log.info(f"Planner 请求人类介入: {intervention.get('question', '')[:80]}")
+            state.intervention = intervention
+            state.intervention_step_id = state.plan_step
+            await self._emit("custom", {
+                "name": "human_intervention",
+                "value": intervention,
+            })
+            return True  # 中断执行循环
+        
         if action == "adjust":
             if state.bump_adjust():
                 reason = decision.get("reason", "")
@@ -1372,6 +1407,78 @@ class AgentOrchestrator:
         """手动清除结果缓存"""
         return self._result_cache.invalidate(session_id)
     
+    async def _quick_classify(self, query: str, chat_history: list | None) -> str:
+        """
+        前置轻量分类：判断问题是否和数据分析有关。
+        
+        在所有重操作（虚拟字段检索、语义解析）之前执行，
+        用极短的 LLM 调用快速分流。
+        
+        Returns:
+            "analysis" | "chat" | "ambiguous"
+        """
+        history_hint = ""
+        if chat_history:
+            last = chat_history[-1] if chat_history else None
+            if last:
+                q = (last.get("query") or "")[:60]
+                a = (last.get("answer") or "")[:60]
+                history_hint = f"\n上一轮对话: Q: {q} A: {a}"
+        
+        prompt = f"""判断用户问题的类型，只输出一个单词：
+- analysis: 需要查询数据库、做数据分析（如流水、收入、趋势、排名、对比等）
+- chat: 闲聊、常识问答、与数据分析无关（如天气、地理、打招呼等）
+- ambiguous: 不确定，可能和数据有关也可能无关
+
+用户问题: {query}{history_hint}
+
+类型:"""
+
+        try:
+            response = await self.llm.chat(
+                prompt=prompt,
+                system_prompt="你是问题分类器。只输出 analysis/chat/ambiguous 其中一个单词，不要输出其他内容。",
+                caller_name="quick_classify",
+            )
+            result = response.strip().lower().split()[0] if response else "analysis"
+            return result if result in ("analysis", "chat", "ambiguous") else "analysis"
+        except Exception:
+            return "analysis"  # 分类失败时走正常分析流程
+    
+    async def _handle_chat_query(
+        self, state: ReActState, context: AgentContext, orch_log,
+    ) -> ReActState:
+        """
+        处理纯闲聊/常识问题，极简路径。
+        
+        跳过虚拟字段检索、语义解析、Planner 等全部重流程，
+        直接用 LLM 回复。
+        """
+        orch_log.info(f"闲聊快速响应: {state.user_query[:50]}...")
+        
+        history_context = HistoryHelper.format_history_for_prompt(context.chat_history)
+        prompt = f"""用户问题: {state.user_query}
+{history_context}
+请回答用户的问题。"""
+
+        try:
+            response = await self.llm.chat(
+                prompt=prompt,
+                system_prompt=(
+                    "你是 ChatDB 数据分析助手。友好地回答用户问题。"
+                    "如果问题和数据分析无关，正常回答即可，"
+                    "可以自然地提及你的数据分析能力，但不要强行引导。"
+                ),
+                caller_name="chat_response",
+            )
+            state.summary = response
+            state.phase = ReActPhase.DONE
+        except Exception as e:
+            orch_log.error(f"闲聊响应失败: {e}")
+            state.summary = f"抱歉，处理时出错了: {e}"
+        
+        return state
+
     async def _handle_other_query(self, state: ReActState, context: AgentContext, orch_log) -> ReActState:
         """
         处理非数据分析请求（mode=other）
@@ -1607,14 +1714,14 @@ class AgentOrchestrator:
         ) + "\n".join(unit_lines)
     
     def _build_result(self, state: ReActState, query: str, start_time: float) -> dict[str, Any]:
-        """构建返回结果"""
+        """构建返回结果（统一响应结构）"""
         duration_ms = (time.time() - start_time) * 1000
         success = state.phase == ReActPhase.DONE and (
             state.has_result or bool(state.analysis_slices) or bool(state.temp_results)
         )
         
         rewritten = getattr(state, "rewritten_query", None)
-        result = {
+        result: dict[str, Any] = {
             "success": success,
             "query": query,
             "rewritten_query": rewritten if rewritten and rewritten != query else None,
@@ -1626,6 +1733,33 @@ class AgentOrchestrator:
             "intent": state.intent.to_dict() if state.intent and hasattr(state.intent, 'to_dict') else None,
         }
         
+        # ★ 统一 status 字段：completed / need_clarification
+        if state.intervention:
+            intervention = state.intervention
+            result["status"] = "need_clarification"
+            result["clarification_request"] = {
+                "reason": intervention.get("reason", ""),
+                "question": intervention.get("question", ""),
+                "options": intervention.get("options", []),
+                "free_input_allowed": intervention.get("free_input_allowed", True),
+            }
+            result["success"] = False
+            result["run_context"] = {
+                "step_id": state.intervention_step_id,
+                "plan_state": "paused",
+            }
+        else:
+            result["status"] = "completed"
+        
+        # ★ research_mode 下解析结构化研究结论
+        if state.research_mode and state.summary:
+            parsed = self._try_parse_research_json(state.summary)
+            if parsed:
+                result["confidence"] = parsed.get("confidence")
+                result["key_findings"] = parsed.get("key_findings", [])
+                result["limitations"] = parsed.get("limitations", [])
+                result["suggested_follow_ups"] = parsed.get("suggested_follow_ups", [])
+        
         # 添加 temp_results（展开文件引用为完整数据）
         if state.temp_results:
             result["temp_results"] = self._scratch_pad.expand_results(state.temp_results)
@@ -1635,7 +1769,7 @@ class AgentOrchestrator:
             result["analysis_results"] = [s.to_dict() for s in state.analysis_slices]
             result["analysis_summary"] = state.get_analysis_summary()
         
-        if not success:
+        if not result["success"] and not state.intervention:
             result["error"] = state.error
         
         if self.debug:
@@ -1649,6 +1783,18 @@ class AgentOrchestrator:
             result["debug"] = debug_info
 
         return result
+    
+    @staticmethod
+    def _try_parse_research_json(summary: str) -> dict[str, Any] | None:
+        """尝试从 summary 末尾提取 research 结构化 JSON"""
+        import re as _re
+        match = _re.search(r'```json\s*(\{.*?\})\s*```', summary, _re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return None
 
 
 # 便捷函数

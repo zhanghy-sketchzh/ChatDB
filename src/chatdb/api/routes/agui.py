@@ -5,6 +5,7 @@ AG-UI 协议端点
 实时推送给前端。支持两种输入模式：
   1. 标准 AG-UI RunAgentInput（兼容 CopilotKit 等客户端）
   2. 简化版 ChatDB 请求（仅需 query + db_path）
+  3. 人类介入恢复（/continue 端点，同样以 SSE 流返回）
 """
 
 from pathlib import Path
@@ -92,6 +93,59 @@ async def agui_standard_endpoint(input_data: RunAgentInput, request: Request):
             thread_id=input_data.thread_id,
             run_id=input_data.run_id,
             session_id=input_data.thread_id,
+        ),
+        media_type=encoder.get_content_type(),
+    )
+
+
+class AGUIContinueRequest(BaseModel):
+    """人类介入恢复请求（AG-UI SSE 流式版本）"""
+    db_path: str = Field(..., description="DuckDB 或 CSV 文件路径")
+    session_id: str = Field(..., description="原始查询的 session_id")
+    chosen_option: str = Field(..., description="用户选择的 option id")
+    extra_input: str | None = Field(default=None, description="用户自由输入补充")
+    original_query: str = Field("", description="原始用户查询")
+    thread_id: str | None = Field(default=None, description="AG-UI 线程 ID")
+    run_id: str | None = Field(default=None, description="AG-UI 运行 ID")
+
+
+@router.post("/continue", summary="AG-UI 人类介入恢复端点（SSE 流式）")
+async def agui_continue_endpoint(request_body: AGUIContinueRequest, request: Request):
+    """
+    当查询返回 need_clarification 状态后，用户提交选择，
+    此端点以 AG-UI SSE 事件流返回恢复执行的全过程。
+
+    与 /query/continue（返回 JSON）不同，此端点提供实时进度事件。
+    """
+    import uuid
+
+    thread_id = request_body.thread_id or uuid.uuid4().hex
+    run_id = request_body.run_id or uuid.uuid4().hex
+
+    # 拼接用户澄清到原始查询中，让 LLM 自主决定如何调整
+    clarification = f"（用户澄清：选择了「{request_body.chosen_option}」"
+    if request_body.extra_input:
+        clarification += f"，补充说明：{request_body.extra_input}"
+    clarification += "）"
+    resumed_query = (
+        f"{request_body.original_query} {clarification}"
+        if request_body.original_query
+        else clarification
+    )
+
+    orchestrator = await _create_orchestrator(request_body.db_path)
+
+    accept = request.headers.get("accept")
+    encoder = EventEncoder(accept=accept)
+    adapter = AGUIAdapter(encoder=encoder)
+
+    return StreamingResponse(
+        adapter.stream(
+            orchestrator=orchestrator,
+            query=resumed_query,
+            thread_id=thread_id,
+            run_id=run_id,
+            session_id=request_body.session_id,
         ),
         media_type=encoder.get_content_type(),
     )

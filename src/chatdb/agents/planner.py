@@ -1204,14 +1204,22 @@ class PlannerAgent(BaseAgent):
         if vf_retrieval_section:
             virtual_fields_section = f"{virtual_fields_section}\n\n{vf_retrieval_section}"
 
-        system_prompt = """你是数据分析决策专家。根据执行结果决定下一步。
+        # ★ 根据 research_mode 切换 system_prompt 档位
+        research_mode = getattr(state, "research_mode", False)
+        
+        system_prompt = f"""你是数据分析决策专家。{'你不仅要判断任务是否成功，更要像分析师一样思考数据背后的故事。' if research_mode else '根据执行结果决定下一步。'}
 关键原则：
 1. 空结果 ≠ 失败，先诊断是 SQL 问题还是数据真的为空
 2. SQL 报错时分析错误信息，用 B（重试）给出修复建议
 3. 数据摘要中已包含查询结果（完整数据或前30行），直接基于这些数据做决策
-4. decision 字段只能是单个字母：A、B、C、D
-5. 选 A 时必须输出 transition_context + selected_tables
-6. 输出 JSON"""
+4. 看到数据后先判断：结果是否回答了用户问题？是否有异常模式？
+5. 如果发现值得深挖的模式（某产品突然下滑、某区域异常增长），用 B 追加验证任务
+6. 如果多个任务结果之间存在矛盾（如总量增长但所有分项在下降），必须用 B 追加验证
+7. 人类介入判断：如果用户问题语义不清存在多种合理解释，或数据质量严重影响结论可靠性，或当前数据根本无法支撑分析粒度，选 E 请求用户澄清
+8. E 选项应谨慎使用——只在确实无法自主判断时才选，不要频繁打断用户
+9. decision 字段只能是单个字母：A、B、C、D、E
+10. 选 A 时必须输出 transition_context + selected_tables
+11. 输出 JSON"""
 
         # ★ 构建可选表的详细信息（含 schema + 列统计），替代原来的简略列表
         available_tables_section = await self._build_available_tables_section(
@@ -1255,8 +1263,15 @@ class PlannerAgent(BaseAgent):
     - ★ **重要**：如果 selected_tables 中**只有临时表（temp_ 开头）**，则 virtual_fields 应为**空列表 []**
     - ★ 如果 selected_tables 中**包含源表**，则正常列出需要的虚拟字段
 **B. 插入/重试任务**：遇到问题（SQL 错误、数据异常），需要插入 validation 任务或重试失败的任务
+  - ★ 发现值得深挖的模式 → 插入新的分析任务
+    例：source 结果显示某大类下滑最多 → 插入 drilldown 任务细查子品类
+    例：两个任务的合计不一致 → 插入 validation 任务交叉验证
 **C. 跳过任务**：前提不成立，跳过部分后续任务
 **D. 结束**：所有任务已完成，可以给出结论。**仅在没有待执行任务（→○）或剩余任务已无意义时才选此项**
+**E. 请求人类协助**（谨慎使用）：确实无法自主判断时，请求用户澄清或确认
+  - 语义不清：用户问题存在多种合理解释，需要用户选择
+  - 数据质量：关键列大面积缺失或结果明显不合理，影响结论可靠性
+  - 能力边界：当前数据/表结构根本无法支撑用户要求的分析粒度
 
 ## 输出格式（decision 字段必须是单个大写字母）
 
@@ -1264,7 +1279,8 @@ class PlannerAgent(BaseAgent):
 选 B（插入）: {{"decision": "B", "reason": "...", "adjustment": {{"insert_task": {{"type": "validation", "description": "..."}}}}}}
 选 B（重试）: {{"decision": "B", "reason": "...", "adjustment": {{"retry_task": {{"task_id": "...", "fix_hint": "..."}}}}}}
 选 C: {{"decision": "C", "reason": "...", "adjustment": {{"skip_tasks": ["task_id"]}}}}
-选 D: {{"decision": "D", "reason": "...", "conclusion": "..."}}"""
+选 D: {{"decision": "D", "reason": "...", "conclusion": "..."}}
+选 E: {{"decision": "E", "reason": "...", "intervention": {{"question": "...", "options": [{{"id": "A", "label": "..."}}, {{"id": "B", "label": "..."}}], "free_input_allowed": true}}}}"""
 
         try:
             response = await self.llm.chat(
@@ -1296,10 +1312,8 @@ class PlannerAgent(BaseAgent):
                 data["decision"] = decision
                 
                 self._log.info(f"决策: {decision} - {data.get('reason', '')}")
-                # 如果 LLM 仍然返回 E（不应该），降级为 A
                 if decision == "E":
-                    self._log.warn("LLM 返回了已移除的 E 决策，降级为 A")
-                    return {"decision": "A", "reason": "E 决策已移除，继续执行下一任务"}
+                    self._log.info("Planner 请求人类介入")
                 return data
         except Exception as e:
             self._log.warn(f"决策解析失败: {e}")
@@ -1511,7 +1525,16 @@ class PlannerAgent(BaseAgent):
                 "conclusion": data.get("conclusion", reason),
             }
 
-        else:  # E 或其他未知决策，降级为 continue
+        elif decision == "E":
+            # 人类介入请求：将 intervention 信息传递给 Orchestrator
+            intervention = data.get("intervention", {})
+            return {
+                "action": "intervention",
+                "reason": reason,
+                "intervention": intervention,
+            }
+
+        else:  # 未知决策，降级为 continue
             self._log.warn(f"未预期的决策类型 '{decision}'，降级为继续")
             next_task = self._get_next_task(results)
             if next_task:

@@ -256,6 +256,11 @@ class ReActState:
     
     # ===== 口径设计（已合并到 SQLTool generate_sql prompt）=====
     sql_hint: str = ""                       # LLM 给 SQL 生成的额外建议
+    
+    # ===== Deep Research =====
+    research_mode: bool = False              # 是否深度分析模式（由 LLM 自动判断）
+    intervention: dict[str, Any] | None = None  # 人类介入信息（Planner E 决策产生）
+    intervention_step_id: int = 0            # 介入时的计划步骤号
 
     # ===== 思考/反思日志 =====
     thoughts: list[str] = field(default_factory=list)        # 思考日志（THINK）

@@ -32,7 +32,9 @@ ChatDB/
 │   │   └── validate_sql.py     # SQL 语法验证
 │   ├── core/                   # 核心模块
 │   │   ├── orchestrator.py     # ReAct 协调器
+│   │   ├── agui_adapter.py     # AG-UI 协议适配器
 │   │   ├── react_state.py      # 状态管理
+│   │   ├── summarize.py        # 总结生成（含 research_mode 证据链）
 │   │   └── tracer.py           # 任务追踪
 │   ├── config/                 # 配置加载
 │   │   ├── table_config.py     # YAML 配置加载器
@@ -101,15 +103,48 @@ ChatDB/
 ## 核心流程
 
 ```
-PLAN → PARSE → GENERATE → EVALUATE → DONE
+用户查询
+    │
+    ├── _quick_classify → "chat"
+    │   └── _handle_chat_query（极简 LLM 回复，跳过全部分析流程）
+    │
+    ├── _quick_classify → "analysis" / "ambiguous"
+    │   └── PARSE → PLAN → EXECUTE → SUMMARIZE → DONE
+    │                  │
+    │                  └── Planner decide 循环:
+    │                       A(继续) / B(插入·重试) / C(跳过) / D(结束)
+    │                       E(人类介入, 仅 research_mode)
+    │
+    └── SemanticParseTool → mode=other（兜底非数据问题）
 ```
 
 | 阶段 | 说明 |
 |------|------|
-| PLAN | Planner 分类查询（basic/trend/complex），选择表 |
-| PARSE | SemanticParserAgent 解析意图 → `StructuredIntent` |
-| GENERATE | SQLGeneratorAgent 生成 SQL（多候选） |
-| EVALUATE | ResultEvaluatorAgent 执行 + 验证 + 修正 + 总结 |
+| CLASSIFY | 前置轻量分类（~50 token），分流 chat/analysis/ambiguous |
+| PARSE | SemanticParserAgent 解析意图 → `StructuredIntent`（含 `research_mode` 自动判断） |
+| PLAN | Planner 生成多步分析计划 |
+| EXECUTE | SQLAgent 按计划执行，Planner 每批任务后决策（含深度分析引导 + 人类介入判断） |
+| SUMMARIZE | 生成自然语言总结（research_mode 下包含证据链 + 结构化结论） |
+
+### Deep Research 模式
+
+LLM 在语义解析阶段自动判断是否开启 `research_mode`（归因分析、异常诊断等复杂问题）。开启后：
+
+- **Planner E 选项**：LLM 可请求人类介入（语义不清、数据质量问题、能力边界）
+- **SummarizeAnswer** 输出证据链报告（置信度、来源标注、局限性、建议后续）
+
+### 人类介入（Human-in-the-Loop）
+
+当 Planner 选择 E 时，查询暂停并返回 `status: need_clarification`，前端展示交互 UI。用户提交选择后通过 `/query/continue` 或 `/agui/continue` 恢复执行，用户选择作为自然语言上下文注入，由 LLM 自主调整分析策略。
+
+### 统一响应结构
+
+所有查询返回统一 status 字段：
+
+| status | 含义 |
+|--------|------|
+| `completed` | 分析正常完成 |
+| `need_clarification` | Planner 请求用户澄清 |
 
 ## ReActState 数据结构
 
@@ -127,6 +162,11 @@ class ReActState:
     summary: str = ""
     thoughts: list[str] = field(default_factory=list)
     tool_log: list[dict] = field(default_factory=list)
+
+    # Deep Research 相关
+    research_mode: bool = False              # 由 LLM 自动判断
+    intervention: dict | None = None         # 人类介入信息（Planner E 决策）
+    intervention_step_id: int = 0            # 介入时的计划步骤号
 ```
 
 ## 查询分类（intent_type）

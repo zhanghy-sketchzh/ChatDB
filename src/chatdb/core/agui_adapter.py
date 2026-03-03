@@ -324,8 +324,9 @@ def _build_state_snapshot(result: dict[str, Any]) -> dict[str, Any] | None:
     """从查询结果构建前端可消费的状态快照。"""
     if not result:
         return None
-    return {
+    snapshot: dict[str, Any] = {
         "success": result.get("success", False),
+        "status": result.get("status", "completed"),
         "query": result.get("query", ""),
         "rewritten_query": result.get("rewritten_query"),
         "sql": result.get("sql", ""),
@@ -334,3 +335,16 @@ def _build_state_snapshot(result: dict[str, Any]) -> dict[str, Any] | None:
         "result": result.get("result", [])[:50],
         "intent": result.get("intent"),
     }
+
+    # human intervention 相关字段透传
+    if result.get("clarification_request"):
+        snapshot["clarification_request"] = result["clarification_request"]
+    if result.get("run_context"):
+        snapshot["run_context"] = result["run_context"]
+
+    # research_mode 结构化结论透传
+    for key in ("confidence", "key_findings", "limitations", "suggested_follow_ups"):
+        if result.get(key) is not None:
+            snapshot[key] = result[key]
+
+    return snapshot

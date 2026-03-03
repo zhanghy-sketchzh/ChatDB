@@ -82,6 +82,7 @@ class SummarizeAnswerTool(BaseTool):
         self,
         user_query: str,
         summary_context: str,
+        research_mode: bool = False,
     ) -> ToolResult:
         """生成多阶段分析结果汇总
         
@@ -89,8 +90,11 @@ class SummarizeAnswerTool(BaseTool):
         让 LLM 综合所有分支的数据生成最终回答。
         
         单任务场景也走此路径（一个阶段 = 一个任务的结果）。
+        
+        Args:
+            research_mode: 深度分析模式下追加证据链要求
         """
-        self._log.info("生成分析结果汇总...")
+        self._log.info(f"生成分析结果汇总...{' (research_mode)' if research_mode else ''}")
         
         try:
             prompt = f"""{summary_context}
@@ -120,6 +124,34 @@ class SummarizeAnswerTool(BaseTool):
 - display_divisor 的含义：将查询结果的原始数值**除以** display_divisor 后，以 unit 为单位展示
   - 例：display_divisor=100000000, unit=亿元 → 原始值 52613134466 应展示为 526.13 亿元
 - 严禁对已经换算过的数值重复换算，也严禁遗漏换算。同一指标在不同阶段中的数值量级应一致"""
+
+            if research_mode:
+                prompt += """
+
+## 深度分析报告要求（research_mode）
+
+### 结论层
+- 给出明确的核心结论（一句话回答用户问题）
+- 标注置信度：高（多个数据源交叉验证）/ 中（数据支撑但未验证）/ 低（样本不足或有矛盾）
+
+### 证据层
+- 每个关键陈述后标注 [来源: task_id]，说明数据来自哪个分析步骤
+- 如果存在数据矛盾，明确说明矛盾点和可能原因
+
+### 不确定性
+- 列出分析过程中的限制（数据时间范围、缺失维度等）
+- 如果某些结论需要更多数据验证，指出具体需要什么
+
+### 额外输出
+在自然语言回答末尾追加一个 JSON 块（用 ```json 包裹）：
+```json
+{
+  "confidence": "high/medium/low",
+  "key_findings": [{"finding": "...", "evidence_task": "task_id", "data_point": "..."}],
+  "limitations": ["..."],
+  "suggested_follow_ups": ["..."]
+}
+```"""
 
             response = await self.llm.chat(
                 prompt=prompt,
@@ -157,6 +189,7 @@ class SummarizeAnswerTool(BaseTool):
         result = await self.summarize(
             user_query=state.user_query,
             summary_context=summary_context,
+            research_mode=getattr(state, "research_mode", False),
         )
         if result.success:
             state.summary = result.data.get("summary", "")

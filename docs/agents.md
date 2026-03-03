@@ -133,6 +133,45 @@ if planner._should_change_strategy(state):
 | 同一 Agent 连续失败 | 换个 Agent 试试 |
 | 多次回退仍失败 | give_up 放弃任务 |
 
+### 决策选项
+
+| 选项 | 含义 | 说明 |
+|------|------|------|
+| A | 继续 | 继续执行下一批任务 |
+| B | 插入/重试 | SQL 错误重试、数据异常追加验证、发现模式时追加 drilldown |
+| C | 跳过 | 跳过当前任务 |
+| D | 结束 | 分析完成，进入总结 |
+| E | 人类介入 | 请求用户澄清（语义不清、数据质量、能力边界） |
+
+### B 选项增强
+
+LLM 看到数据后可主动深挖：
+- 发现值得深挖的模式 → 插入 drilldown 任务（如"手游大类下滑最多 → 细查子品类"）
+- 多个任务结果矛盾 → 插入 validation 任务交叉验证
+
+### E 选项（人类介入）
+
+LLM 自主判断何时需要人类帮助（谨慎使用，不频繁打断用户）：
+- 语义不清：存在多种合理解释 → 输出 question + options 供用户选择
+- 数据质量：关键列大面积缺失或结果明显不合理 → 输出 question + options
+- 能力边界：数据/表结构无法支撑分析粒度 → 输出 question + suggestions
+
+E 选项输出示例：
+```json
+{
+  "decision": "E",
+  "reason": "用户问题存在多种可能解释",
+  "intervention": {
+    "question": "请确认您更想要哪种分析？",
+    "options": [
+      {"id": "A", "label": "2024国内流水同比变化原因"},
+      {"id": "B", "label": "2024国内各产品流水分布"}
+    ],
+    "free_input_allowed": true
+  }
+}
+```
+
 ### LLM Prompt 示例
 
 ```
@@ -183,6 +222,7 @@ if planner._should_change_strategy(state):
 ```json
 {
   "intent_type": "basic|trend|dimension|complex",
+  "research_mode": false,
   "metrics": ["metric_id_from_yaml"],
   "dimensions": ["dimension_id_from_yaml"],
   "time": {
@@ -199,6 +239,20 @@ if planner._should_change_strategy(state):
   "limit": 10
 }
 ```
+
+### research_mode 自动判断
+
+`research_mode` 由 LLM 在语义解析阶段自动判断，用户无需手动指定。判断原则：
+
+| 设为 true | 设为 false |
+|-----------|-----------|
+| 归因分析（"为什么流水下降"） | 简单查询（"上月总流水多少"） |
+| 异常诊断（"数据异常波动"） | 排名/TopN |
+| 多维交叉验证 | 占比计算 |
+| 趋势归因（"增长放缓的驱动因素"） | 趋势展示（仅展示不分析原因） |
+| 假设检验类问题 | 简单对比查询 |
+
+**核心原则**：用户只是"看数据" → false；用户要"理解数据背后的原因" → true。
 
 ### intent_type 分类
 

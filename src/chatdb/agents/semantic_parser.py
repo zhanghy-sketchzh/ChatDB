@@ -69,6 +69,7 @@ class StructuredIntent:
     
     # === 其他字段 ===
     other_request: str | None = None
+    research_mode: bool = False  # 是否需要深度研究模式（由 LLM 自动判断）
     
     def __post_init__(self):
         self._migrate_legacy_fields()
@@ -163,6 +164,7 @@ class StructuredIntent:
             "time": self.time,
             "filters": self.filters,
             "other_request": self.other_request,
+            "research_mode": self.research_mode,
             "intent_type": self.intent_type,
             "qa_type": self.qa_type,
         }
@@ -193,6 +195,7 @@ class StructuredIntent:
             time=data.get("time", {}),
             _filters=data.get("filters", []),
             other_request=data.get("other_request"),
+            research_mode=bool(data.get("research_mode", False)),
         )
         # 兼容旧字段
         if data.get("qa_type") or data.get("intent_type"):
@@ -542,9 +545,29 @@ class SemanticParser:
   "mode": "analysis|other",
   "task_type": "单类型字符串或数组",
   "virtual_fields": ["field_id_1", "field_id_2", "..."],
-  "examples": [0]
+  "examples": [0],
+  "research_mode": false
 }}
 ```
+
+### research_mode 判断指南
+research_mode 是深度复杂推理开关。开启后系统会进行多轮假设-验证循环、交叉比对、矛盾检测，**成本约为普通查询的 3-5 倍**，因此需要准确判断。
+
+**设为 true 的场景**（问题本质需要多步推理、无法一次查询得出结论）：
+- 归因分析："为什么流水下降了"、"下滑的原因是什么" → 需要拆解多个维度逐一排查
+- 异常诊断："上个月数据异常波动" → 需要对比历史基线、检测离群值
+- 多维度交叉验证："各渠道的用户留存和付费转化关系" → 需要多次查询并交叉比对结论
+- 趋势归因："收入增长趋势放缓的驱动因素" → 需要分解为多个子问题逐步验证
+- 假设检验类："是不是因为新用户减少导致总流水下降" → 需要正反两面数据验证
+
+**设为 false 的场景**（一次或少量查询即可得出答案）：
+- 简单查询："上个月总流水多少"、"DAU 是多少"
+- 排名/TopN："流水最高的前5个产品"
+- 占比计算："各渠道收入占比"
+- 趋势展示："近12个月流水趋势"（仅展示，不分析原因）
+- 对比查询："A产品和B产品的流水对比"（仅对比，不追问为什么）
+
+**判断核心原则**：如果用户只是"看数据"→ false；如果用户要"理解数据背后的原因"→ true。
 
 只输出 JSON，不要其他文字。"""
 
@@ -657,9 +680,29 @@ class SemanticParser:
   "dimensions": ["分组列名"],
   "conditions": [
     {{"type": "ref", "id": "筛选器ID"}}
-  ]
+  ],
+  "research_mode": false
 }}
 ```
+
+### research_mode 判断指南
+research_mode 是深度复杂推理开关。开启后系统会进行多轮假设-验证循环、交叉比对、矛盾检测，**成本约为普通查询的 3-5 倍**，因此需要准确判断。
+
+**设为 true 的场景**（问题本质需要多步推理、无法一次查询得出结论）：
+- 归因分析："为什么流水下降了"、"下滑的原因是什么" → 需要拆解多个维度逐一排查
+- 异常诊断："上个月数据异常波动" → 需要对比历史基线、检测离群值
+- 多维度交叉验证："各渠道的用户留存和付费转化关系" → 需要多次查询并交叉比对结论
+- 趋势归因："收入增长趋势放缓的驱动因素" → 需要分解为多个子问题逐步验证
+- 假设检验类："是不是因为新用户减少导致总流水下降" → 需要正反两面数据验证
+
+**设为 false 的场景**（一次或少量查询即可得出答案）：
+- 简单查询："上个月总流水多少"、"DAU 是多少"
+- 排名/TopN："流水最高的前5个产品"
+- 占比计算："各渠道收入占比"
+- 趋势展示："近12个月流水趋势"（仅展示，不分析原因）
+- 对比查询："A产品和B产品的流水对比"（仅对比，不追问为什么）
+
+**判断核心原则**：如果用户只是"看数据"→ false；如果用户要"理解数据背后的原因"→ true。
 
 ## task_type 识别规则
 
