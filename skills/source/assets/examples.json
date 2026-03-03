@@ -1,0 +1,9 @@
+[
+  {
+    "id": "source_example",
+    "type": "source",
+    "description": "按维度拆解单期构成，展示各部分贡献",
+    "notes": ["分组维度: 根据需求", "排序: 通常按指标降序"],
+    "sql_template": "SELECT {{dimension}}, {{aggregation}}({{metric}}) AS {{alias}} FROM {{table}} WHERE {{conditions}} GROUP BY {{dimension}} ORDER BY {{alias}} DESC"
+  }
+]

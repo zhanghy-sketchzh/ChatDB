@@ -1,0 +1,9 @@
+[
+  {
+    "id": "basic_example",
+    "type": "basic",
+    "description": "简单聚合查询，获取单一数值",
+    "notes": ["无分组", "常用聚合函数: SUM/COUNT/AVG/MAX/MIN"],
+    "sql_template": "SELECT {{aggregation}}({{metric}}) AS {{alias}} FROM {{table}} WHERE {{conditions}}"
+  }
+]

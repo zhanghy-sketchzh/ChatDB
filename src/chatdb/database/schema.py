@@ -49,11 +49,20 @@ class SchemaInfo:
     database_name: str
     tables: list[TableInfo]
 
-    def to_prompt_text(self) -> str:
-        """转换为 LLM Prompt 友好的文本格式"""
+    def to_prompt_text(self, exclude_temp_tables: bool = True) -> str:
+        """
+        转换为 LLM Prompt 友好的文本格式
+        
+        Args:
+            exclude_temp_tables: 是否排除临时表（temp_ 开头的表）
+        """
         lines = [f"数据库: {self.database_name}", "=" * 50, ""]
 
         for table in self.tables:
+            # 过滤临时表
+            if exclude_temp_tables and table.name.startswith("temp_"):
+                continue
+                
             lines.append(f"表名: {table.name}")
             if table.comment:
                 lines.append(f"描述: {table.comment}")

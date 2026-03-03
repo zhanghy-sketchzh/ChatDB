@@ -100,10 +100,6 @@ class HistoryConfig:
     num_history_sessions: int = 2
 
 
-# 向后兼容：ChatHistoryDB 现在就是 TaskHistoryDB
-ChatHistoryDB = TaskHistoryDB
-
-
 class ChatHistoryManager:
     """
     聊天历史管理器

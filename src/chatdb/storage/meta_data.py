@@ -74,6 +74,7 @@ class MetaDataStore:
                     column_profiles TEXT,
                     ddl_schema TEXT,
                     light_schema TEXT,
+                    table_understanding TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     access_count INTEGER DEFAULT 0,
@@ -86,7 +87,7 @@ class MetaDataStore:
             # 检查并添加新列（兼容已存在的表）
             cursor = conn.execute("PRAGMA table_info(table_meta)")
             existing_cols = {row[1] for row in cursor.fetchall()}
-            for col, col_type in [("column_profiles", "TEXT"), ("ddl_schema", "TEXT"), ("light_schema", "TEXT")]:
+            for col, col_type in [("column_profiles", "TEXT"), ("ddl_schema", "TEXT"), ("light_schema", "TEXT"), ("table_understanding", "TEXT")]:
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE table_meta ADD COLUMN {col} {col_type}")
 
@@ -205,6 +206,7 @@ class MetaDataStore:
         column_profiles: list[dict] | None = None,
         ddl_schema: str | None = None,
         light_schema: str | None = None,
+        table_understanding: str | None = None,
     ) -> None:
         """保存表元数据"""
         with self._conn() as conn:
@@ -225,13 +227,14 @@ class MetaDataStore:
                         columns_info = ?, schema_info = ?, table_description = ?,
                         summary_prompt = ?, id_columns = ?, create_table_sql = ?,
                         column_profiles = ?, ddl_schema = ?, light_schema = ?,
+                        table_understanding = ?,
                         last_accessed = CURRENT_TIMESTAMP, access_count = access_count + 1
                     WHERE id = ?
                 """, (
                     table_hash, source_type, table_name, file_name, db_name, db_path,
                     row_count, column_count, columns_json, schema_info, table_description,
                     summary_prompt, id_columns_json, create_table_sql, profiles_json,
-                    ddl_schema, light_schema, existing["id"]
+                    ddl_schema, light_schema, table_understanding, existing["id"]
                 ))
             else:
                 conn.execute("""
@@ -239,13 +242,13 @@ class MetaDataStore:
                         file_hash, table_hash, source_type, table_name, sheet_name, file_name,
                         db_name, db_path, row_count, column_count, columns_info, schema_info,
                         table_description, summary_prompt, id_columns, create_table_sql,
-                        column_profiles, ddl_schema, light_schema
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        column_profiles, ddl_schema, light_schema, table_understanding
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     file_hash, table_hash, source_type, table_name, sheet_name, file_name,
                     db_name, db_path, row_count, column_count, columns_json, schema_info,
                     table_description, summary_prompt, id_columns_json, create_table_sql,
-                    profiles_json, ddl_schema, light_schema
+                    profiles_json, ddl_schema, light_schema, table_understanding
                 ))
 
     def save_from_df(
@@ -284,6 +287,14 @@ class MetaDataStore:
             conn.execute(
                 "UPDATE table_meta SET summary_prompt = ?, last_accessed = CURRENT_TIMESTAMP WHERE (table_hash = ? OR file_hash = ?) AND source_type = ?",
                 (summary_prompt, content_hash, content_hash, source_type)
+            )
+
+    def update_table_understanding(self, content_hash: str, table_understanding: str, source_type: str = "excel") -> None:
+        """更新表理解文本"""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE table_meta SET table_understanding = ?, last_accessed = CURRENT_TIMESTAMP WHERE (table_hash = ? OR file_hash = ?) AND source_type = ?",
+                (table_understanding, content_hash, content_hash, source_type)
             )
 
     def delete_by_hash(self, content_hash: str, source_type: str = "excel") -> bool:
@@ -338,11 +349,8 @@ class MetaDataStore:
             "column_profiles": json.loads(row["column_profiles"]) if row["column_profiles"] else [],
             "ddl_schema": row["ddl_schema"],
             "light_schema": row["light_schema"],
+            "table_understanding": row["table_understanding"],
             "created_at": row["created_at"],
             "last_accessed": row["last_accessed"],
             "access_count": row["access_count"],
         }
-
-
-# 向后兼容别名
-DataCacheManager = MetaDataStore

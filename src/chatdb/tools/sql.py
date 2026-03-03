@@ -21,10 +21,42 @@ from chatdb.utils.logger import get_component_logger
 from chatdb.utils.common import parse_json, clean_sql as _clean_sql_util, format_rows
 
 from chatdb.core.react_state import ReActState, ReActPhase, ErrorType, AnalysisPhase
+from chatdb.tools.virtual_field_converter import (
+    build_mappings_from_tables_info,
+    expand_virtual_fields,
+)
 
 if TYPE_CHECKING:
     from chatdb.agents.base import AgentContext
     from chatdb.agents.semantic_parser import StructuredIntent
+
+
+# ---------- dict → ColumnStats 转换 ----------
+
+def _dicts_to_column_stats(
+    stats_dicts: list[dict[str, Any]],
+) -> list:
+    """将旧格式 dict 列表转换为 ColumnStats 对象列表。"""
+    from chatdb.database.column_stats_provider import ColumnStats
+
+    result = []
+    for d in stats_dicts:
+        cs = ColumnStats(
+            name=d.get("name", ""),
+            dtype=d.get("type", ""),
+            null_pct=d.get("null_pct", 0.0),
+            unique_count=d.get("unique_count", 0),
+        )
+        stats = d.get("stats")
+        if stats:
+            cs.min_val = stats.get("min")
+            cs.max_val = stats.get("max")
+            cs.mean_val = stats.get("mean")
+            cs.median_val = stats.get("median")
+        if d.get("top_values"):
+            cs.top_values = d["top_values"]
+        result.append(cs)
+    return result
 
 
 # ---------- 公共逻辑 ----------
@@ -34,39 +66,63 @@ DANGEROUS_KEYWORDS = [
 ]
 
 
-def check_sql_readonly(sql: str) -> list[str]:
-    """只读安全检查：必须 SELECT，禁止写操作关键词。返回错误列表，空表示通过。"""
+def check_sql_validity(sql: str, checks: str = "all") -> list[str]:
+    """统一的 SQL 检查函数。
+    
+    Args:
+        sql: 待检查的 SQL 语句
+        checks: 检查级别
+            - "readonly": 只读检查（SELECT + 禁止写操作）
+            - "syntax": 语法检查（SELECT + FROM + 括号匹配）
+            - "safety": 安全检查（危险关键词）
+            - "all": 全部检查（默认）
+    
+    Returns:
+        错误列表，空列表表示通过
+    """
     errors: list[str] = []
     sql_upper = sql.upper().strip()
-    if not sql_upper.startswith("SELECT"):
-        errors.append("只支持 SELECT 查询")
-    for kw in DANGEROUS_KEYWORDS:
-        if kw in sql_upper:
-            errors.append(f"禁止使用 {kw} 语句")
+    
+    # 只读检查
+    if checks in ("readonly", "all"):
+        if not sql_upper.startswith("SELECT"):
+            errors.append("只支持 SELECT 查询")
+        for kw in DANGEROUS_KEYWORDS:
+            if kw in sql_upper:
+                errors.append(f"禁止使用 {kw} 语句")
+    
+    # 语法检查
+    if checks in ("syntax", "all"):
+        if not sql_upper.startswith("SELECT"):
+            errors.append("SQL 必须以 SELECT 开头")
+        if "FROM" not in sql_upper:
+            errors.append("SQL 必须包含 FROM 子句")
+        if sql.count("(") != sql.count(")"):
+            errors.append("括号不匹配")
+    
+    # 安全检查
+    if checks == "safety":
+        for kw in DANGEROUS_KEYWORDS:
+            if kw in sql_upper:
+                errors.append(f"禁止使用 {kw} 语句")
+    
     return errors
+
+
+# 向后兼容的包装函数
+def check_sql_readonly(sql: str) -> list[str]:
+    """只读安全检查（向后兼容）"""
+    return check_sql_validity(sql, checks="readonly")
 
 
 def check_sql_syntax(sql: str) -> list[str]:
-    """基础语法检查：SELECT、FROM、括号匹配。返回错误列表，空表示通过。"""
-    errors: list[str] = []
-    sql_upper = sql.upper().strip()
-    if not sql_upper.startswith("SELECT"):
-        errors.append("SQL 必须以 SELECT 开头")
-    if "FROM" not in sql_upper:
-        errors.append("SQL 必须包含 FROM 子句")
-    if sql.count("(") != sql.count(")"):
-        errors.append("括号不匹配")
-    return errors
+    """基础语法检查（向后兼容）"""
+    return check_sql_validity(sql, checks="syntax")
 
 
 def check_sql_safety(sql: str) -> list[str]:
-    """安全检查（危险关键词）。返回错误列表。"""
-    errors: list[str] = []
-    sql_upper = sql.upper()
-    for kw in DANGEROUS_KEYWORDS:
-        if kw in sql_upper:
-            errors.append(f"禁止使用 {kw} 语句")
-    return errors
+    """安全检查（向后兼容）"""
+    return check_sql_validity(sql, checks="safety")
 
 
 def error_type_from_str(s: str) -> ErrorType:
@@ -174,10 +230,12 @@ class SQLTool:
         self,
         llm: BaseLLM | None = None,
         db_connector: BaseDatabaseConnector | None = None,
+        skill_registry: Any = None,
     ):
         self.llm = llm
         self.db_connector = db_connector
         self._log = get_component_logger("SQLTool")
+        self._skill_registry = skill_registry  # SkillRegistry 实例（可选）
 
     def validate_sql(
         self,
@@ -261,61 +319,15 @@ class SQLTool:
     def _format_columns_for_prompt(
         self, 
         columns: list[dict[str, Any]],
-        column_profiles: list[dict[str, Any]] | None = None,
+        column_stats: list[dict[str, Any]] | None = None,
     ) -> str:
-        """格式化列信息供 LLM 理解
-        
-        Args:
-            columns: 基础列信息 [{"name": "月份", "type": "BIGINT"}, ...]
-            column_profiles: 丰富的列元信息（来自 meta_data.db），包含：
-                - unique_count: 唯一值数量
-                - summary: 统计摘要（范围/高频值）
-                - top_values: 高频值列表
-                - stats: 数值统计（min/max/mean）
-        
-        这些信息让 LLM 能够推理出如何分组、筛选，而不需要硬编码规则。
-        例如：LLM 看到 "月份: 整数, 12个唯一值, 范围[202501~202512]" 
-        就能推理出这是月度数据，可以按季度分组。
-        """
-        if not columns:
-            return "无列信息"
-        
-        # 构建 column_profiles 的索引
-        profiles_map: dict[str, dict] = {}
-        if column_profiles:
-            for p in column_profiles:
-                profiles_map[p.get("name", "")] = p
-        
-        lines = []
-        for col in columns:
-            col_name = col.get("name", col.get("column_name", ""))
-            col_type = col.get("type", col.get("column_type", ""))
-            
-            # 基础信息
-            line = f'- "{col_name}" ({col_type})'
-            
-            # 尝试从 column_profiles 获取丰富信息
-            profile = profiles_map.get(col_name)
-            if profile:
-                # 唯一值数量
-                unique_count = profile.get("unique_count")
-                if unique_count is not None:
-                    line += f" [唯一值:{unique_count}]"
-                
-                # 统计摘要（最有价值的信息）
-                summary = profile.get("summary", "")
-                if summary:
-                    # 截断过长的摘要
-                    if len(summary) > 100:
-                        summary = summary[:100] + "..."
-                    line += f" -- {summary}"
-            else:
-                # 没有 column_profiles，不提供额外信息
-                pass
-            
-            lines.append(line)
-        
-        return "\n".join(lines)
+        """格式化列信息供 LLM 理解（委托 ColumnStatsProvider）。"""
+        from chatdb.database.column_stats_provider import ColumnStatsProvider, ColumnStats
+
+        stats_objs = _dicts_to_column_stats(column_stats) if column_stats else []
+        return ColumnStatsProvider.format_columns(
+            stats_objs, columns=columns, relevant_cols=None,
+        )
 
     def _get_metrics_info(
         self,
@@ -491,20 +503,59 @@ class SQLTool:
         
         return sql
 
-    def _parse_candidates(self, response: str) -> list[SQLCandidate]:
+    def _parse_candidates(self, response: str) -> tuple[list[SQLCandidate], list[str]]:
+        """解析 LLM 返回的候选 SQL。
+
+        Returns:
+            (candidates, virtual_fields) — virtual_fields 为 LLM 声明使用的虚拟字段列表
+        """
         candidates = []
         try:
             data = json.loads(response)
         except json.JSONDecodeError:
             json_match = re.search(r'\{[\s\S]*\}', response)
             data = json.loads(json_match.group()) if json_match else {}
+        virtual_fields: list[str] = data.get("virtual_fields", [])
         for c in data.get("candidates", []):
             sql = (c.get("sql", "") or "").strip()
             reason = c.get("reason", "")
             if sql:
                 sql = self._clean_sql(sql)
                 candidates.append(SQLCandidate(sql=sql, reason=reason, confidence=0.9))
-        return candidates
+        return candidates, virtual_fields
+
+    def _expand_virtual_fields_in_candidates(
+        self,
+        candidates: list[SQLCandidate],
+        virtual_fields: list[str],
+        tables_info: list[dict[str, Any]] | None,
+        state: Any = None,
+    ) -> None:
+        """使用 AST 转换引擎替换候选 SQL 中的虚拟字段。原地修改 candidates。"""
+        mappings = build_mappings_from_tables_info(tables_info, state)
+        if not mappings:
+            return
+        all_replaced: set[str] = set()
+        for c in candidates:
+            result = expand_virtual_fields(c.sql, mappings)
+            if result.replaced_fields:
+                self._log.info(
+                    f"虚拟字段转换: {result.replaced_fields}"
+                    f"{' (正则兜底)' if result.used_fallback else ''}"
+                )
+                for msg in result.messages:
+                    self._log.debug(msg)
+            c.sql = result.sql
+            all_replaced.update(result.replaced_fields)
+        # 检查 LLM 声明但未替换的字段（column 类型跳过：它的作用域在 Planner 层面，SQL 中直接用真实列名）
+        mapping_by_id = {m.field_id: m for m in mappings}
+        for fid in virtual_fields:
+            if fid not in all_replaced and fid in mapping_by_id:
+                m = mapping_by_id[fid]
+                if m.field_type == "column":
+                    self._log.debug(f"虚拟字段 '{fid}' 为 column 类型，SQL 中直接使用真实列名，跳过占位符检查")
+                else:
+                    self._log.warn(f"LLM 声明了虚拟字段 '{fid}' 但 SQL 中未找到占位符")
 
     def _build_rule_based_sql(
         self,
@@ -618,21 +669,36 @@ class SQLTool:
             '字符串值使用单引号：WHERE "列名" = \'值\'',
             '**只生成 1 个 SQL，必须与当前任务类型匹配**',
             '**若上文指定了指标聚合表达式，SELECT 中必须使用该表达式**',
+            '**SELECT 中所有聚合表达式和虚拟字段必须用 AS 起一个简短的别名**：'
+            '如 `total_flow AS "总流水"`、`SUM("金额") AS "总金额"`。'
+            '禁止 SELECT 中出现无别名的聚合表达式或虚拟字段裸名称，否则列名会变成整段表达式导致下游引用失败',
         ]
         if has_required_where:
             rules.append(
-                '**WHERE 条件已确定**：上文"建议 WHERE 条件"是数据约束的完整定义，直接使用，可追加 AND，不可删改'
+                '**虚拟字段用法**：条件型虚拟字段是**完整布尔条件**，独立作为 AND 子句，'
+                '禁止追加 `=`/`IN`/`>` 等操作符；'
+                '指标型虚拟字段用**裸名称**引用（如 `total_flow`），系统自动包裹聚合函数。'
+                '即使写了 `SUM(total_flow)`，系统也会安全跳过重复包裹，推荐用裸名称保持简洁。'
+                '额外筛选用真实列名写独立 AND 条件，不要修改虚拟字段本身'
             )
             rules.append(
-                '**禁止推断额外筛选**：任务描述只描述分析动作，不包含筛选逻辑。不要根据描述中的词汇添加额外 WHERE 条件'
+                '**同组互斥字段不能 AND**：同一互斥组的虚拟字段操作同一列的不同枚举值，AND 连接永远返回 0 行。'
+                '对比场景应将它们分别放在不同子查询的 WHERE 中'
+            )
+            rules.append(
+                '**必选条件不可遗漏**：标记为"必选条件"的虚拟字段控制数据口径，遗漏会导致查询到错误范围的数据'
             )
         if has_task_description:
             rules.append(
-                '**任务描述解读**：description 中的词汇（如"市场费""今年"）是上下文说明，其对应的筛选条件已在"建议 WHERE 条件"中，不要重复添加'
+                '**任务描述解读**：description 中的词汇（如"市场费""今年"）是上下文说明，其对应的筛选条件已在虚拟字段中，不要重复添加'
             )
             rules.append(
                 '**禁止越权**：SQL 只实现"任务描述"中明确要求的动作。不要自作主张做额外分析（找极值、下钻、排名等）'
             )
+        rules.append(
+            '**SQL 必须查询真实数据表**：禁止生成不含 FROM 子句的纯常量 SQL（如 `SELECT 字面值 UNION ALL SELECT ...`）。'
+            '即使上下文中提供了具体数值，也必须通过 FROM 子句从表中查询获取数据，不得将数值硬编码为 SELECT 常量'
+        )
         rules.append("只输出 JSON，不要其他文字")
         return "\n".join(f"{i}. {r}" for i, r in enumerate(rules, 1))
 
@@ -673,11 +739,15 @@ class SQLTool:
                 for match in re.findall(r'"([^"]+)"', f.get("expr", "")):
                     cols.add(match)
 
-        # current_metric_def 中的列
-        if state and getattr(state, "current_metric_def", None):
-            agg = state.current_metric_def.get("agg", "")
-            for match in re.findall(r'"([^"]+)"', agg):
-                cols.add(match)
+        # current_metric_def 中的列（+ all_metric_defs）
+        if state:
+            all_defs = getattr(state, "all_metric_defs", {}) or {}
+            if not all_defs and getattr(state, "current_metric_def", None):
+                all_defs = {"_": state.current_metric_def}
+            for mdef in all_defs.values():
+                agg = mdef.get("agg", "")
+                for match in re.findall(r'"([^"]+)"', agg):
+                    cols.add(match)
 
         return cols
 
@@ -689,118 +759,358 @@ class SQLTool:
         table_schema: dict[str, Any] | None,
         current_task: dict[str, Any] | None = None,
         state: Any = None,
+        column_stats: list[dict[str, Any]] | None = None,
+        tables_info: list[dict[str, Any]] | None = None,
     ) -> str:
-        # ── 1. 列信息：只保留 intent 相关列 ──
-        relevant_cols = self._collect_relevant_columns(intent, yml_config, state)
-        if table_schema and table_schema.get("columns"):
-            all_cols = table_schema["columns"]
-            profiles = table_schema.get("column_profiles", [])
-            if relevant_cols:
-                key_cols = [c for c in all_cols if c.get("name", c.get("column_name", "")) in relevant_cols]
-                other_cols = [c for c in all_cols if c.get("name", c.get("column_name", "")) not in relevant_cols]
-                columns_info = "### 关键列（与本次查询直接相关）\n"
-                columns_info += self._format_columns_for_prompt(key_cols, column_profiles=profiles)
-                columns_info += f"\n\n### 其他可用列（共 {len(other_cols)} 列）\n"
-                columns_info += ", ".join(
-                    f'"{c.get("name", c.get("column_name", ""))}"'
-                    for c in other_cols
-                )
-            else:
-                columns_info = self._format_columns_for_prompt(all_cols, column_profiles=profiles)
-        elif schema_text:
-            columns_info = schema_text
-        else:
-            columns_info = "无列信息"
+        # ★ 统一表模型：所有选中的表一视同仁，每个表自带自己的上下文
+        # 不区分源表/临时表，选了谁就用谁的信息
 
-        # ── 2. 指标约束（强制使用聚合表达式）──
-        metric_section = ""
-        if state and getattr(state, "current_metric_def", None):
-            md = state.current_metric_def
-            metric_name = getattr(state, "current_metric", "")
-            agg_expr = md.get("agg", "")
-            filter_refs = md.get("filter_refs", [])
-            metric_section = f"""## 指标约束
-- 指标ID: {metric_name}
-- 含义: {md.get('label', '')}
-- 聚合表达式（必须使用）: {agg_expr}
-- 默认筛选器: {filter_refs}"""
+        # ── 1. 构建所有表的完整信息段（列信息 + 业务说明 + 指标约束 + WHERE 条件）──
+        tables_sections = self._build_tables_sections(
+            intent, yml_config, schema_text, table_schema, column_stats,
+            state, tables_info,
+        )
 
-        # ── 3. WHERE 条件（已解析的 SQL 片段）──
-        has_required_where = bool(state and getattr(state, "required_filters", None))
-        where_section = ""
-        if has_required_where:
-            where_parts = []
-            for f in state.required_filters:
-                where_parts.append(f"  -- {f['id']}: {f['label']}\n  ({f['expr']})")
-            where_section = f"## 建议 WHERE 条件\n以下条件直接用于 WHERE 子句（可追加 AND，不可删改）：\n\n{chr(10).join(where_parts)}"
+        # ── 2. 判断是否有任何表带了 required_filters（用于硬约束规则）──
+        has_required_where = False
+        if tables_info:
+            for tbl in tables_info:
+                if tbl.get("required_filters"):
+                    has_required_where = True
+                    break
+        elif state and getattr(state, "required_filters", None):
+            # 兼容旧路径
+            has_required_where = True
 
-        # ── 4. 结构化意图摘要 ──
-        # ★ task_type 优先使用当前任务的类型（而非全局 intent 的主类型）
+        # ── 3. 结构化意图摘要 ──
         effective_task_type = (
             current_task.get("task_type", intent.task_type)
             if current_task
             else intent.task_type
         )
+        # 从所有表的 yml_config 中汇集 dimensions 信息
+        all_dims_config: dict[str, Any] = {}
+        if tables_info:
+            for tbl in tables_info:
+                tbl_yml = tbl.get("yml_config") or {}
+                all_dims_config.update(tbl_yml.get("dimensions", {}))
+        if not all_dims_config:
+            all_dims_config = (yml_config or {}).get("dimensions", {})
+        
+        dim_display = []
+        for did in (intent.dimensions or []):
+            if did in all_dims_config:
+                col = all_dims_config[did].get("column", did)
+                dim_display.append(f'{did} → 列名 `{col}`')
+            else:
+                dim_display.append(did)
         intent_section = f"""## 结构化意图
 - task_type: {effective_task_type}
 - metrics: {intent.metrics}
-- dimensions: {intent.dimensions}"""
+- dimensions: {', '.join(dim_display) if dim_display else '[]'}
+- SQL 中必须使用真实列名，不要使用维度ID"""
 
-        # ── 5. 任务指令 ──
-        user_query = getattr(state, "user_query", "") if state else ""
-        task_instruction = self._build_task_instruction(current_task, user_query)
+        # ── 4. 任务指令 ──
+        task_instruction = self._build_task_instruction(current_task)
 
-        # ── 6. 用户查询（多任务时精简，避免泄露完整意图导致越权）──
+        # ── 5. 用户查询 ──
         rewritten = getattr(intent, "rewritten_query", "") or ""
         if current_task and current_task.get("description"):
-            # 多步计划：只展示当前任务描述作为查询上下文
             query_section = f"## 用户查询（当前任务视角）\n{current_task['description']}"
         elif rewritten and rewritten != intent.raw_query:
             query_section = f"## 用户查询\n{rewritten}\n（原始: {intent.raw_query}）"
         else:
             query_section = f"## 用户查询\n{intent.raw_query}"
 
-        # ── 7. 检索增强：值匹配提示 ──
+        # ── 6. 检索增强：值匹配提示（通用，不绑定特定表）──
         value_hint_section = ""
         rc = getattr(state, "retrieval_context", None) if state else None
         if rc is not None and hasattr(rc, "format_value_hint"):
             value_hint_section = rc.format_value_hint()
 
-        return f"""请根据以下信息生成可执行的 SQL。
-{task_instruction}
-{query_section}
+        # ── 7. 虚拟字段检索召回 ──
+        # ★ 已移除：检索召回的虚拟字段段落（vf_retrieval_section）与上方
+        # _build_virtual_fields_section() 大量重复，后者已包含完整的虚拟字段表格、
+        # 互斥组说明、scope 标注和用法示例，信息更精确。去除重复可缩减 prompt 长度。
+        vf_retrieval_section = ""
 
-## 表名
-{intent.table_name}
+        # ── 8. 构建动态输出格式示例 ──
+        output_section = self._build_output_section(tables_info, state, has_required_where)
 
-## 列信息（只能使用这些列！）
-{columns_info}
+        # ── 9. 统一组装 prompt ──
+        sections = [
+            "请根据以下信息生成可执行的 SQL。",
+            task_instruction,
+            query_section,
+            "",
+            tables_sections,
+            "",
+            intent_section,
+            "",
+            value_hint_section,
+            "",
+            vf_retrieval_section,
+            "",
+            f"## DuckDB SQL 规范\n{get_duckdb_syntax_rules()}",
+            "",
+            f"### 硬约束\n{self._build_sql_hard_rules(has_required_where=has_required_where, has_task_description=bool(current_task))}",
+            "",
+            output_section,
+        ]
+        # 过滤掉空段落，避免多余空行
+        return "\n".join(s for s in sections if s)
 
-{intent_section}
+    def _build_output_section(
+        self,
+        tables_info: list[dict[str, Any]] | None,
+        state: Any,
+        has_required_where: bool,
+    ) -> str:
+        """构建输出格式说明。
 
-{metric_section}
+        ★ 不硬编码具体 SQL 示例，只规定 JSON 结构和虚拟字段声明规则，
+        让 LLM 根据上文的虚拟字段说明、任务指令、Skill SQL 示例自由生成 SQL。
+        """
+        # 收集所有虚拟字段 ID
+        vf_ids: list[str] = []
+        if tables_info:
+            for tbl in tables_info:
+                for f in (tbl.get("required_filters") or []):
+                    fid = f.get("id", "")
+                    if fid and fid not in vf_ids:
+                        vf_ids.append(fid)
+        elif state and getattr(state, "required_filters", None):
+            for f in state.required_filters:
+                fid = f.get("id", "")
+                if fid and fid not in vf_ids:
+                    vf_ids.append(fid)
 
-{where_section}
+        lines = [
+            "## 输出要求",
+            "严格输出 JSON，**只生成 1 个最匹配当前任务的 SQL**：",
+            "```json",
+            "{",
+            '  "candidates": [',
+            '    { "sql": "<你生成的完整 SQL>", "reason": "一句话解释" }',
+            "  ],",
+            f'  "virtual_fields": {json.dumps(vf_ids, ensure_ascii=False) if vf_ids else "[]"}',
+            "}",
+            "```",
+        ]
 
-{value_hint_section}
+        if vf_ids:
+            lines.append(f"**virtual_fields 必须包含所有使用到的虚拟字段**（上方共 {len(vf_ids)} 个）。")
+            lines.append("SQL 中如何使用虚拟字段，请参照上方「虚拟字段」章节的规则和示例。")
+            lines.append("若需额外筛选条件，用真实列名单独添加 AND 子句。")
 
-## DuckDB SQL 规范
-{get_duckdb_syntax_rules()}
+        return "\n".join(lines)
 
-### 硬约束
-{self._build_sql_hard_rules(has_required_where=has_required_where, has_task_description=bool(current_task))}
+    def _build_tables_sections(
+        self,
+        intent: Any,
+        yml_config: dict[str, Any],
+        schema_text: str | None,
+        table_schema: dict[str, Any] | None,
+        column_stats: list[dict[str, Any]] | None,
+        state: Any,
+        tables_info: list[dict[str, Any]] | None,
+    ) -> str:
+        """为所有选中表构建统一格式的完整信息段。
 
-## 输出要求
-严格输出 JSON，**只生成 1 个最匹配当前任务的 SQL**：
-{{
-  "candidates": [
-    {{ "sql": "SELECT ... FROM ... WHERE ... GROUP BY ...", "reason": "一句话解释业务逻辑和口径选择" }}
-  ]
-}}
-"""
+        ★ 核心设计：所有表一视同仁，每个表自带自己的上下文。
+        选了哪个表，就用哪个表的 understanding、yml、metric、filters。
 
-    def _build_task_instruction(self, current_task: dict[str, Any] | None, user_query: str) -> str:
-        """构建任务类型指令（完整版，保留各类型的详细规则）。"""
+        每张表的格式：
+        ## 表: "表名"  (N 行)
+        ### 业务说明
+        ...（该表自己的 table_understanding）
+        ### 列信息
+        - "列名" (类型) [缺失:X%] [唯一值:N] -- 摘要
+        ### 指标约束（如该表有 yml 配置）
+        ...
+        ### 建议 WHERE 条件（如该表有 required_filters）
+        ...
+        """
+        # ★ 有 tables_info 时使用统一模型
+        if tables_info:
+            parts = []
+            for tbl in tables_info:
+                parts.append(self._build_single_table_section(tbl, intent, state))
+
+            if not parts:
+                return "## 可用表\n无表信息"
+
+            result = "\n\n".join(parts)
+            if len(parts) > 1:
+                result += "\n\n★ 多个表已列出，请根据任务需求选择合适的表进行查询。"
+            return result
+
+        # ★ 兼容旧路径：无 tables_info 时退化到单表逻辑
+        if table_schema and table_schema.get("columns"):
+            tbl_yml = yml_config or {}
+            relevant_cols = self._collect_relevant_columns(intent, tbl_yml, state)
+            all_cols = table_schema["columns"]
+            if relevant_cols:
+                col_info = self._format_columns_with_highlight(all_cols, relevant_cols, column_stats)
+            else:
+                col_info = self._format_columns_for_prompt(all_cols, column_stats=column_stats)
+            source_table = getattr(intent, "table_name", "") or ""
+            return f'## 表: `"{source_table}"`\n{col_info}'
+        elif schema_text:
+            return f"## 列信息\n{schema_text}"
+        else:
+            return "## 列信息\n无列信息"
+
+    def _build_single_table_section(
+        self,
+        tbl: dict[str, Any],
+        intent: Any,
+        state: Any,
+    ) -> str:
+        """为单个表构建完整的 prompt 段落。
+        
+        每个表自带：schema、column_stats、understanding、yml_config、
+        metric_def、required_filters —— 有什么就展示什么，没有就跳过。
+        """
+        tbl_name = tbl["table_name"]
+        tbl_schema = tbl.get("schema") or {}
+        tbl_stats = tbl.get("column_stats")
+        tbl_cols = tbl_schema.get("columns", [])
+        row_count = tbl_schema.get("row_count", 0)
+        tbl_yml = tbl.get("yml_config") or {}
+        tbl_understanding = tbl.get("understanding") or ""
+        tbl_metric_def = tbl.get("metric_def")
+        tbl_metric_name = tbl.get("metric_name") or ""
+        tbl_all_metric_defs = tbl.get("all_metric_defs") or {}
+        tbl_required_filters = tbl.get("required_filters") or []
+        tbl_metric_union_info = tbl.get("metric_union_info") or []
+
+        # 表头
+        header = f'## 表: `"{tbl_name}"`'
+        if row_count:
+            header += f"  ({row_count} 行)"
+
+        sub_sections = [header]
+
+        # 业务说明（该表自己的）
+        if tbl_understanding:
+            sub_sections.append(f"### 业务说明\n{tbl_understanding}")
+
+        # 列信息
+        if tbl_cols:
+            # 有 yml 配置时区分关键列/其他列；无 yml 时展示全部列
+            if tbl_yml and tbl_yml.get("metrics"):
+                relevant_cols = self._collect_relevant_columns(intent, tbl_yml, state)
+                col_info = self._format_columns_with_highlight(tbl_cols, relevant_cols, tbl_stats)
+            else:
+                col_info = self._format_columns_for_prompt(tbl_cols, column_stats=tbl_stats)
+            sub_sections.append(f"### 列信息\n{col_info}")
+        else:
+            sub_sections.append("### 列信息\n无列信息")
+
+        # 指标约束（展示该任务涉及的所有指标定义）
+        if tbl_all_metric_defs:
+            # 多指标：逐个展示
+            metric_lines = ["### 指标约束"]
+            for mid, mdef in tbl_all_metric_defs.items():
+                agg_expr = mdef.get("agg", "")
+                f_refs = mdef.get("filter_refs", [])
+                role = "（主指标）" if mid == tbl_metric_name else ""
+                # 已展开的指标：metric_* 筛选器已内置在 CASE WHEN 中，不再展示
+                if mdef.get("_expanded"):
+                    f_refs = [f for f in f_refs if not f.startswith("metric_")]
+                    metric_lines.append(
+                        f"- **{mid}**{role}: {mdef.get('label', '')}\n"
+                        f"  - 聚合表达式（已含指标筛选）: `{agg_expr}`\n"
+                        f"  - 公共筛选器: {f_refs}"
+                    )
+                else:
+                    metric_lines.append(
+                        f"- **{mid}**{role}: {mdef.get('label', '')}\n"
+                        f"  - 聚合表达式: `{agg_expr}`\n"
+                        f"  - 默认筛选器: {f_refs}"
+                    )
+            sub_sections.append("\n".join(metric_lines))
+        elif tbl_metric_def:
+            # 向后兼容：单指标
+            agg_expr = tbl_metric_def.get("agg", "")
+            filter_refs = tbl_metric_def.get("filter_refs", [])
+            sub_sections.append(f"""### 指标约束
+- 指标ID: {tbl_metric_name}
+- 含义: {tbl_metric_def.get('label', '')}
+- 聚合表达式（必须使用）: {agg_expr}
+- 默认筛选器: {filter_refs}""")
+
+        # ★ 多原子指标 CASE WHEN 引导（当 WHERE 中互斥条件已用 OR 合并时）
+        if tbl_metric_union_info and tbl_all_metric_defs:
+            sub_sections.append(self._build_metric_union_hint(
+                tbl_metric_union_info, tbl_all_metric_defs,
+            ))
+
+        # 虚拟字段占位符（条件型 + 列型）
+        if tbl_required_filters:
+            sub_sections.append(self._build_virtual_fields_section(tbl_required_filters, tbl_metric_name))
+
+        return "\n".join(sub_sections)
+
+    def _build_metric_union_hint(
+        self,
+        metric_union_info: list[dict[str, Any]],
+        all_metric_defs: dict[str, dict[str, Any]],
+    ) -> str:
+        """构建多原子指标聚合引导段落。
+
+        当多个原子指标的互斥筛选条件（如"报表项=利润" vs "报表项=流水"）
+        被 OR 合并到 WHERE 中时，SQL 的 SELECT 必须使用各指标预定义的聚合表达式，
+        这些表达式已经内含 CASE WHEN 逻辑，LLM 不需要自行构造。
+        """
+        lines = [
+            "### ★ 多指标聚合模式",
+            "",
+            "本任务涉及**多个互斥指标**，WHERE 中已用 OR 合并其筛选条件以保证数据完整。",
+            "**你必须直接使用上方「指标约束」中给出的聚合表达式**，不要自行构造 CASE WHEN。",
+            "",
+            "每个指标的聚合表达式已经内含了正确的 CASE WHEN 逻辑，直接在 SELECT 中引用即可：",
+            "",
+        ]
+
+        for mid, mdef in all_metric_defs.items():
+            agg_expr = mdef.get("agg", "")
+            label = mdef.get("label", mid)
+            if agg_expr:
+                lines.append(f'- **{label}** (`{mid}`): `{agg_expr}`')
+
+        lines.append("")
+        lines.append("**⚠️ 禁止自行构造 CASE WHEN**，直接复制上方聚合表达式使用。")
+
+        return "\n".join(lines)
+
+    def _build_virtual_fields_section(
+        self,
+        required_filters: list[dict[str, Any]],
+        metric_name: str = "",
+    ) -> str:
+        """构建虚拟字段说明段落（委托给 VirtualFieldPromptBuilder）。"""
+        from chatdb.config.virtual_field import VirtualFieldPromptBuilder
+        return VirtualFieldPromptBuilder.build(required_filters, metric_name)
+
+    def _format_columns_with_highlight(
+        self,
+        all_cols: list[dict[str, Any]],
+        relevant_cols: set[str],
+        column_stats: list[dict[str, Any]] | None,
+    ) -> str:
+        """格式化列信息，区分关键列和其他列（委托 ColumnStatsProvider）。"""
+        from chatdb.database.column_stats_provider import ColumnStatsProvider
+
+        stats_objs = _dicts_to_column_stats(column_stats) if column_stats else []
+        return ColumnStatsProvider.format_columns(
+            stats_objs, columns=all_cols,
+            relevant_cols=relevant_cols if relevant_cols else None,
+        )
+
+    def _build_task_instruction(self, current_task: dict[str, Any] | None) -> str:
+        """构建任务类型指令，SQL 生成规则统一从 SkillRegistry 加载。"""
         if not current_task:
             return ""
 
@@ -830,7 +1140,15 @@ class SQLTool:
 - 后续分析由其他任务负责，不需要你在这一步完成
 """
         if task_notes:
-            inst += f"- 注意事项: {'; '.join(str(n) for n in task_notes)}\n"
+            # ★ 对分组维度相关的 note 加强调，避免 LLM 遗漏 GROUP BY 维度
+            formatted_notes = []
+            for n in task_notes:
+                note_str = str(n)
+                if any(kw in note_str for kw in ['分组维度', 'GROUP BY', 'group by']):
+                    formatted_notes.append(f"  - ★ **{note_str}**（GROUP BY 必须包含全部列，缺少任何一个都会导致数据被错误聚合）")
+                else:
+                    formatted_notes.append(f"  - {note_str}")
+            inst += "- 注意事项:\n" + "\n".join(formatted_notes) + "\n"
         if current_dim:
             inst += f"- 当前分析维度: {current_dim}\n"
         if time_granularity:
@@ -869,93 +1187,33 @@ class SQLTool:
 {intent_hint}
 """
 
-        # ── 各任务类型的参考规则（指导性，根据具体任务描述灵活调整） ──
-        if task_type == "trend":
-            inst += """
-### 趋势分析参考
-- 通常按时间维度（年/季/月/周/日）GROUP BY
-- 通常按时间升序排列（ORDER BY 时间列 ASC），但具体排序方向以任务描述为准
-- 只生成 1 个 SQL
-"""
-        elif task_type == "source":
-            dims_hint = "、".join(f"「{d}」" for d in available_dims) if available_dims else "任务描述中指定的维度"
-            inst += f"""
-### 来源/构成分析参考
-- 可用的分组维度: {dims_hint}
-- 根据任务描述选择最合适的维度进行 GROUP BY
-- 通常按数值降序排序（看 top 贡献），但具体排序以任务描述为准
-- 只生成 1 个 SQL
-"""
-        elif task_type == "comparison":
-            inst += """
-### 对比分析参考
-- 对比两个时间段或两个条件的差异
-- 计算差值和/或增长率：(当期 - 基期) / NULLIF(基期, 0) * 100
-- 结果应包含：基期值、当期值、变化值/增长率
-- 可用 LAG/LEAD 窗口函数或子查询实现
-- ★ 排序方向必须严格匹配任务描述的语义：
-  - "下降最多/跌幅最大" → ORDER BY 变化值 ASC（取最负的值）
-  - "增长最多/涨幅最大" → ORDER BY 变化值 DESC（取最正的值）
-  - 禁止使用 ABS() 排序，因为 ABS 会混淆增长和下降的方向
-"""
-        elif task_type == "drilldown":
-            inst += """
-### 下钻分析参考
-- 在上一步结果基础上进一步细分
-- 增加更细粒度的维度或筛选条件
-- 保留上游的筛选条件
-"""
-        elif task_type == "ratio":
-            inst += f"""
-### 占比分析规则
+        # ── 各任务类型的参考规则（统一从 SkillRegistry 加载）──
+        if self._skill_registry:
+            skill_instruction = self._skill_registry.get_sql_instruction(task_type)
 
-**用户问题**：{user_query}
+            if skill_instruction:
+                # 动态参数注入：source 类型需要可用维度
+                if task_type == "source" and available_dims:
+                    dims_hint = "、".join(f"「{d}」" for d in available_dims)
+                    inst += f"\n- 可用的分组维度: {dims_hint}\n"
 
-请根据用户问题判断使用哪种占比模式：
+                inst += f"\n{skill_instruction}\n"
 
-**模式1 - 分别占比**（用户说"分别""各自""每个"时使用）：按维度 GROUP BY，每行一个占比
-```sql
-SELECT "维度列",
-  SUM("数值列") AS 值,
-  ROUND(SUM("数值列") * 100.0 / (SELECT SUM("数值列") FROM 表名 WHERE <全局条件>), 2) AS 占比
-FROM 表名
-WHERE <全局条件> AND <分组条件>
-GROUP BY "维度列"
-ORDER BY 值 DESC
-```
+                # 注入 SQL 示例（从 SkillRegistry 加载）
+                sql_examples = self._skill_registry.get_sql_examples(task_type)
+                if sql_examples:
+                    inst += "\n### SQL 参考示例\n"
+                    inst += "以下是同类任务的 SQL 模板参考（需根据实际表名和列名调整）：\n"
+                    for ex in sql_examples:
+                        desc = ex.get("description", "")
+                        notes = ex.get("notes", [])
+                        sql_tpl = ex.get("sql_template", "")
+                        inst += f"\n**{desc}**\n"
+                        if notes:
+                            inst += f"- 要点: {'; '.join(str(n) for n in notes)}\n"
+                        if sql_tpl:
+                            inst += f"```sql\n{sql_tpl}\n```\n"
 
-**模式2 - 合计占比**（用户问一组对象合起来占多少时使用）：CASE WHEN 输出单行
-```sql
-SELECT
-  ROUND(SUM(CASE WHEN <分子条件> THEN "数值列" ELSE 0 END) * 100.0 / SUM("数值列"), 2) AS 占比
-FROM 表名 WHERE <全局条件>
-```
-
-**模式3 - TOP N 占比**（分子条件涉及聚合排序时）：CTE 取 TOP N 再 CASE WHEN IN
-```sql
-WITH top_n AS (
-  SELECT "维度列" FROM 表名 WHERE <全局条件>
-  GROUP BY "维度列" ORDER BY SUM("数值列") DESC LIMIT N
-)
-SELECT
-  SUM(CASE WHEN "维度列" IN (SELECT "维度列" FROM top_n) THEN "数值列" ELSE 0 END) AS 分子,
-  SUM("数值列") AS 分母,
-  ROUND(... * 100.0 / ..., 2) AS 占比
-FROM 表名 WHERE <全局条件>
-```
-
-**关键判断**：
-- 用户说"**分别**占多少"→ 模式1（GROUP BY）
-- 用户说"**一共**占多少"→ 模式2（CASE WHEN）
-- 涉及"前N名""TOP N"→ 模式3（CTE + CASE WHEN IN）
-"""
-        elif task_type == "ranking":
-            inst += """
-### 排名分析参考
-- 按指标 GROUP BY 维度后排序
-- 使用 ORDER BY 指标 DESC/ASC（根据任务描述决定方向）
-- 使用 LIMIT N 限制返回数量
-"""
         return inst
 
     async def _generate_candidates(
@@ -966,17 +1224,27 @@ FROM 表名 WHERE <全局条件>
         table_schema: dict[str, Any] | None = None,
         current_task: dict[str, Any] | None = None,
         state: Any = None,  # ReActState
+        column_stats: list[dict[str, Any]] | None = None,
+        tables_info: list[dict[str, Any]] | None = None,
     ) -> list[SQLCandidate]:
-        prompt = self._build_generation_prompt(intent, yml_config, schema_text, table_schema, current_task, state)
-        system = "你是 SQL 生成专家。根据用户查询和表结构生成 DuckDB SQL。核心原则：以用户查询为准，业务配置仅供参考；只使用提供的列名；列名用双引号，字符串值用单引号。严格输出 JSON。"
+        prompt = self._build_generation_prompt(
+            intent, yml_config, schema_text, table_schema,
+            current_task, state, column_stats=column_stats,
+            tables_info=tables_info,
+        )
+        system = "你是 SQL 生成专家。根据任务描述和表结构生成 DuckDB SQL。核心原则：以任务描述为准，业务配置仅供参考；只使用提供的列名；列名用双引号，字符串值用单引号。严格输出 JSON。"
         try:
             response = await self.llm.chat(
                 prompt=prompt,
                 system_prompt=system,
                 caller_name="generate_sql",
             )
-            candidates = self._parse_candidates(response)
+            candidates, virtual_fields = self._parse_candidates(response)
+            # 虚拟字段替换（AST 转换引擎）
             if candidates:
+                self._expand_virtual_fields_in_candidates(
+                    candidates, virtual_fields, tables_info, state,
+                )
                 self._log.observe(f"生成 {len(candidates)} 个候选 SQL")
                 return candidates
         except Exception as e:
@@ -993,19 +1261,48 @@ FROM 表名 WHERE <全局条件>
         state: Any = None,  # ReActState
         **kwargs: Any,
     ) -> ToolResult:
-        """根据结构化意图生成 SQL。"""
+        """根据结构化意图生成 SQL。
+        
+        ★ 核心设计：所有选中的表一视同仁。
+        每个表自带自己的完整上下文（understanding、yml_config、metric_def、filters），
+        不依赖 state 上的全局"源表"字段。
+        """
         if not self.llm:
             return ToolResult.fail("未配置 LLM，无法生成 SQL")
         from chatdb.agents.semantic_parser import StructuredIntent
         intent_obj = StructuredIntent.from_dict(intent) if isinstance(intent, dict) else intent
-        table_schema = self._get_table_schema(intent_obj.table_name, available_tables or [])
+
+        # ★ 统一表模型：确定需要查询的表
+        selected = getattr(state, "selected_tables", None) if state else None
+        source_table = intent_obj.table_name or ""
+
+        if selected:
+            tables_to_query: list[str] = list(selected)
+        else:
+            tables_to_query = [source_table] if source_table else []
+            if current_task:
+                for dep_id, tbl_info in current_task.get("upstream_temp_tables", {}).items():
+                    tbl_name = tbl_info.get("name", "") if isinstance(tbl_info, dict) else tbl_info
+                    if tbl_name and tbl_name not in tables_to_query:
+                        tables_to_query.append(tbl_name)
+
+        # ★ 为每张表构建完整上下文（schema + stats + understanding + yml + metric + filters）
+        tables_info: list[dict[str, Any]] = []
+        for tbl_name in tables_to_query:
+            tbl_entry = await self._build_table_context(
+                tbl_name, source_table, available_tables, state,
+            )
+            tables_info.append(tbl_entry)
+
         candidates = await self._generate_candidates(
             intent_obj,
             yml_config or {},
             schema_text or None,
-            table_schema,
+            None,
             current_task,
-            state,  # 传入 state
+            state,
+            column_stats=None,
+            tables_info=tables_info,
         )
         if not candidates:
             return ToolResult.fail("无法生成有效 SQL")
@@ -1021,6 +1318,137 @@ FROM 表名 WHERE <全局条件>
             },
             message="SQL 生成成功",
         )
+
+    async def _build_table_context(
+        self,
+        tbl_name: str,
+        source_table: str,
+        available_tables: list[dict] | None,
+        state: Any,
+    ) -> dict[str, Any]:
+        """为单个表构建完整上下文。
+        
+        ★ 核心方法：每个表自带自己的全部信息，不区分源表/临时表。
+        有 yml 配置就带上指标和 filters，有 understanding 就带上，没有就不带。
+        
+        Returns:
+            {
+                "table_name": str,
+                "schema": dict,           # 列信息
+                "column_stats": list,      # 实时列统计
+                "understanding": str,      # 该表的业务说明
+                "yml_config": dict,        # 该表的 yml 配置（如有）
+                "metric_name": str,        # 该表的当前指标 ID（如有）
+                "metric_def": dict,        # 该表的指标定义（如有）
+                "required_filters": list,  # 该表的 WHERE 条件（如有）
+            }
+        """
+        # 1. Schema
+        tbl_schema = self._get_table_schema(tbl_name, available_tables or [])
+        if not tbl_schema.get("columns"):
+            tbl_schema = await self._fetch_table_schema_from_db(tbl_name)
+        
+        # 2. 实时列统计
+        tbl_stats = await self._fetch_column_stats(tbl_name)
+        
+        # 3. 该表自己的上下文（understanding、yml_config、metric、filters）
+        # 从 state 获取（state 上挂的是当前任务注入的信息）
+        tbl_understanding = ""
+        tbl_yml_config: dict[str, Any] = {}
+        tbl_metric_name = ""
+        tbl_metric_def: dict[str, Any] | None = None
+        tbl_all_metric_defs: dict[str, dict[str, Any]] = {}
+        tbl_required_filters: list[dict[str, Any]] = []
+        tbl_metric_union_info: list[dict[str, Any]] = []
+        
+        if state:
+            # ★ 如果该表是 state.table_name 指向的表，继承 state 上的所有上下文
+            # （这些上下文由 SQLAgent._inject_metric_definition 注入，与该表绑定）
+            if tbl_name == getattr(state, "table_name", ""):
+                tbl_understanding = getattr(state, "table_understanding", "") or ""
+                tbl_yml_config = getattr(state, "yml_config", {}) or {}
+                tbl_metric_name = getattr(state, "current_metric", "") or ""
+                tbl_metric_def = getattr(state, "current_metric_def", None)
+                tbl_all_metric_defs = getattr(state, "all_metric_defs", {}) or {}
+                tbl_required_filters = getattr(state, "required_filters", []) or []
+                tbl_metric_union_info = getattr(state, "metric_union_info", []) or []
+            elif tbl_name.startswith("temp_"):
+                # ★ 临时表：不继承源表的虚拟字段/指标/filters
+                # 临时表是上游任务的预聚合结果，列名来自上游 SELECT，
+                # 不包含源表原始列，注入虚拟字段展开会引用不存在的列导致 BinderException
+                tbl_understanding = (
+                    f"这是上游任务生成的临时表，包含预聚合结果。"
+                    f"直接使用该表现有的列名查询，不需要重新聚合或过滤。"
+                )
+            else:
+                # 不是 state.table_name 的表：尝试从 MetaDataStore 加载 understanding
+                tbl_understanding = self._load_table_understanding_sync(tbl_name)
+        
+        return {
+            "table_name": tbl_name,
+            "schema": tbl_schema,
+            "column_stats": tbl_stats,
+            "understanding": tbl_understanding,
+            "yml_config": tbl_yml_config,
+            "metric_name": tbl_metric_name,
+            "metric_def": tbl_metric_def,
+            "all_metric_defs": tbl_all_metric_defs,
+            "required_filters": tbl_required_filters,
+            "metric_union_info": tbl_metric_union_info,
+        }
+
+    def _load_table_understanding_sync(self, table_name: str) -> str:
+        """同步加载表的业务说明（从 MetaDataStore 缓存读取）。
+        
+        用于非源表（如临时表）在没有预加载 understanding 时的回退。
+        """
+        try:
+            from chatdb.storage import MetaDataStore
+            meta_store = MetaDataStore()
+            meta = meta_store.get_by_table_name(table_name)
+            if meta and meta.get("table_understanding"):
+                return meta["table_understanding"]
+        except Exception:
+            pass
+        return ""
+
+    async def _fetch_column_stats(self, table_name: str) -> list[dict[str, Any]] | None:
+        """从数据库实时获取列描述统计，失败时返回 None 而非中断。"""
+        if not self.db_connector or not table_name:
+            return None
+        try:
+            from chatdb.database.duckdb.duckdb import DuckDBConnector
+            if isinstance(self.db_connector, DuckDBConnector):
+                return await self.db_connector.get_column_stats_async(table_name)
+        except Exception as e:
+            self._log.warn(f"获取列描述统计失败: {e}")
+        return None
+
+    async def _fetch_table_schema_from_db(self, table_name: str) -> dict[str, Any]:
+        """从 DuckDB 实时获取表的 schema（列名 + 类型 + 行数）。
+        
+        用于临时表等不在 available_tables 中的表。
+        """
+        result: dict[str, Any] = {"table_name": table_name, "columns": [], "row_count": 0}
+        if not self.db_connector or not table_name:
+            return result
+        try:
+            from chatdb.database.duckdb.duckdb import DuckDBConnector
+            if isinstance(self.db_connector, DuckDBConnector):
+                from sqlalchemy import text
+                import asyncio
+                def _describe() -> dict[str, Any]:
+                    with self.db_connector._engine.connect() as conn:
+                        desc = conn.execute(text(f'DESCRIBE "{table_name}"'))
+                        cols = [{"name": r[0], "type": r[1]} for r in desc.fetchall()]
+                        cnt = conn.execute(text(f'SELECT COUNT(*) FROM "{table_name}"'))
+                        row_count = cnt.fetchone()[0] or 0
+                        return {"table_name": table_name, "columns": cols, "row_count": row_count}
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(None, _describe)
+        except Exception as e:
+            self._log.warn(f"从 DB 获取 schema 失败 ({table_name}): {e}")
+        return result
 
     # ---------- 执行与评估（原 ResultEvaluator 逻辑） ----------
 
@@ -1086,6 +1514,7 @@ FROM 表名 WHERE <全局条件>
         eval_result: EvaluationResult,
         intent: Any,
         schema_text: str | None,
+        required_filters: list[dict[str, Any]] | None = None,
     ) -> str:
         prompt = f"""请诊断以下 SQL 的问题并给出最小修正。
 
@@ -1107,13 +1536,85 @@ FROM 表名 WHERE <全局条件>
             prompt += f"\n## 用户原始查询\n{intent.raw_query}\n"
         if schema_text:
             prompt += f"\n## 表 Schema\n{schema_text[:2000]}\n"
+
+        # ★ 注入虚拟字段信息，让修正 LLM 了解虚拟字段语义
+        if required_filters:
+            vf_section = self._build_virtual_fields_section(required_filters)
+            if vf_section:
+                prompt += f"\n{vf_section}\n"
+
+        # ★ 根据错误类型给出针对性的诊断指南
+        error_guide = self._get_error_diagnosis_guide(eval_result.error_type)
+        if error_guide:
+            prompt += f"\n{error_guide}\n"
+
         prompt += """
 ## 输出要求
 ```json
 { "diagnosis": "一句话说明问题", "refined_sql": "修正后的完整 SQL" }
 ```
-原则：只改出错部分，保持其他结构不变。只输出 JSON。"""
+原则：只改出错部分，保持其他结构不变。修正后的 SQL 中必须保留所有虚拟字段占位符（如 "base_valid_data"、"source_actual"、total_flow 等），不要将它们手动展开为真实表达式，系统会自动处理展开。只输出 JSON。"""
         return prompt
+
+    @staticmethod
+    def _get_error_diagnosis_guide(error_type: ErrorType) -> str:
+        """根据错误类型返回针对性的诊断指南和常见修复方法"""
+        guides = {
+            ErrorType.SYNTAX_ERROR: """## 常见语法错误模式与修复方法
+
+**1. 括号不匹配**（最常见）
+- 症状: `syntax error at or near ","` 或 `syntax error at or near ")"`
+- 诊断方法: 逐一数每对括号（子查询括号、函数括号、IN 列表括号、AND/OR 分组括号），确保左右配对
+- 常见场景: ROUND(... / (SELECT ...), 2) 中子查询的右括号与 ROUND 的逗号、右括号交织
+- 修复: 格式化 SQL 对齐括号层级，找到缺失的括号位置补齐
+- ★ 关键检查: IN (...) 的右括号后面如果紧跟 AND，确保 AND 前的 `)` 数量正确
+
+**2. 子查询中 AND/OR 优先级错误**
+- 症状: 括号看似配对，但 WHERE 逻辑不对
+- 诊断: 检查 `A AND B OR C` 是否应该是 `A AND (B OR C)` 或 `(A AND B) OR C`
+- 修复: 给 AND/OR 混用的地方加明确括号
+
+**3. 中文别名未加双引号**
+- 症状: `syntax error` 在中文词附近
+- 修复: 列名/别名含中文时必须用双引号包裹
+
+**4. ROUND 函数参数错误**
+- 症状: `syntax error at or near ","` 在 ROUND 附近
+- 原因: ROUND 的第一个参数（表达式）内部的子查询括号不完整，导致逗号被误解析
+- 修复: 确保 ROUND( <完整表达式> , 2) 中第一个参数是完整闭合的表达式""",
+
+            ErrorType.UNKNOWN_COLUMN: """## 常见列名错误模式与修复方法
+
+**1. 使用了维度 ID 而非真实列名**
+- 症状: `column "dim_product_category" not found`
+- 原因: 误用了结构化意图中的维度 ID（dim_xxx）作为列名
+- 修复: 查看"表 Schema"中的实际列名，例如 dim_product_category → "产品大类"
+
+**2. 列名拼写错误或使用了不存在的列**
+- 症状: `column "xxx" not found`，且有 `Candidate bindings` 提示
+- 修复: 使用 Candidate bindings 中推荐的列名
+
+**3. CTE 内层列名在外层不可见**
+- 症状: 外层 SELECT 引用的列在 CTE 中未被 SELECT
+- 修复: 确保外层引用的列在 CTE 的 SELECT 列表中""",
+
+            ErrorType.TYPE_MISMATCH: """## 常见类型不匹配模式与修复方法
+
+**1. BIGINT 列与字符串值比较**
+- 症状: `cannot compare BIGINT and VARCHAR`
+- 场景: WHERE "年" IN ('2024', '2025')，但"年"列是 BIGINT 类型
+- 修复: 去掉单引号，改为 WHERE "年" IN (2024, 2025)
+
+**2. 日期函数用在整数列上**
+- 症状: `QUARTER()/MONTH() 只接受 DATE/TIMESTAMP`
+- 场景: 月份列是 BIGINT（如 202501），不能直接用 QUARTER()
+- 修复: 使用 CASE WHEN 映射或数学运算提取季度
+
+**3. 聚合函数参数类型错误**
+- 症状: `cannot apply SUM to VARCHAR`
+- 修复: 确保 SUM/AVG 等聚合函数作用于数值列""",
+        }
+        return guides.get(error_type, "")
 
     async def _diagnose_and_refine(
         self,
@@ -1121,9 +1622,15 @@ FROM 表名 WHERE <全局条件>
         intent: Any,
         yml_config: dict[str, Any],
         schema_text: str | None,
+        required_filters: list[dict[str, Any]] | None = None,
     ) -> EvaluationResult:
-        prompt = self._build_diagnose_prompt(eval_result, intent, schema_text)
-        system = "你是 SQL 调试专家。诊断错误原因，给出最小修正。只改出错部分，输出清晰 JSON。"
+        prompt = self._build_diagnose_prompt(eval_result, intent, schema_text, required_filters)
+        system = ("你是 SQL 调试专家。严格按以下步骤修正：\n"
+                  "1. 精确定位错误位置（不要只说'括号不匹配'，要指出具体在哪个函数/子查询处缺少了什么）\n"
+                  "2. 参考诊断指南中的常见模式匹配错误类型\n"
+                  "3. 只改出错部分，给出可直接执行的完整 SQL\n"
+                  "4. 修正后的 SQL 必须与原 SQL 有实质性差异，不能原样返回\n"
+                  "输出清晰 JSON。")
         try:
             response = await self.llm.chat(
                 prompt=prompt,
@@ -1185,6 +1692,7 @@ FROM 表名 WHERE <全局条件>
         """执行 SQL 并诊断/修正。"""
         if not self.llm or not self.db_connector:
             return ToolResult.fail("未配置 LLM 或数据库连接，无法执行与评估")
+        required_filters = kwargs.get("required_filters", None)
         eval_result = EvaluationResult(sql=sql)
         eval_result = await self._execute_sql_internal(eval_result)
         attempts = 0
@@ -1192,6 +1700,7 @@ FROM 表名 WHERE <全局条件>
             self._log.info(f"尝试修正 (第 {attempts + 1} 次)")
             eval_result = await self._diagnose_and_refine(
                 eval_result, intent, yml_config or {}, schema_text or None,
+                required_filters=required_filters,
             )
             if eval_result.refined:
                 eval_result.sql = eval_result.refined_sql
@@ -1469,9 +1978,18 @@ FROM 表名 WHERE <全局条件>
         )
         eval_result = await self._diagnose_and_refine(
             eval_result, state.intent, state.yml_config, state.schema_text,
+            required_filters=state.required_filters or None,
         )
         if eval_result.refined and eval_result.refined_sql != state.current_sql:
-            state.current_sql = eval_result.refined_sql
+            # ★ 修复后的 SQL 可能仍含虚拟字段占位符，需要再做一次展开
+            refined = eval_result.refined_sql
+            mappings = build_mappings_from_tables_info(None, state)
+            if mappings:
+                result = expand_virtual_fields(refined, mappings)
+                if result.replaced_fields:
+                    self._log.info(f"[refine] 虚拟字段展开: {result.replaced_fields}")
+                refined = result.sql
+            state.current_sql = refined
             state.reflect(f"SQL 已修正: {eval_result.diagnosis}")
             state.mark_need(need_execute=True)
         else:
@@ -1500,7 +2018,15 @@ FROM 表名 WHERE <全局条件>
             )
             state.reflect(f"空结果诊断: {diagnosis.get('conclusion', '未知原因')}")
             if diagnosis.get("suggested_sql") and diagnosis.get("can_fix"):
-                state.current_sql = _clean_sql_util(diagnosis["suggested_sql"])
+                suggested = _clean_sql_util(diagnosis["suggested_sql"])
+                # ★ 诊断修复的 SQL 可能仍含虚拟字段占位符，需要再做一次展开
+                mappings = build_mappings_from_tables_info(None, state)
+                if mappings:
+                    result = expand_virtual_fields(suggested, mappings)
+                    if result.replaced_fields:
+                        self._log.info(f"[no_data_fix] 虚拟字段展开: {result.replaced_fields}")
+                    suggested = result.sql
+                state.current_sql = suggested
                 state.mark_need(need_execute=True)
                 state.reflect(f"建议修正: {diagnosis.get('fix_reason', '')}")
         except Exception as e:
@@ -1531,7 +2057,7 @@ FROM 表名 WHERE <全局条件>
         if result.success:
             state.current_sql = result.data.get("sql", "")
             state.sql_candidates = result.data.get("candidates", [])
-            # ACT: 记录生成的 SQL
+            # ACT: 记录生成的 SQL（条件校验延后到执行成功后进行）
             state.act(state.current_sql, tool="SQL")
             state.mark_need(need_sql=False, need_execute=True)
             if hasattr(context, "generated_sql"):
@@ -1588,13 +2114,17 @@ FROM 表名 WHERE <全局条件>
 
     async def run_workflow(self, state: ReActState, context: Any) -> None:
         """
-        完整流程：生成 SQL → 执行 → 评估 → (失败时 critique → refine → 重新执行)
-        
-        ReAct 重试循环：
-        1. 生成 SQL
+        完整流程：生成 SQL → 执行 → (失败时 refine → 重新执行) → 执行成功后条件校验 → 再执行
+
+        核心设计：条件校验（AST）延后到 SQL 可执行之后再做。
+        因为 LLM 生成的 SQL 可能有语法错误（如括号不匹配），AST 解析会失败。
+        让数据库 + refine 先修好语法，再用 AST 做条件完整性校验。
+
+        流程：
+        1. LLM 生成 SQL
         2. 执行 SQL
-        3. 执行失败 → critique → refine → 重新执行（最多 max_refine 次）
-        4. 执行成功 → 结束
+        3. 执行失败 → refine → 重新执行（最多 max_refine 次）
+        4. 执行成功 → 条件校验/注入 → 如果 SQL 变了则再执行一次
         """
         max_refine = 3
         
@@ -1606,7 +2136,7 @@ FROM 表名 WHERE <全局条件>
             # 执行 SQL
             await self._execute_sql(state, context)
             
-            # 执行成功，结束
+            # 执行成功 → 直接返回（虚拟字段已在生成阶段替换，无需后置校验）
             if state.has_result:
                 return
             

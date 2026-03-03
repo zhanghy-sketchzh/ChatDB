@@ -1,0 +1,10 @@
+[
+  {
+    "id": "drilldown_example",
+    "type": "drilldown",
+    "description": "对上游结果中的某项进行更细粒度的下钻分析",
+    "depends_on": ["{{parent_task_id}}"],
+    "notes": ["筛选: 继承上游的目标项", "下钻维度: 时间/维度更细化"],
+    "sql_template": "SELECT {{drilldown_dimension}}, {{aggregation}}({{metric}}) AS {{alias}} FROM {{table}} WHERE {{parent_filter}} AND {{conditions}} GROUP BY {{drilldown_dimension}} ORDER BY {{sort_column}} {{sort_direction}}"
+  }
+]

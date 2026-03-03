@@ -1,16 +1,15 @@
 """
 SummarizeAnswerTool - 总结回答工具
 
-根据查询结果生成自然语言总结。
+根据多阶段分析结果生成自然语言总结。
 
 适用场景：
-- 查询已完成，需要生成用户可读的总结
-- 需要整合多个分析结果
+- 多阶段分析计划执行完毕后，整合所有任务结果生成最终回答
+- 单任务场景视为"一个阶段"的多阶段汇总，统一走同一条路径
 
 输入：
 - user_query: 用户原始问题
-- rows: 查询结果
-- analysis_results: 分析结果（可选）
+- summary_context: 多阶段分析结果汇总文本
 
 输出：
 - summary: 自然语言总结
@@ -21,7 +20,6 @@ from typing import Any, TYPE_CHECKING
 from chatdb.tools.base import BaseTool, ToolMetadata, ToolParameter, ToolResult
 from chatdb.llm.base import BaseLLM
 from chatdb.utils.logger import get_component_logger
-from chatdb.utils.common import format_rows
 
 if TYPE_CHECKING:
     from chatdb.core.react_state import ReActState
@@ -33,20 +31,21 @@ class SummarizeAnswerTool(BaseTool):
     总结回答工具
     
     核心能力：
-    - 根据查询结果生成自然语言总结
-    - 整合多个分析结果
-    - 突出关键数据
+    - 根据多阶段分析结果生成自然语言总结
+    - 整合多个任务的 SQL 和查询结果
+    - 突出关键数据，结构化呈现
+    
+    设计：单任务 = 一个阶段的多阶段汇总，统一入口。
     """
     
     def __init__(self, llm: BaseLLM):
         metadata = ToolMetadata(
             name="summarize_answer",
-            description="根据查询结果生成自然语言总结，回答用户问题",
+            description="根据多阶段分析结果生成自然语言总结，回答用户问题",
             category="analysis",
             inputs={
                 "user_query": {"type": "str", "description": "用户原始问题"},
-                "rows": {"type": "list", "description": "查询结果"},
-                "analysis_results": {"type": "list", "description": "分析结果（可选）"},
+                "summary_context": {"type": "str", "description": "多阶段分析结果汇总文本"},
             },
             outputs={
                 "summary": {"type": "str", "description": "自然语言总结"},
@@ -64,11 +63,10 @@ class SummarizeAnswerTool(BaseTool):
     
     @property
     def description(self) -> str:
-        return """总结回答工具：根据查询结果生成自然语言总结。
+        return """总结回答工具：根据多阶段分析结果生成自然语言总结。
 
 使用场景：
-- 查询已完成，需要生成用户可读的总结
-- 需要整合多个分析结果
+- 分析计划执行完毕后，整合所有任务结果生成最终回答
 
 输出：
 - 简洁的自然语言总结，突出关键数据"""
@@ -77,75 +75,22 @@ class SummarizeAnswerTool(BaseTool):
     def parameters(self) -> list[ToolParameter]:
         return [
             ToolParameter(name="user_query", type="string", description="用户问题"),
-            ToolParameter(name="rows", type="array", description="查询结果"),
-            ToolParameter(name="analysis_results", type="array", description="分析结果", required=False),
+            ToolParameter(name="summary_context", type="string", description="多阶段分析结果汇总文本"),
         ]
     
-    async def execute(
-        self,
-        user_query: str,
-        rows: list[dict],
-        analysis_results: list[dict] | None = None,
-        **kwargs: Any,
-    ) -> ToolResult:
-        """生成总结"""
-        self._log.info("生成总结...")
-        
-        # 空结果处理
-        if not rows or len(rows) == 0:
-            return ToolResult.ok(
-                data={"summary": "查询未返回结果。"},
-                message="空结果",
-            )
-        
-        try:
-            # 构建 prompt
-            prompt = f"""用户问题: {user_query}
-
-查询结果（共 {len(rows)} 行，前 {min(10, len(rows))} 行）:
-{format_rows(rows[:10])}"""
-            
-            # 添加分析结果
-            if analysis_results:
-                for ar in analysis_results:
-                    dim = ar.get("dimension", "")
-                    ar_rows = ar.get("rows", [])
-                    if ar_rows:
-                        sub = format_rows(ar_rows[:5])
-                        prompt += f"\n\n按维度「{dim}」拆解（共 {ar.get('row_count', len(ar_rows))} 类）:\n{sub}"
-            
-            prompt += "\n\n请用简洁的语言总结，突出关键数据；若有拆解结果请结合说明。"
-            
-            response = await self.llm.chat(
-                prompt=prompt,
-                system_prompt="你是数据分析专家，请简洁回答。",
-                caller_name="summarize_answer",
-            )
-            
-            return ToolResult.ok(
-                data={"summary": response.strip()},
-                message="总结完成",
-            )
-        
-        except Exception as e:
-            self._log.error(f"总结失败: {e}")
-            summary = f"查询返回 {len(rows)} 行结果。"
-            return ToolResult.ok(
-                data={"summary": summary},
-                message="使用默认总结",
-            )
-    
-    async def summarize_multi_stage(
+    async def summarize(
         self,
         user_query: str,
         summary_context: str,
     ) -> ToolResult:
-        """多阶段分析结果汇总
+        """生成多阶段分析结果汇总
         
         将多个任务阶段的描述、SQL、查询结果整合后，
         让 LLM 综合所有分支的数据生成最终回答。
+        
+        单任务场景也走此路径（一个阶段 = 一个任务的结果）。
         """
-        self._log.info("生成多阶段汇总...")
+        self._log.info("生成分析结果汇总...")
         
         try:
             prompt = f"""{summary_context}
@@ -154,27 +99,43 @@ class SummarizeAnswerTool(BaseTool):
 
 请根据以上所有阶段的查询结果，综合回答用户的问题。
 
-要求：
-1. 整合所有阶段的数据，一段话给出完整、准确、精简的回答
-2. 用结构化的方式呈现（如表格、列表），突出关键数据
-3. 如果不同阶段的数据有关联关系（如先查 Top3 产品，再查各产品明细），要把它们关联起来呈现
-4. 数据要具体到数字，不要笼统概括"""
+## 输出要求
+
+### 内容准确性
+- **只使用查询结果中实际存在的数据**，严禁编造、推测或补充查询结果中没有的数字
+- 数据要具体到数字，不要笼统概括
+- 如果不同阶段的数据有关联关系（如先查 Top3 产品，再查各产品明细），要把它们关联起来呈现
+
+### 数据质量
+- 查询结果中维度列值为 None、NULL、null、空字符串的行可能是无效/未分类数据，在回答中应单独标注或排除
+- 不要将无效数据作为正常的分类维度值参与分析和排名
+
+### 呈现格式
+- 用结构化的方式呈现（如表格、列表），突出关键数据
+- 一段话给出完整、准确、精简的回答
+- 如果有多个阶段，先总述结论，再分阶段展开关键细节
+
+### 单位换算
+- 如果上文提供了「指标单位说明」（含 display_divisor 和 unit），**所有阶段的同一指标必须统一使用相同的换算规则**
+- display_divisor 的含义：将查询结果的原始数值**除以** display_divisor 后，以 unit 为单位展示
+  - 例：display_divisor=100000000, unit=亿元 → 原始值 52613134466 应展示为 526.13 亿元
+- 严禁对已经换算过的数值重复换算，也严禁遗漏换算。同一指标在不同阶段中的数值量级应一致"""
 
             response = await self.llm.chat(
                 prompt=prompt,
-                system_prompt="你是数据分析专家。请基于多阶段查询结果，综合回答用户问题。回答要准确、完整、结构清晰。",
-                caller_name="summarize_multi_stage",
+                system_prompt="你是数据分析专家。请基于查询结果综合回答用户问题。回答要准确、完整、结构清晰。严格基于数据回答，不得编造数据。",
+                caller_name="summarize_answer",
             )
             
             return ToolResult.ok(
                 data={"summary": response.strip()},
-                message="多阶段汇总完成",
+                message="汇总完成",
             )
         
         except Exception as e:
-            self._log.error(f"多阶段汇总失败: {e}")
+            self._log.error(f"汇总失败: {e}")
             return ToolResult.ok(
-                data={"summary": f"多阶段分析已完成，但汇总生成失败: {e}"},
+                data={"summary": f"分析已完成，但汇总生成失败: {e}"},
                 message="汇总失败",
             )
 
@@ -184,33 +145,18 @@ class SummarizeAnswerTool(BaseTool):
         context: "AgentContext",
         **kwargs: Any,
     ) -> None:
-        """ReAct 模式执行：直接修改 state"""
+        """ReAct 模式执行：直接修改 state
         
-        # ★ 多阶段汇总模式：extra_context 包含多阶段分析结果时使用
-        extra_context = getattr(state, "extra_context", "")
-        if extra_context and extra_context.startswith("## 多阶段分析结果汇总"):
-            self._log.info("检测到多阶段分析结果，使用多阶段汇总模式")
-            result = await self.summarize_multi_stage(
-                user_query=state.user_query,
-                summary_context=extra_context,
-            )
-            if result.success:
-                state.summary = result.data.get("summary", "")
+        统一入口：通过 state.extra_context 传入多阶段分析结果汇总文本。
+        """
+        summary_context = getattr(state, "extra_context", "")
+        if not summary_context:
+            self._log.warn("无 extra_context，跳过汇总")
             return
         
-        # 单任务模式：使用原有逻辑
-        rows = state.execute_result.get("rows", []) if state.execute_result else []
-        
-        # 获取分析结果
-        analysis_results = None
-        if state.analysis_slices:
-            analysis_results = [s.to_dict() for s in state.analysis_slices]
-        
-        result = await self.execute(
+        result = await self.summarize(
             user_query=state.user_query,
-            rows=rows,
-            analysis_results=analysis_results,
+            summary_context=summary_context,
         )
-        
         if result.success:
             state.summary = result.data.get("summary", "")

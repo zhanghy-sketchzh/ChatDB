@@ -85,6 +85,11 @@ class DuckDBConnector:
         sql = sql.rstrip().rstrip(';')
         with self._engine.connect() as conn:
             result = conn.execute(text(sql), params or {})
+            # DDL 语句（CREATE/DROP/ALTER）需要显式 commit，否则 SQLAlchemy 2.0
+            # 的 autobegin 模式会在退出 with 时回滚，导致其他连接看不到新建的表
+            sql_upper = sql.lstrip().upper()
+            if sql_upper.startswith(("CREATE ", "DROP ", "ALTER ", "INSERT ", "UPDATE ", "DELETE ")):
+                conn.commit()
             rows = result.fetchall()
             columns = result.keys()
             return [dict(zip(columns, row)) for row in rows]
@@ -131,6 +136,9 @@ class DuckDBConnector:
             # 获取所有表名
             tables_result = conn.execute(text("SHOW TABLES"))
             tables = [row[0] for row in tables_result.fetchall()]
+            
+            # ★ 过滤掉临时表（temp_ 开头），只返回源表元数据
+            tables = [t for t in tables if not t.startswith("temp_")]
             
             for table_name in tables:
                 # 获取表结构
@@ -188,6 +196,54 @@ class DuckDBConnector:
         """异步获取数据库中所有表的元数据"""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(self._executor, self.get_tables_meta)
+
+    def get_column_stats(self, table_name: str, top_k: int = 10) -> list[dict[str, Any]]:
+        """实时计算指定表每列的描述统计。
+
+        委托 ColumnStatsProvider 完成全量扫描。
+
+        Returns:
+            [{"name": str, "type": str, "null_pct": float, "unique_count": int,
+              "summary": str, "stats": {...} | None}, ...]
+        """
+        if self._engine is None:
+            raise ConnectionError("数据库未连接，请先调用 connect() 方法")
+
+        from chatdb.database.column_stats_provider import ColumnStatsProvider
+
+        def _exec_sync(sql: str) -> list[dict[str, Any]]:
+            return self._execute_sync(sql)
+
+        provider = ColumnStatsProvider(execute_fn=_exec_sync, top_k=top_k)
+        stats = provider.scan_table(table_name)
+        return ColumnStatsProvider.stats_to_dicts(stats)
+
+    def get_column_stats_objects(self, table_name: str, top_k: int = 10) -> list:
+        """实时扫描指定表，返回 ColumnStats 对象列表（供格式化使用）。"""
+        if self._engine is None:
+            raise ConnectionError("数据库未连接，请先调用 connect() 方法")
+
+        from chatdb.database.column_stats_provider import ColumnStatsProvider
+
+        def _exec_sync(sql: str) -> list[dict[str, Any]]:
+            return self._execute_sync(sql)
+
+        provider = ColumnStatsProvider(execute_fn=_exec_sync, top_k=top_k)
+        return provider.scan_table(table_name)
+
+    async def get_column_stats_async(self, table_name: str, top_k: int = 10) -> list[dict[str, Any]]:
+        """异步版本的 get_column_stats"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor, self.get_column_stats, table_name, top_k,
+        )
+
+    async def get_column_stats_objects_async(self, table_name: str, top_k: int = 10) -> list:
+        """异步版本的 get_column_stats_objects"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor, self.get_column_stats_objects, table_name, top_k,
+        )
 
     async def __aenter__(self) -> "DuckDBConnector":
         await self.connect()

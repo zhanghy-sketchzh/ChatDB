@@ -44,6 +44,7 @@ class SemanticParseTool(BaseTool):
         self,
         llm: BaseLLM,
         yml_config: str | Path | None = None,
+        skill_registry: Any = None,
     ):
         metadata = ToolMetadata(
             name="semantic_parse",
@@ -70,6 +71,7 @@ class SemanticParseTool(BaseTool):
         self.llm = llm
         self.yml_config_path = Path(yml_config) if yml_config else None
         self._log = get_component_logger("SemanticParseTool")
+        self._skill_registry = skill_registry  # SkillRegistry 实例（可选）
         
         # 延迟导入避免循环依赖
         self._parser_agent = None
@@ -102,7 +104,10 @@ class SemanticParseTool(BaseTool):
         """延迟初始化 SemanticParser"""
         if self._parser_agent is None:
             from chatdb.agents.semantic_parser import SemanticParser
-            self._parser_agent = SemanticParser(self.llm, self.yml_config_path)
+            self._parser_agent = SemanticParser(
+                self.llm, self.yml_config_path,
+                skill_registry=self._skill_registry,
+            )
         return self._parser_agent
     
     async def execute(
@@ -112,6 +117,8 @@ class SemanticParseTool(BaseTool):
         table_name: str = "",
         available_tables: list[dict] | None = None,
         chat_history: list[dict[str, str]] | None = None,
+        column_stats_map: dict[str, list[dict]] | None = None,
+        relevant_columns: dict[str, list[str]] | None = None,
         **kwargs: Any,
     ) -> ToolResult:
         """执行语义解析"""
@@ -129,6 +136,8 @@ class SemanticParseTool(BaseTool):
             )
             context.available_tables = available_tables or []  # type: ignore[attr-defined]
             context.selected_tables = [table_name] if table_name else []  # type: ignore[attr-defined]
+            context.column_stats_map = column_stats_map or {}  # type: ignore[attr-defined]
+            context.relevant_columns = relevant_columns or {}  # type: ignore[attr-defined]
             
             # 调用 parser agent
             parser = self._get_parser()
@@ -161,13 +170,33 @@ class SemanticParseTool(BaseTool):
         
         state.phase = ReActPhase.SEMANTIC_PARSE
 
-        # 检索增强：将 schema 召回结果追加到 schema_text
-        schema_text = state.schema_text
+        # ★ schema_text 不再携带原始表列结构（避免 temp 表、源表列信息污染 prompt）
+        #   v2（有 YAML）：prompt 中已有 虚拟字段定义 + column_stats，不需要原始列信息
+        #   v1（无 YAML）：_extract_intent_from_schema 通过 tables_meta 获取列信息
+        schema_text = ""
+
+        # 表理解文本：注入 LLM 生成的表业务说明
+        table_understanding = getattr(state, "table_understanding", "")
+        if table_understanding:
+            schema_text = f"## 表业务说明\n{table_understanding}"
+
         rc = getattr(state, "retrieval_context", None)
-        if rc is not None and hasattr(rc, "format_schema_hint"):
-            schema_hint = rc.format_schema_hint()
-            if schema_hint:
-                schema_text = f"{schema_text}\n\n{schema_hint}"
+        column_stats_map: dict[str, list[dict]] = {}
+        relevant_columns: dict[str, list[str]] = {}
+        if rc is not None:
+            if hasattr(rc, "format_schema_hint"):
+                schema_hint = rc.format_schema_hint()
+                if schema_hint:
+                    schema_text = f"{schema_text}\n\n{schema_hint}"
+            column_stats_map = getattr(rc, "column_stats_map", {}) or {}
+            relevant_columns = getattr(rc, "relevant_columns", {}) or {}
+        
+        # 虚拟字段检索结果：将召回的虚拟字段信息注入 schema_text
+        vf_retrieval = getattr(state, "retrieved_virtual_fields", None)
+        if vf_retrieval is not None and hasattr(vf_retrieval, "format_prompt_section"):
+            vf_section = vf_retrieval.format_prompt_section()
+            if vf_section:
+                schema_text = f"{schema_text}\n\n{vf_section}"
         
         result = await self.execute(
             user_query=state.user_query,
@@ -175,6 +204,8 @@ class SemanticParseTool(BaseTool):
             table_name=state.table_name or "",
             available_tables=state.available_tables,
             chat_history=context.chat_history or None,
+            column_stats_map=column_stats_map,
+            relevant_columns=relevant_columns,
         )
         
         if result.success:

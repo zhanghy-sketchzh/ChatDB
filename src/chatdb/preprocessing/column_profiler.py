@@ -69,6 +69,9 @@ class ColumnProfile:
 class ColumnProfiler:
     """列摘要生成器"""
     
+    # 被视为缺失的字符串值（大小写敏感匹配原始值）
+    _NULL_STRINGS = {"None", "none", "null", "NULL", "Null", "", "为空", "NA", "N/A", "na", "n/a"}
+    
     def __init__(self, summary_top_k: int = 20):
         """
         Args:
@@ -84,7 +87,9 @@ class ColumnProfiler:
     ) -> ColumnProfile:
         """生成单列摘要"""
         dtype_str = self._get_dtype_str(series.dtype)
-        null_count = int(series.isnull().sum())
+        # ★ 统一缺失判定：SQL NULL / NaN + 字符串 'None'/'null'/''/'为空'
+        null_mask = series.isnull() | series.isin(self._NULL_STRINGS)
+        null_count = int(null_mask.sum())
         null_pct = (null_count / len(series)) * 100 if len(series) > 0 else 0
         unique_count = series.nunique(dropna=True)
         

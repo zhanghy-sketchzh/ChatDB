@@ -1,0 +1,9 @@
+[
+  {
+    "id": "validation_example",
+    "type": "validation",
+    "description": "诊断性查询，检查数据存在性/分布/样例",
+    "notes": ["诊断类型: 值检查/行数统计/字段分布/数据采样"],
+    "sql_template": "SELECT {{columns}} FROM {{table}} WHERE {{conditions}} GROUP BY {{group_columns}} ORDER BY {{sort_column}} LIMIT {{limit}}"
+  }
+]

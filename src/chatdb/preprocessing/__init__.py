@@ -9,7 +9,7 @@
 """
 
 from chatdb.preprocessing.column_profiler import ColumnProfile, ColumnProfiler
-from chatdb.preprocessing.preprocessor import DataPreprocessor, PreprocessResult
+from chatdb.preprocessing.preprocessor import DataPreprocessor, PreprocessResult, extract_meta_info_from_yml
 from chatdb.preprocessing.schema_builder import DDLSchema, LightSchema, SchemaBuilder
 from chatdb.preprocessing.text_index import BM25Index, IndexDocument, KeywordMatch, SearchResult, TextIndex
 from chatdb.preprocessing.vector_store import (
@@ -43,4 +43,5 @@ __all__ = [
     # Main Preprocessor
     "DataPreprocessor",
     "PreprocessResult",
+    "extract_meta_info_from_yml",
 ]

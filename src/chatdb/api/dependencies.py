@@ -8,7 +8,7 @@ from typing import AsyncGenerator
 
 from chatdb.core import AgentOrchestrator
 from chatdb.utils.config import settings
-from chatdb.database.base import BaseDatabaseConnector, create_connector
+from chatdb.database.base import BaseDatabaseConnector
 from chatdb.database.schema import SchemaInspector
 from chatdb.llm.factory import LLMFactory
 

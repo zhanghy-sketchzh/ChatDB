@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from chatdb import __version__
 from chatdb.api.dependencies import app_state
-from chatdb.api.routes import database_router, health_router, query_router, chat_router
+from chatdb.api.routes import database_router, health_router, query_router, chat_router, agui_router
 from chatdb.utils.config import settings
 from chatdb.utils.logger import logger, setup_logging
 
@@ -77,6 +77,7 @@ def create_app() -> FastAPI:
     app.include_router(chat_router)
     app.include_router(query_router)
     app.include_router(database_router)
+    app.include_router(agui_router)
 
     return app
 

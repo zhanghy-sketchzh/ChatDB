@@ -23,12 +23,7 @@ from chatdb.utils.logger import logger
 from chatdb.database.base import BaseDatabaseConnector
 from chatdb.database.excel.data_processor import DataProcessor
 from chatdb.database.schema import SchemaGenerator
-from chatdb.storage import DataCacheManager
-
-
-# ExcelCacheManager 已迁移到 chatdb.storage.meta_data.DataCacheManager
-# 保留别名以保持向后兼容
-ExcelCacheManager = DataCacheManager
+from chatdb.storage import MetaDataStore
 
 
 class ExcelConnector(BaseDatabaseConnector):
@@ -92,7 +87,7 @@ class ExcelConnector(BaseDatabaseConnector):
         super().__init__(connection_url)
         
         if not hasattr(self, "_initialized"):
-            self.cache_manager = DataCacheManager()
+            self.cache_manager = MetaDataStore()
             self.llm_client = llm_client
             self.model_name = model_name
 
@@ -265,7 +260,7 @@ class ExcelConnector(BaseDatabaseConnector):
                 raise ValueError(f"指定的sheet都不存在。可用的sheet: {all_sheet_names}")
 
         # 计算文件级别的哈希
-        file_hash = DataCacheManager.calculate_file_hash(excel_file_path, target_sheets)
+        file_hash = MetaDataStore.calculate_file_hash(excel_file_path, target_sheets)
         
         # 去除 Excel 文件的筛选状态
         excel_file_path = self.data_processor.remove_excel_filters(excel_file_path)

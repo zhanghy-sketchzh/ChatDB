@@ -46,8 +46,16 @@ class LLMSettings(BaseSettings):
     )
     hunyuan_model: str = Field(default="hunyuan-t1-latest", description="混元模型名称")
 
+    # Venus 代理平台（支持 GLM、Qwen 等模型，OpenAI 兼容协议）
+    venus_api_key: str = Field(default="", description="Venus 代理 Token")
+    venus_api_base: str = Field(
+        default="http://v2.open.venus.oa.com/llmproxy",
+        description="Venus API Base URL",
+    )
+    venus_model: str = Field(default="glm-5", description="Venus 模型名称")
+
     # 默认提供商
-    default_llm_provider: Literal["openai", "anthropic", "hunyuan"] = Field(
+    default_llm_provider: Literal["openai", "anthropic", "hunyuan", "venus"] = Field(
         default="openai", description="默认 LLM 提供商"
     )
 
@@ -59,6 +67,14 @@ class LLMSettings(BaseSettings):
             "api_base": self.hunyuan_api_base,
             "enable_enhancement": False,
             "sensitive_business": True,
+        }
+
+    def get_venus_params(self) -> dict:
+        """获取 Venus 代理平台的参数字典"""
+        return {
+            "model": self.venus_model,
+            "api_key": self.venus_api_key,
+            "api_base": self.venus_api_base,
         }
 
 
@@ -202,6 +218,13 @@ def get_settings() -> Settings:
                 settings.llm.hunyuan_api_base = llm_config["hunyuan_api_base"]
             if llm_config.get("hunyuan_model"):
                 settings.llm.hunyuan_model = llm_config["hunyuan_model"]
+            
+            if llm_config.get("venus_api_key"):
+                settings.llm.venus_api_key = llm_config["venus_api_key"]
+            if llm_config.get("venus_api_base"):
+                settings.llm.venus_api_base = llm_config["venus_api_base"]
+            if llm_config.get("venus_model"):
+                settings.llm.venus_model = llm_config["venus_model"]
             
             if llm_config.get("default_llm_provider"):
                 settings.llm.default_llm_provider = llm_config["default_llm_provider"]

@@ -120,6 +120,10 @@ class TableConfigLoader:
         with open(self.config_path, "r", encoding="utf-8") as f:
             self._raw = yaml.safe_load(f) or {}
         
+        # 预处理：展开模板、表驱动生成 metric_* 筛选器
+        from chatdb.config.metrics_loader import preprocess_yaml_config
+        self._raw = preprocess_yaml_config(self._raw)
+        
         self._meta = self._raw.get("meta", {})
         self._parse_business_terms()
         self._parse_filters()
@@ -137,8 +141,9 @@ class TableConfigLoader:
                 synonyms=item.get("synonyms", []),
                 description=item.get("description", ""),
                 related_dimensions=item.get("related_dimensions", []),
-                related_filters=item.get("related_filters", []),
-                related_metrics=item.get("related_metrics", []),
+                # 兼容 v1.2 的 "filters" 和旧版 "related_filters"
+                related_filters=item.get("filters", []) or item.get("related_filters", []),
+                related_metrics=item.get("metrics", []) or item.get("related_metrics", []),
                 example_nl=item.get("example_nl", ""),
             )
             self._business_terms[term.id] = term
@@ -193,23 +198,32 @@ class TableConfigLoader:
             ex = Example(
                 id=item.get("id", ""),
                 query=item.get("query", ""),
-                business_terms=item.get("business_terms", []),
+                # 兼容 v1.2 的 "terms" 和旧版 "business_terms"
+                business_terms=item.get("terms", []) or item.get("business_terms", []),
                 dimensions=item.get("dimensions", []),
                 filters=item.get("filters", []),
-                sql=item.get("sql", ""),
-                explanation=item.get("explanation", ""),
+                sql=item.get("sql", item.get("sql_hint", "")),
+                explanation=item.get("explanation", item.get("note", "")),
             )
             self._examples.append(ex)
     
     def _parse_rules(self) -> None:
-        """解析规则"""
-        for item in self._raw.get("rules", []):
+        """解析规则（兼容 v1 list 和 v2 dict 格式）"""
+        raw_rules = self._raw.get("rules", [])
+        # v2 格式是 dict，跳过旧版解析
+        if isinstance(raw_rules, dict):
+            return
+        for item in raw_rules:
+            # match_pattern 可能是字符串或列表，统一转为字符串供旧 API 兼容
+            mp = item.get("match_pattern", "")
+            if isinstance(mp, list):
+                mp = ", ".join(mp)
             r = Rule(
                 id=item.get("id", ""),
                 type=item.get("type", ""),
                 description=item.get("description", ""),
-                match_pattern=item.get("match_pattern", ""),
-                default_value=item.get("default_value", ""),
+                match_pattern=mp,
+                default_value=item.get("default_filter", item.get("default_metric", item.get("default_value", ""))),
                 field=item.get("field", ""),
                 default_filter=item.get("default_filter", ""),
                 must_include=item.get("must_include", ""),
@@ -403,3 +417,127 @@ class TableConfigLoader:
 def load_table_config(config_path: str | Path | None = None) -> TableConfigLoader:
     """加载表级语义配置"""
     return TableConfigLoader(config_path)
+
+
+# ============================================================
+# YML meta 信息格式化（供各 Agent Prompt 注入）
+# ============================================================
+
+def format_yml_meta_for_prompt(yml_config: dict, level: str = "full") -> str:
+    """
+    从 YML 配置的 meta 块中提取关键业务信息，格式化为 Prompt 注入文本。
+
+    Args:
+        yml_config: 完整的 YML 配置字典
+        level: 输出详细程度
+            - "full": 完整信息（用于 table_understanding 生成、SQL 生成）
+            - "summary": 精简摘要（用于 SemanticParser / Planner）
+
+    Returns:
+        格式化后的 meta 信息文本，为空时返回 ""
+    """
+    meta = yml_config.get("meta", {})
+    if not meta:
+        return ""
+
+    lines: list[str] = []
+
+    # ── 1. 表基本信息 ──
+    display_name = meta.get("display_name", "")
+    description = meta.get("description", "")
+    grain = meta.get("grain", "")
+    table_name = meta.get("table_name", "")
+
+    if display_name or description:
+        header = display_name or table_name
+        if description:
+            header = f"{header}：{description}" if header else description
+        lines.append(f"- 表定位: {header}")
+
+    if grain:
+        lines.append(f"- 数据粒度: {grain}")
+
+    value_column = meta.get("value_column", "")
+    if value_column:
+        lines.append(f"- 度量列: {value_column}")
+
+    business_key = meta.get("business_key", [])
+    if business_key:
+        lines.append(f"- 业务主键: {', '.join(business_key)}")
+
+    # ── 2. 报表项层级结构（对理解指标体系至关重要）──
+    hierarchy = meta.get("report_item_hierarchy", {})
+    if hierarchy and level == "full":
+        lines.append("")
+        lines.append("- 报表项层级结构:")
+        _format_hierarchy(hierarchy, lines, indent=2)
+
+    # ── 3. 组织范围说明（从 meta.org_scope 或 rules.canonical_scope 读取）──
+    org_scope = meta.get("org_scope") or meta.get("organization_scope", {})
+    if org_scope:
+        lines.append("")
+        lines.append("- 组织范围:")
+        for scope_name, scope_info in org_scope.items():
+            if isinstance(scope_info, dict):
+                filter_expr = scope_info.get("filter", "")
+                available = scope_info.get("metrics", scope_info.get("available_metrics", ""))
+                detail = f"（筛选: {filter_expr}）" if filter_expr else ""
+                avail_str = f"，可用指标: {available}" if available else ""
+                lines.append(f"    {scope_name}{detail}{avail_str}")
+            else:
+                lines.append(f"    {scope_name}: {scope_info}")
+    else:
+        # v1.2: 从 rules 中提取 canonical_scope
+        rules = yml_config.get("rules", [])
+        scope_rules = [r for r in rules if r.get("type") == "canonical_scope"]
+        if scope_rules:
+            lines.append("")
+            lines.append("- 组织范围:")
+            for r in scope_rules:
+                scope_name = r.get("scope_name", "")
+                filt = r.get("filter", "")
+                avail = r.get("available_metrics", "")
+                detail = f"（筛选: {filt}）" if filt else ""
+                avail_str = f"，可用指标: {avail}" if avail else ""
+                lines.append(f"    {scope_name}{detail}{avail_str}")
+
+    # ── 4. 数据预处理说明（极重要：null 处理等）──
+    data_prep = meta.get("data_preprocessing", "")
+    if data_prep:
+        lines.append("")
+        lines.append(f"- 数据预处理说明: {data_prep.strip()}")
+
+    # ── 5. 注意事项 ──
+    notes = meta.get("notes", "")
+    if notes:
+        lines.append("")
+        lines.append(f"- 重要注意事项:\n{_indent_text(notes.strip(), 4)}")
+
+    if not lines:
+        return ""
+
+    return "\n".join(lines)
+
+
+def _format_hierarchy(data: dict | list | str, lines: list[str], indent: int = 2) -> None:
+    """递归格式化报表项层级结构"""
+    prefix = " " * indent
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, (dict, list)):
+                lines.append(f"{prefix}{key}:")
+                _format_hierarchy(value, lines, indent + 2)
+            else:
+                lines.append(f"{prefix}{key}: {value}")
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                _format_hierarchy(item, lines, indent)
+            else:
+                lines.append(f"{prefix}• {item}")
+
+
+def _indent_text(text: str, spaces: int) -> str:
+    """给多行文本加缩进"""
+    prefix = " " * spaces
+    return "\n".join(f"{prefix}{line}" for line in text.split("\n"))

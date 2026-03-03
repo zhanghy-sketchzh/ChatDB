@@ -43,6 +43,8 @@ dependencies = [
     "loguru>=0.7.0",
     "tenacity>=8.2.0",
     "rich>=13.7.0",
+    "sqlglot>=25.0.0",
+    "ag-ui-protocol>=0.1.13",
 ]
 
 [project.optional-dependencies]

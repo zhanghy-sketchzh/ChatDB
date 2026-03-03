@@ -51,10 +51,6 @@ from chatdb.tools.sql import SQLCandidate, EvaluationResult
 from chatdb.core.react_state import ReActState, ReActPhase, ErrorType
 from chatdb.core.messages import TaskRequest, TaskResponse, TaskResultEntry, PlanDecision
 
-# 别名兼容
-SemanticParserAgent = SemanticParser
-AnalysisStep = AnalysisTask  # 旧名称兼容
-
 __all__ = [
     # 基类
     "BaseAgent",
@@ -70,13 +66,11 @@ __all__ = [
     "PlannerAgent",
     "AnalysisPlan",
     "AnalysisTask",
-    "AnalysisStep",  # 兼容
     "DEFAULT_TASK_TYPES",
     "get_task_types",
     "load_task_types_from_config",
     # 语义解析（前置 workflow，含查询改写）
     "SemanticParser",
-    "SemanticParserAgent",
     "StructuredIntent",
     # SQL 数据类
     "SQLCandidate",

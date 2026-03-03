@@ -1,0 +1,9 @@
+[
+  {
+    "id": "trend_example",
+    "type": "trend",
+    "description": "按时间粒度聚合指标，观察时间变化趋势",
+    "notes": ["时间粒度: 根据需求选择", "排序: 按时间升序"],
+    "sql_template": "SELECT {{time_column}}, {{aggregation}}({{metric_column}}) AS {{alias}} FROM {{table}} WHERE {{conditions}} GROUP BY {{time_column}} ORDER BY {{time_column}} ASC"
+  }
+]

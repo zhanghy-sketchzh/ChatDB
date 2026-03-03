@@ -4,13 +4,14 @@ PlannerAgent：规划决策 Agent，将用户问题拆解为数据分析任务�
 核心理念：让 LLM 做智能决策，减少规则层复杂度
 
 职责划分：
-- SemanticParser: 提取"用户想查什么"（metrics, dimensions, conditions）
-- Planner: 决定"怎么分析"（TaskType + 具体参数：comparison, order_by, limit 等）
+- SemanticParser: 提取"用户想查什么"（metrics 目录, dimensions, 通用 conditions）+ task_type
+- Planner: 决定"怎么分析"（per-task 指标分配 + TaskType + 具体参数）
+  ★ 每个子任务通过 metric 字段指定使用的指标 ID，指标的专属筛选条件由下游自动注入
 
 流程：
-1. 接收 SemanticParser 输出的 StructuredIntent
-2. 根据用户问题 + 意图，推断分析场景（TaskType）
-3. 生成分析计划（tasks DAG）
+1. 接收 SemanticParser 输出的 StructuredIntent（含全局指标目录和通用条件）
+2. 根据用户问题 + 意图，生成分析计划（tasks DAG）
+3. 每个 task 独立分配 metric，避免全局指标/条件冲突
 """
 
 import json
@@ -368,7 +369,8 @@ class PlannerAgent(BaseAgent):
     - 直接使用 Intent.task_type，避免二次推断不一致
     """
 
-    def __init__(self, llm: BaseLLM, **kwargs: Any):
+    def __init__(self, llm: BaseLLM, skill_registry: Any = None,
+                 db_connector: Any = None, **kwargs: Any):
         super().__init__(
             name="Planner",
             llm=llm,
@@ -378,6 +380,8 @@ class PlannerAgent(BaseAgent):
         self._analysis_plan: Optional[AnalysisPlan] = None
         self._data_constraints: dict[str, Any] = {}
         self._analysis_approach: str = ""  # LLM 生成的分析思路
+        self._skill_registry = skill_registry  # SkillRegistry 实例（可选）
+        self._db_connector = db_connector  # 数据库连接器（用于实时获取列统计）
 
     def clear_history(self) -> None:
         self._analysis_plan = None
@@ -412,7 +416,11 @@ class PlannerAgent(BaseAgent):
 
         # === 从 Intent 获取 task_types（由 SemanticParser 识别）===
         task_types: list[TaskType] = []
+        seen: set[str] = set()
         for ts in state.intent.task_types:
+            if ts in seen:
+                continue
+            seen.add(ts)
             try:
                 task_types.append(TaskType(ts))
             except ValueError:
@@ -451,9 +459,9 @@ class PlannerAgent(BaseAgent):
         
         intent = state.intent
         intent_summary = {
-            "metrics": intent.metrics,
+            "available_metrics": intent.metrics,  # 用户想查的指标目录（需在 tasks 中 per-task 分配）
             "dimensions": intent.dimensions,
-            "conditions": intent.conditions,
+            "global_conditions": intent.conditions,  # 通用筛选条件（自动应用到所有子任务）
             "task_types": [t.value for t in task_types],
         }
 
@@ -463,6 +471,9 @@ class PlannerAgent(BaseAgent):
         
         # 检索增强上下文（来自 ContextRetriever）
         retrieval_section = self._build_retrieval_section(state)
+        
+        # 虚拟字段检索召回（来自 VirtualFieldRetriever）
+        vf_retrieval_section = self._build_vf_retrieval_section(state)
         
         # ★ 根据任务类型选择对应的 Prompt 模板（复合类型时拼接所有相关模板）
         task_specific_prompt = "\n\n---\n\n".join(
@@ -516,6 +527,7 @@ class PlannerAgent(BaseAgent):
 {yml_info or "（无）"}
 
 {retrieval_section}
+{vf_retrieval_section}
 ---
 
 {task_specific_prompt}
@@ -531,9 +543,11 @@ class PlannerAgent(BaseAgent):
     {{
       "id": "唯一标识",
       "type": "{type_placeholder}",
+      "metric": "指标ID（字符串或列表，ratio 用列表如 [\"分子指标\", \"分母指标\"]）",
       "description": "完整的分析指令",
       "depends_on": [],
-      "notes": ["执行提示"]
+      "notes": ["执行提示"],
+      "virtual_fields": ["该子任务需要的虚拟字段 ID 列表（condition/column/metric 均可）"]
     }}
   ]
 }}
@@ -545,19 +559,57 @@ class PlannerAgent(BaseAgent):
 3. 复杂问题最多 3-5 个任务
 4. 不要使用 validation/clarify 类型（执行时遇到问题才用）
 5. **type 决定下游 SQL 引擎的行为模式**，选错会导致 SQL 规则不匹配：
-   - `trend`: 按时间 GROUP BY + ASC → 适合"看随时间变化走势"
-   - `comparison`: LAG/窗口函数计算差值/增长率 → 适合"对比两期差异、找增减幅度最大的项"
-   - `ranking`: ORDER BY + LIMIT → 适合"找 TopN / 最大最小"（基于绝对值排名，不涉及变化量计算）
-   - `source`: 按维度 GROUP BY + DESC → 适合"按XX拆解构成/贡献"（**仅单期**，不涉及变化量计算）
-   - `ratio`: CASE WHEN 算占比 → 适合"占多少比例"
-   - `basic`: 简单聚合
+{self._get_type_rules_text(task_types)}
+
+## ★ 任务合并原则
+**核心思想**：能用一条 SQL 完成的分析，绝不拆成多条。拆任务的唯一理由是下游依赖上游结果。
+- **判断是否需要拆任务的唯一标准**：下游任务是否必须等上游结果出来后才能决定查什么？如果不需要，就应该合并
+
+## ★ 指标分配原则
+每个子任务必须在 `metric` 字段中指定该任务使用的指标 ID：
+- 从「已解析的意图」中的 available_metrics 列表中选择
+- **单指标任务**（basic/ranking/trend 等）：`"metric": "指标ID"`（字符串）
+- **多指标任务**（ratio 等需要分子+分母）：`"metric": ["分子指标ID", "分母指标ID"]`（列表，第一个是分子/主指标，第二个是分母）
+- **★ 优先使用派生指标**：如果「业务配置」中存在 `type: derived` 的指标，且其含义与当前任务一致，应直接使用该派生指标 ID（字符串），而非拆成多个原子指标列表。派生指标自带公式，系统会自动展开并生成正确的表达式
+- 系统会自动为 metric 中列出的**所有**指标注入聚合表达式和专属筛选条件
+- 如果某个任务不需要直接聚合指标（如 meta 类型），metric 可省略
+
+## ★ 虚拟字段分配原则
+每个子任务必须在 `virtual_fields` 字段中列出**该子任务需要用到的所有虚拟字段 ID**：
+- 包含 condition（筛选条件）、column（维度列）、metric（聚合指标）三种类型
+- **★ 只能使用上方「业务配置」和「虚拟字段检索召回」中列出的虚拟字段 ID，严禁自行创造或猜测不存在的 ID**
+- 如果需要的筛选条件没有对应的虚拟字段（如需要 2024 年数据但只有 `time_2025`），在 notes 中用真实列名写条件（如 `"额外筛选: \"年\" = 2024"`）
+- scope=required 的字段**必须**包含在每个子任务中
+- 子任务间的 virtual_fields 可以不同（如对比任务的两个子步骤可能用不同的 condition）
+- 系统会根据 virtual_fields 自动注入 WHERE 条件、聚合表达式、维度列
 
 ## ★ 任务隔离原则
 每个任务是独立执行单元，执行者**只能看到自己的 description 和 notes**：
 - **description 只描述当前步骤的动作**，禁止提及后续步骤要做的事
   - ✅ "按年聚合总流水，查看年度趋势"
   - ❌ "按年聚合总流水，找出下降最多的年份并按产品拆解"（越权）
-- **notes 只写当前任务的技术参数**（如时间粒度、排序方向），不要写"后续需要…""用于…"
+- **notes 是传递给 SQL 引擎的技术参数**，用于精确控制 SQL 生成：
+  - ★ **筛选条件优先使用虚拟字段 ID**（而非展开后的真实列名/SQL 表达式）：
+    - ✅ `"筛选: source_actual"` `"筛选: time_2025"` `"筛选: category_mobile"`
+    - ❌ `"筛选: 数据集来源 IN ('一方报表', '投资公司-实际')"` — 禁止展开虚拟字段
+  - ★ **只有当所需条件没有对应的虚拟字段时**，才允许在 notes 中用真实列名写条件：
+    - ✅ `"额外筛选: \"年\" = 2024"` — 没有 time_2024 虚拟字段时的正确写法
+    - ❌ `"筛选: year_2024"` — 禁止发明不存在的虚拟字段 ID
+  - ★ **分组维度必须完整**：如果任务需要多个分组维度，notes 中必须完整列出全部维度。SQL 引擎会严格按 notes 生成 GROUP BY，缺少任何一个维度都会导致数据被错误聚合
+    - ✅ `"分组维度: 年, 国内/海外"` — 明确列出所有需要的维度
+    - ❌ `"分组维度: 国内/海外"` — 遗漏了年份维度，导致多年数据混在一起
+  - 维度：使用虚拟字段 ID（如 `"分组维度: dim_product"`）或真实列名（如 `"分组维度: 考核产品"`）
+  - 排序/限制：`"排序: DESC"` `"LIMIT: 10"`
+  - 时间粒度：`"时间粒度: 月"`
+  - ★ 当子任务需要额外的筛选条件（非全局已有），在 notes 中通过虚拟字段 ID 指出，如 `"额外筛选: source_forecast"`
+  - **理由**：虚拟字段由系统自动展开为正确的 SQL 表达式，Planner 无需关心展开细节，避免手写条件与预定义定义不一致
+- ★ **notes 中严禁包含任何具体数值或上游查询结果数据**：
+  - notes 只能包含筛选条件、维度、排序等结构化指令，数值必须由 SQL 引擎从数据库查询获取
+  - ❌ `"使用已查询出的数据：王者荣耀(52613134466.18802)..."` — 注入具体数值会导致 SQL 引擎硬编码常量，绕过数据库查询
+  - ❌ `"分子为 52613134466"` — 禁止将上游数值传递给下游任务
+  - ✅ `"分子筛选: 考核产品 IN ('王者荣耀', '和平精英', ...)"` — 只描述筛选条件，由 SQL 查询获取数值
+  - **理由**：硬编码数值会绕过虚拟字段系统，导致数据口径不一致和类型溢出；下游任务应通过 depends_on 机制引用上游结果或独立查询
+- 禁止在 notes 中写"后续需要…""用于…"等跨任务描述
 - 任务间衔接通过 depends_on + 上游结果自动传递，无需在描述中提前说明"""
 
         try:
@@ -580,7 +632,7 @@ class PlannerAgent(BaseAgent):
                 self._analysis_approach = approach
 
             self._log.info(f"LLM 生成 {len(tasks_data)} 个任务")
-            plan = self._parse_tasks(tasks_data) if tasks_data else None
+            plan = self._parse_tasks(tasks_data, state=state) if tasks_data else None
             
             return plan
 
@@ -590,140 +642,61 @@ class PlannerAgent(BaseAgent):
 
     def _get_task_specific_prompt(self, task_type: TaskType) -> str:
         """
-        根据任务类型返回特定的 Prompt 模板
+        根据任务类型返回特定的 Prompt 模板。
         
-        每种任务类型有其特定的执行要点、SQL 模式和适用场景。
-        类型选择直接影响下游 SQL 引擎行为，务必选择最匹配的类型。
+        统一从 SkillRegistry 加载（文件驱动），无 fallback 硬编码。
+        如果 SkillRegistry 中未找到对应 skill，返回通用的最小模板。
         """
-        prompts = {
-            TaskType.RATIO: """## 占比分析 (ratio)
+        if self._skill_registry:
+            skill_prompt = self._skill_registry.get_planner_prompt(task_type.value)
+            if skill_prompt:
+                return skill_prompt
 
-**适用场景**：计算"A 占 B 的百分比"
-**不适用**：单纯对比增减、排名、趋势
+        # 通用最小模板（仅在 SkillRegistry 不可用或 skill 文件缺失时使用）
+        self._log.warn(f"未找到 skill '{task_type.value}' 的 Planner Prompt，使用通用模板")
+        return f"""## {task_type.label} ({task_type.value})
 
-**SQL 模式**：CASE WHEN 算分子，WHERE 控全局，或 CTE + TOP N
-**核心**：一个 SQL 算出"部分/总体"比例，不要拆成多个任务
-
-**任务示例**：
-```json
-{
-  "id": "ratio_1",
-  "type": "ratio",
-  "description": "计算手游在总流水中的占比，分子=手游流水，分母=总流水",
-  "notes": ["分子条件: 产品大类='手游'", "全局条件: 数据集来源=实际数据"]
-}
-```""",
-
-            TaskType.COMPARISON: """## 对比分析 (comparison)
-
-**适用场景**：需要**计算两期差值或增长率**的分析，包括：
-- 同比/环比对比，计算增长率/变化幅度
-- 找出"下降最多""增长最快""跌幅最大"的项（无论按什么维度分组）
-- 按维度分组后计算各自的变化量并排序
-**不适用**：单纯看走势（用 trend），单纯排名不涉及变化量（用 ranking），单纯拆解构成（用 source）
-
-**SQL 模式**：LAG/LEAD 窗口函数或子查询计算差值、增长率
-
-**★ 核心判断**：只要涉及"变化/增减/跌幅/涨幅/同比/环比"，就必须用 comparison
-- "找出跌幅最大的产品" → comparison（按产品 GROUP BY 两期数据，LAG 算变化量后排序）
-- "哪些产品流水下降最多" → comparison（需要对比两年数据，不是单期拆解）
-- "按产品拆解流水构成" → source（不涉及变化量）
+**说明**：{task_type.description}
 
 **任务示例**：
 ```json
-{
-  "id": "comparison_1",
-  "type": "comparison",
-  "description": "对比2023和2024年各产品流水，找出流水下降幅度最大的产品",
-  "notes": ["对比方式: 同比", "分组维度: 产品", "排序: 按变化值升序取最小", "需要计算差值和增长率"]
-}
-```""",
-
-            TaskType.RANKING: """## 排名分析 (ranking)
-
-**适用场景**：找出 TopN / BottomN，按某个指标排序取极值
-**不适用**：需要计算变化幅度再排序（用 comparison），需要看时间趋势（用 trend）
-
-**SQL 模式**：GROUP BY 维度 + ORDER BY 指标 DESC/ASC + LIMIT N
-
-**任务示例**：
-```json
-{
-  "id": "ranking_1",
-  "type": "ranking",
-  "description": "找出2025年流水最高的5个产品",
-  "notes": ["排序方向: DESC", "限制数量: 5", "分组维度: 产品"]
-}
-```""",
-
-            TaskType.TREND: """## 趋势分析 (trend)
-
-**适用场景**：观察指标随时间的变化走势（逐年/逐月/逐日）
-**不适用**：对比两期差异（用 comparison），按维度拆解（用 source），找极值（用 ranking）
-
-**SQL 模式**：GROUP BY 时间列 + ORDER BY 时间 ASC
-
-**任务示例**：
-```json
-{
-  "id": "trend_1",
-  "type": "trend",
-  "description": "分析2020-2025年手游流水的年度变化趋势",
-  "notes": ["时间粒度: 年", "排序: 按时间升序"]
-}
-```""",
-
-            TaskType.SOURCE: """## 来源分析 (source)
-
-**适用场景**：按维度拆解**单期**的构成，找出主要贡献来源/占比分布
-**不适用**：涉及"变化/增减/跌幅/涨幅"等需要计算两期差值的分析（用 comparison），需要时间趋势（用 trend）
-
-**SQL 模式**：GROUP BY 维度列 + ORDER BY 指标 DESC
-
-**正反例**：
-- "按产品拆解2024年流水构成" → ✅ source（单期绝对值拆解）
-- "找出哪些产品流水下降最多" → ❌ 不是 source，应用 comparison（需要两期数据计算变化）
-
-**任务示例**：
-```json
-{
-  "id": "source_1",
-  "type": "source",
-  "description": "按产品拆解2024年流水构成，找出各产品的流水金额",
-  "notes": ["分组维度: 产品", "排序: 按流水降序"]
-}
-```""",
-
-            TaskType.BASIC: """## 基础查询 (basic)
-
-**适用场景**：简单聚合，获取单一数值
-**不适用**：需要分组、排序、对比、趋势等复杂分析
-
-**SQL 模式**：SELECT SUM/COUNT/AVG(指标) FROM 表 WHERE 条件
-
-**任务示例**：
-```json
-{
-  "id": "basic_1",
-  "type": "basic",
-  "description": "查询2025年手游总流水",
+{{
+  "id": "{task_type.value}_1",
+  "type": "{task_type.value}",
+  "description": "...",
   "notes": []
-}
-```""",
-        }
+}}
+```"""
+
+    def _get_type_rules_text(self, task_types: list[TaskType]) -> str:
+        """
+        生成 type→SQL引擎行为 规则文本。
         
-        return prompts.get(task_type, prompts[TaskType.BASIC])
+        统一从 SkillRegistry 加载，无 fallback 硬编码。
+        """
+        if self._skill_registry:
+            skill_ids = [t.value for t in task_types]
+            rules = self._skill_registry.get_planner_type_rules(skill_ids)
+            if rules:
+                return rules
+
+        # SkillRegistry 不可用时，从 TaskType 的描述生成最小规则
+        lines = []
+        for t in task_types:
+            lines.append(f"   - `{t.value}`: {t.description}")
+        return "\n".join(lines)
 
     def _resolve_filter_refs(self, state: ReActState, filter_refs: list[str]) -> str:
         if not filter_refs:
             return "（无预定义筛选）"
 
-        filters_config = (state.yml_config or {}).get("filters", {})
+        yml = state.yml_config or {}
+        filters_config = yml.get("virtual_fields") or {}
         lines = []
         for fid in filter_refs:
             if fid in filters_config:
                 f = filters_config[fid]
-                label = f.get("label", fid)
+                label = f.get("description") or f.get("label", fid)
                 expr = f.get("expr", "").strip()
                 if expr:
                     expr_short = " ".join(line.strip() for line in expr.split("\n"))[:60]
@@ -745,37 +718,228 @@ class PlannerAgent(BaseAgent):
         if not target:
             return "（无 Schema 信息）"
 
-        lines = [
+        lines = []
+
+        # 表理解文本（LLM 生成的详细业务说明）
+        table_understanding = getattr(state, "table_understanding", "")
+        if table_understanding:
+            lines.append("### 表业务说明")
+            lines.append(table_understanding)
+            lines.append("")
+
+        lines.extend([
             f"表名: {target.get('table_name', 'unknown')}",
             f"行数: {target.get('row_count', 0):,}",
-            "",
-            "列信息:",
-        ]
-        columns = target.get("columns_info") or target.get("columns", [])
-        for col in columns:
-            col_name = col.get("name", col.get("column_name", ""))
-            col_type = col.get("type", col.get("column_type", ""))
-            lines.append(f"  - {col_name} ({col_type})")
+        ])
         return "\n".join(lines)
+
+    # ── decide 阶段：为可选表构建带 schema + 列统计的丰富信息 ──
+
+    async def _build_available_tables_section(
+        self,
+        state: ReActState,
+        collected_results: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> str:
+        """为 Planner decide prompt 构建可选表的详细信息段。
+
+        与 _llm_decide 中原来的简略列表不同，这里复用 ColumnStatsProvider
+        为每张表提供 schema + 列统计（缺失率、唯一值、常见值等），
+        帮助 Planner 做出更精准的 selected_tables 决策。
+        """
+        source_table = state.table_name or ""
+        results_src = collected_results if collected_results is not None else state.temp_results
+
+        # 收集所有可选表名
+        table_names: list[tuple[str, str]] = []  # (表名, 来源描述)
+        if source_table:
+            table_names.append((source_table, "源表"))
+        if results_src:
+            for tid, task_results in results_src.items():
+                for r in task_results:
+                    tt = r.get("_temp_table")
+                    if tt:
+                        table_names.append((tt, f"← 任务 {tid}"))
+
+        if not table_names:
+            return ""
+
+        parts: list[str] = [
+            "## 可选表",
+            "",
+            "**选表提示**：",
+            "- **源表**：包含所有原始列，适合做新的聚合计算（需配合虚拟字段）",
+            "- **临时表**（temp_ 开头）：上游任务的预聚合结果，只包含输出列，**不能使用虚拟字段**",
+            "",
+        ]
+        for tbl_name, origin in table_names:
+            tbl_section = await self._build_table_info_for_decide(
+                tbl_name, origin, state,
+            )
+            parts.append(tbl_section)
+
+        return "\n".join(parts)
+
+    async def _build_table_info_for_decide(
+        self,
+        table_name: str,
+        origin: str,
+        state: ReActState,
+    ) -> str:
+        """为单张表构建 decide prompt 用的精简信息段。
+
+        包含：表名、行数、列信息（类型 + 统计摘要）。
+        复用 ColumnStatsProvider.format_columns 保持与 SQLTool 一致的展示格式。
+        """
+        is_temp = table_name.startswith("temp_")
+        tag = "临时表/预聚合" if is_temp else "源表"
+        header = f'### `"{table_name}"` ({tag}, {origin})'
+
+        # 1. 尝试获取 schema（列名 + 类型 + 行数）
+        schema_info = self._get_table_schema_for_decide(table_name, state)
+        columns = schema_info.get("columns", [])
+        row_count = schema_info.get("row_count", 0)
+
+        if row_count:
+            header += f"  — {row_count:,} 行"
+
+        # 2. 尝试获取实时列统计
+        stats_text = await self._get_column_stats_text(table_name, columns)
+
+        if stats_text:
+            result = f"{header}\n{stats_text}"
+        elif columns:
+            # 无统计时退化为简单列信息
+            col_lines = []
+            for col in columns:
+                col_name = col.get("name", col.get("column_name", ""))
+                col_type = col.get("type", col.get("column_type", ""))
+                col_lines.append(f"  - {col_name} ({col_type})")
+            result = f"{header}\n" + "\n".join(col_lines)
+        else:
+            result = header
+
+        # ★ 临时表追加使用提示
+        if is_temp:
+            result += (
+                "\n  > ⚠️ 临时表是预聚合结果，直接用上述列名查询即可。"
+                "**不要**对临时表使用虚拟字段（virtual_fields 应为空列表）。"
+            )
+
+        return result
+
+    def _get_table_schema_for_decide(
+        self, table_name: str, state: ReActState,
+    ) -> dict[str, Any]:
+        """从 state.available_tables 或 DB 获取表 schema（同步兜底）。"""
+        # 优先从 available_tables 查找
+        for t in (state.available_tables or []):
+            if t.get("table_name") == table_name:
+                return {
+                    "columns": t.get("columns_info") or t.get("columns", []),
+                    "row_count": t.get("row_count", 0),
+                }
+        # 尝试从 DB 实时获取（临时表等场景）
+        if self._db_connector:
+            try:
+                from sqlalchemy import text
+                with self._db_connector._engine.connect() as conn:
+                    desc = conn.execute(text(f'DESCRIBE "{table_name}"'))
+                    cols = [{"name": r[0], "type": r[1]} for r in desc.fetchall()]
+                    cnt = conn.execute(text(f'SELECT COUNT(*) FROM "{table_name}"'))
+                    row_count = cnt.fetchone()[0] or 0
+                    return {"columns": cols, "row_count": row_count}
+            except Exception:
+                pass
+        return {"columns": [], "row_count": 0}
+
+    async def _get_column_stats_text(
+        self, table_name: str, columns: list[dict[str, Any]],
+    ) -> str:
+        """获取实时列统计并格式化为 prompt 文本，失败时返回空字符串。"""
+        if not self._db_connector:
+            return ""
+        try:
+            from chatdb.database.duckdb.duckdb import DuckDBConnector
+            if not isinstance(self._db_connector, DuckDBConnector):
+                return ""
+            stats_dicts = await self._db_connector.get_column_stats_async(table_name)
+            if not stats_dicts:
+                return ""
+
+            from chatdb.database.column_stats_provider import ColumnStatsProvider, ColumnStats
+            stats_objs: list[ColumnStats] = []
+            for d in stats_dicts:
+                cs = ColumnStats(
+                    name=d.get("name", ""),
+                    dtype=d.get("type", ""),
+                    null_pct=d.get("null_pct", 0.0),
+                    unique_count=d.get("unique_count", 0),
+                )
+                stats = d.get("stats")
+                if stats:
+                    cs.min_val = stats.get("min")
+                    cs.max_val = stats.get("max")
+                    cs.mean_val = stats.get("mean")
+                    cs.median_val = stats.get("median")
+                if d.get("top_values"):
+                    cs.top_values = d["top_values"]
+                stats_objs.append(cs)
+
+            return ColumnStatsProvider.format_columns(
+                stats_objs, columns=columns, relevant_cols=None,
+                max_summary_len=80,
+            )
+        except Exception as e:
+            self._log.debug(f"获取列统计失败 ({table_name}): {e}")
+            return ""
 
     def _build_yml_info(self, state: ReActState) -> str:
         if not state.yml_config:
             return ""
 
         lines = []
-        metrics = state.yml_config.get("metrics", {})
-        if metrics:
-            lines.append("可用指标:")
-            for mid, m in list(metrics.items())[:6]:
-                label = m.get("label", mid)
-                expr = m.get("expr") or m.get("agg", "")
-                lines.append(f"  - {mid}: {label}" + (f" = {expr}" if expr else ""))
+        yml = state.yml_config
+        virtual_fields = yml.get("virtual_fields", {})
 
-        dimensions = state.yml_config.get("dimensions", {})
-        if dimensions:
-            lines.append("可用维度:")
-            for did, d in list(dimensions.items())[:8]:
-                lines.append(f"  - {did}: {d.get('label', did)}")
+        if virtual_fields:
+            # v2: 从 virtual_fields 按 field_type 分类展示
+            metric_fields = {k: v for k, v in virtual_fields.items()
+                            if isinstance(v, dict) and v.get("field_type") == "metric"}
+            column_fields = {k: v for k, v in virtual_fields.items()
+                            if isinstance(v, dict) and v.get("field_type") == "column"}
+            condition_fields = {k: v for k, v in virtual_fields.items()
+                               if isinstance(v, dict) and v.get("field_type") == "condition"}
+            
+            if condition_fields:
+                lines.append("可用条件（field_type=condition，用于 WHERE 筛选）:")
+                for cid, c in list(condition_fields.items())[:15]:
+                    desc = c.get("description", cid)
+                    scope = c.get("scope", "optional")
+                    group = c.get("group", "")
+                    syns = c.get("synonyms", [])
+                    scope_str = f" [scope={scope}]" if scope != "optional" else ""
+                    group_str = f" [互斥组: {group}]" if group else ""
+                    syn_str = f" [同义词: {', '.join(syns)}]" if syns else ""
+                    lines.append(f"  - {cid}: {desc}{scope_str}{group_str}{syn_str}")
+                lines.append("  ⚠️ 只能使用上方列出的条件 ID，禁止发明不存在的虚拟字段名")
+            
+            if metric_fields:
+                lines.append("可用指标（field_type=metric，直接在 SQL 中用名称引用）:")
+                for mid, m in list(metric_fields.items())[:12]:
+                    desc = m.get("description", mid)
+                    unit = m.get("unit", "")
+                    syns = m.get("synonyms", [])
+                    unit_str = f" ({unit})" if unit else ""
+                    syn_str = f" [同义词: {', '.join(syns)}]" if syns else ""
+                    lines.append(f"  - {mid}: {desc}{unit_str}{syn_str}")
+            
+            if column_fields:
+                lines.append("可用维度（field_type=column，用于 GROUP BY / ORDER BY）:")
+                for did, d in list(column_fields.items())[:10]:
+                    col = d.get("column", did)
+                    syns = d.get("synonyms", [])
+                    syn_str = f" [同义词: {', '.join(syns)}]" if syns else ""
+                    lines.append(f'  - {did}: {d.get("description", did)} → 列名 `{col}`{syn_str}')
 
         return "\n".join(lines)
 
@@ -804,12 +968,47 @@ class PlannerAgent(BaseAgent):
 
         return "\n\n".join(parts)
 
-    def _parse_tasks(self, tasks_data: list[dict]) -> Optional[AnalysisPlan]:
+    @staticmethod
+    def _build_vf_retrieval_section(state: ReActState) -> str:
+        """构建虚拟字段检索召回段（来自 VirtualFieldRetriever）"""
+        vf = getattr(state, "retrieved_virtual_fields", None)
+        if vf is None or not hasattr(vf, "format_prompt_section"):
+            return ""
+        section = vf.format_prompt_section()
+        return section or ""
+
+    def _parse_tasks(self, tasks_data: list[dict], state: ReActState = None) -> Optional[AnalysisPlan]:
         if not tasks_data:
             return None
 
+        # 构建已定义虚拟字段的 ID 集合（用于校验 LLM 输出）
+        known_vf_ids: set[str] = set()
+        if state and state.yml_config:
+            vf_defs = state.yml_config.get("virtual_fields", {})
+            known_vf_ids = {k for k, v in vf_defs.items() if isinstance(v, dict)}
+
         tasks = []
         for i, t in enumerate(tasks_data):
+            meta = t.get("meta", {})
+            # ★ 将 LLM 输出的 per-task metric 存入 meta，供 SQLAgent 消费
+            if "metric" in t and t["metric"]:
+                meta["metric"] = t["metric"]
+            # ★ 将 LLM 输出的 per-task virtual_fields 存入 meta，供下游注入
+            if "virtual_fields" in t and t["virtual_fields"]:
+                raw_vf_ids = t["virtual_fields"]
+                if known_vf_ids:
+                    # 校验：过滤掉不存在的虚拟字段 ID
+                    valid_ids = [vid for vid in raw_vf_ids if vid in known_vf_ids]
+                    invalid_ids = [vid for vid in raw_vf_ids if vid not in known_vf_ids]
+                    if invalid_ids:
+                        task_id = t.get("id", f"task_{i + 1}")
+                        self._log.warn(
+                            f"任务 '{task_id}' 引用了不存在的虚拟字段 {invalid_ids}，已丢弃。"
+                            f"可用字段: {sorted(known_vf_ids)}"
+                        )
+                    meta["virtual_fields"] = valid_ids
+                else:
+                    meta["virtual_fields"] = raw_vf_ids
             raw = {
                 "id": t.get("id") or f"task_{i + 1}",
                 "type": t.get("type", "basic"),
@@ -818,7 +1017,7 @@ class PlannerAgent(BaseAgent):
                 "depends_on": t.get("depends_on", []),
                 "strategy_group": t.get("strategy_group", ""),
                 "priority": t.get("priority", 0),
-                "meta": t.get("meta", {}),
+                "meta": meta,
             }
             tasks.append(AnalysisTask.from_dict(raw))
         return AnalysisPlan(tasks=tasks) if tasks else None
@@ -984,20 +1183,50 @@ class PlannerAgent(BaseAgent):
         if self._analysis_approach:
             approach_section += f"\n## 分析思路\n{self._analysis_approach}\n"
 
+        # ★ 构建全局条件摘要，让 LLM 了解当前生效的筛选条件
+        conditions_section = ""
+        if state.intent and state.intent.conditions:
+            cond_lines = []
+            for c in state.intent.conditions:
+                if c.get("type") == "ref":
+                    cond_lines.append(f"  - [预定义] {c.get('id', '?')}")
+            if cond_lines:
+                conditions_section = "\n## 当前全局筛选条件\n以下条件会自动应用到每个子任务的 SQL WHERE 子句：\n" + "\n".join(cond_lines)
+
+        # ★ 构建下一个待执行任务的详情（notes、指标、类型等）
+        next_task_section = self._build_next_task_section(current_task, state)
+
+        # ★ 构建虚拟字段摘要，让 Planner 了解下游 SQL 会用到的虚拟字段
+        virtual_fields_section = self._build_virtual_fields_section_for_decide(state)
+
+        # ★ 虚拟字段检索召回（补充更多可能相关的虚拟字段）
+        vf_retrieval_section = self._build_vf_retrieval_section(state)
+        if vf_retrieval_section:
+            virtual_fields_section = f"{virtual_fields_section}\n\n{vf_retrieval_section}"
+
         system_prompt = """你是数据分析决策专家。根据执行结果决定下一步。
 关键原则：
 1. 空结果 ≠ 失败，先诊断是 SQL 问题还是数据真的为空
 2. SQL 报错时分析错误信息，用 B（重试）给出修复建议
 3. 数据摘要中已包含查询结果（完整数据或前30行），直接基于这些数据做决策
 4. decision 字段只能是单个字母：A、B、C、D
-5. 选 A 时必须输出 transition_context：基于已完成任务的数据，告诉下一步任务关键发现和应聚焦的条件
+5. 选 A 时必须输出 transition_context + selected_tables
 6. 输出 JSON"""
+
+        # ★ 构建可选表的详细信息（含 schema + 列统计），替代原来的简略列表
+        available_tables_section = await self._build_available_tables_section(
+            state, collected_results,
+        )
 
         prompt = f"""## 用户问题
 {state.user_query}
 {approach_section}
 ## 当前计划状态
 {plan_display}
+{conditions_section}
+{next_task_section}
+{virtual_fields_section}
+{available_tables_section}
 
 {data_summary}
 
@@ -1007,17 +1236,31 @@ class PlannerAgent(BaseAgent):
 
 ## 决策选项
 
-**A. 继续**：结果正常，按计划执行下一任务。**当还有待执行任务（→○）且当前任务数据正常时，必须选此项**
+**A. 继续**：结果正常，按计划执行下一任务。**当还有待执行任务（→○）且当前任务数据正常时，优先选此项**
   - ★ 必须输出 transition_context：总结已完成步骤的关键发现，为下一步提供聚焦建议
-  - transition_context 应包含：(1) 上游数据的关键结论 (2) 下一步应关注/限定的具体条件或范围
-  - 例如：上游发现2024年流水下降最多，下一步对比应只看2023和2024两年的数据，找出哪些产品在2024年跌幅最大
+  - ★ 必须输出 selected_tables：从上方「可选表」中选择下一步子任务需要用到的表名列表
+    - ★ **选表核心原则：源表 vs 临时表的区别**：
+      - **源表**（原始数据表）：包含所有原始列，适合做新的聚合计算（SUM/AVG/COUNT + CASE WHEN 等）
+      - **临时表**（temp_ 开头）：是上游任务的**预聚合结果**，只包含上游 SELECT 输出的列（如产品名、已算好的金额）
+      - ★ 如果下一任务需要**计算新的聚合指标**（如 ratio 需要分子和分母、trend 需要源数据聚合），则**必须包含源表**
+      - ★ 如果下一任务只需要**读取/对比/排序上游已算好的数据**，则**只选临时表即可，不要选源表**
+      - ★ **选了临时表就不需要虚拟字段**：临时表的列已经是最终结果，虚拟字段（如 base_valid_data、total_flow）展开后会引用源表的原始列（如"ieg口径金额-人民币"），这些列在临时表中不存在，会导致报错
+    - ★ **选表决策清单**（按顺序检查）：
+      1. 检查下一任务需要的所有列/维度（从 notes 和 description 中提取）
+      2. 检查上游临时表的 GROUP BY 是否已包含这些维度 → 如果**全部包含**，选临时表
+      3. 如果临时表**缺少必要维度**（如需要按年对比但临时表没有年份列），则选源表+虚拟字段
+      4. 简单判断：查看上游 SQL 的 GROUP BY，如果包含下一步需要的所有列，选临时表；否则选源表
+    - 仅选必要的表，减少无关上下文干扰
+  - ★ 必须输出 virtual_fields：列出下一步子任务需要用到的**虚拟字段 ID 列表**（condition/column/metric 均可）
+    - ★ **重要**：如果 selected_tables 中**只有临时表（temp_ 开头）**，则 virtual_fields 应为**空列表 []**
+    - ★ 如果 selected_tables 中**包含源表**，则正常列出需要的虚拟字段
 **B. 插入/重试任务**：遇到问题（SQL 错误、数据异常），需要插入 validation 任务或重试失败的任务
 **C. 跳过任务**：前提不成立，跳过部分后续任务
-**D. 结束**：所有任务已完成，可以给出结论。**仅在没有任何待执行任务（→○）时才能选此项**
+**D. 结束**：所有任务已完成，可以给出结论。**仅在没有待执行任务（→○）或剩余任务已无意义时才选此项**
 
 ## 输出格式（decision 字段必须是单个大写字母）
 
-选 A: {{"decision": "A", "reason": "...", "transition_context": "基于上游结果的关键发现 + 下一步应聚焦的条件/范围"}}
+选 A: {{"decision": "A", "reason": "...", "transition_context": "...", "selected_tables": ["表名1", "表名2"], "virtual_fields": ["field_id_1", "field_id_2"]}}
 选 B（插入）: {{"decision": "B", "reason": "...", "adjustment": {{"insert_task": {{"type": "validation", "description": "..."}}}}}}
 选 B（重试）: {{"decision": "B", "reason": "...", "adjustment": {{"retry_task": {{"task_id": "...", "fix_hint": "..."}}}}}}
 选 C: {{"decision": "C", "reason": "...", "adjustment": {{"skip_tasks": ["task_id"]}}}}
@@ -1062,6 +1305,126 @@ class PlannerAgent(BaseAgent):
             self._log.warn(f"决策解析失败: {e}")
         return {"decision": "A", "reason": "解析失败，默认继续"}
 
+    def _build_next_task_section(self, current_task: AnalysisTask, state: ReActState) -> str:
+        """构建下一个待执行任务的详细信息段，让 Planner decide 了解任务上下文。"""
+        if not current_task or current_task.status not in ("pending", "failed"):
+            return ""
+
+        lines = [
+            f"\n## 下一步待执行任务: {current_task.id}",
+            f"- 类型: {current_task.type.value} ({current_task.type.label})",
+            f"- 描述: {current_task.description}",
+        ]
+        if current_task.notes:
+            lines.append("- Planner notes（执行提示）:")
+            for note in current_task.notes:
+                lines.append(f"  - {note}")
+        if current_task.depends_on:
+            lines.append(f"- 依赖: {', '.join(current_task.depends_on)}")
+        # 展示 per-task 指标分配
+        metric = current_task.meta.get("metric")
+        if metric:
+            if isinstance(metric, list):
+                lines.append(f"- 指标: {metric}（多指标，第一个为分子/主指标，第二个为分母）")
+            else:
+                lines.append(f"- 指标: {metric}")
+        # 展示 per-task 虚拟字段分配
+        vf = current_task.meta.get("virtual_fields")
+        if vf and isinstance(vf, list):
+            lines.append(f"- 虚拟字段: {vf}")
+
+        return "\n".join(lines)
+
+    def _build_virtual_fields_section_for_decide(self, state: ReActState) -> str:
+        """构建虚拟字段摘要，让 Planner decide 了解下游 SQL 的筛选机制。
+
+        展示内容：
+        1. 每个预定义虚拟字段的 ID、含义、展开后的 SQL 表达式
+        2. 虚拟字段的作用说明（它们会自动注入到 SQL 的 WHERE 中）
+        """
+        yml_config = state.yml_config
+        if not yml_config:
+            return ""
+
+        virtual_fields = yml_config.get("virtual_fields", {})
+        if not virtual_fields:
+            return ""
+
+        return self._build_virtual_fields_section_v2(state, virtual_fields)
+
+    def _build_virtual_fields_section_v2(self, state: ReActState, virtual_fields: dict) -> str:
+        """v2 版本的虚拟字段摘要（展示完整定义含 field_type/scope/synonyms）"""
+        intent_refs = set()
+        intent_vfs = set()
+        if state.intent:
+            intent_refs = {c["id"] for c in state.intent.conditions if c.get("type") == "ref"}
+            intent_vfs = set(getattr(state.intent, "virtual_fields", []))
+        
+        # 收集活跃的虚拟字段（被 intent 引用 或 scope 为 required/default）
+        active_fields: dict[str, dict] = {}
+        for fid, fdef in virtual_fields.items():
+            if not isinstance(fdef, dict):
+                continue
+            is_active = (
+                fid in intent_refs
+                or fid in intent_vfs
+                or fdef.get("scope") in ("required", "default")
+                or (fid in (state.intent.metrics if state.intent else []))
+            )
+            if is_active:
+                active_fields[fid] = fdef
+
+        if not active_fields:
+            return ""
+        
+        # 按 field_type 分组
+        cond_fields = {k: v for k, v in active_fields.items() if v.get("field_type") == "condition"}
+        metric_fields = {k: v for k, v in active_fields.items() if v.get("field_type") == "metric"}
+        column_fields = {k: v for k, v in active_fields.items() if v.get("field_type") == "column"}
+
+        lines = [
+            "\n## 虚拟字段（Virtual Fields）— 当前查询涉及的预定义字段",
+            "",
+            "以下虚拟字段会被系统自动处理：condition 型注入到 WHERE，metric 型展开为聚合表达式。",
+            "",
+        ]
+        
+        if cond_fields:
+            lines.append("### condition (WHERE 条件)")
+            lines.append("| ID | 描述 | scope | group | synonyms |")
+            lines.append("|-----|------|-------|-------|----------|")
+            for fid, fdef in sorted(cond_fields.items()):
+                syns = ", ".join(fdef.get("synonyms", []))
+                lines.append(
+                    f"| {fid} | {fdef.get('description', '')} "
+                    f"| {fdef.get('scope', 'optional')} | {fdef.get('group', '')} | {syns} |"
+                )
+            lines.append("")
+        
+        if metric_fields:
+            lines.append("### metric (聚合指标)")
+            lines.append("| ID | 描述 | unit | synonyms |")
+            lines.append("|-----|------|------|----------|")
+            for fid, fdef in sorted(metric_fields.items()):
+                syns = ", ".join(fdef.get("synonyms", []))
+                lines.append(
+                    f"| {fid} | {fdef.get('description', '')} "
+                    f"| {fdef.get('unit', '')} | {syns} |"
+                )
+            lines.append("")
+        
+        if column_fields:
+            lines.append("### column (维度列)")
+            lines.append("| ID | 描述 | 真实列名 | synonyms |")
+            lines.append("|-----|------|----------|----------|")
+            for fid, fdef in sorted(column_fields.items()):
+                col = fdef.get("column", fid)
+                syns = ", ".join(fdef.get("synonyms", []))
+                lines.append(f"| {fid} | {fdef.get('description', '')} | `{col}` | {syns} |")
+            lines.append("")
+
+        return "\n".join(lines)
+
     def _detect_issues(self, data_summary: str) -> str:
         """检测执行结果中的问题"""
         if not data_summary or data_summary == "暂无执行结果":
@@ -1096,11 +1459,19 @@ class PlannerAgent(BaseAgent):
         if decision == "A":
             next_task = self._get_next_task(results)
             if next_task:
-                result = {"action": "continue", "task": next_task}
+                result: dict[str, Any] = {"action": "continue", "task": next_task}
                 # ★ 传递承上启下的分析结论，供下游任务参考
                 transition_context = data.get("transition_context", "")
                 if transition_context:
                     result["transition_context"] = transition_context
+                # ★ 传递 LLM 选择的表列表，下游按需注入对应 schema
+                selected_tables = data.get("selected_tables")
+                if selected_tables and isinstance(selected_tables, list):
+                    result["selected_tables"] = selected_tables
+                # ★ 传递 LLM 指定的虚拟字段列表，下游按需注入
+                virtual_fields = data.get("virtual_fields")
+                if virtual_fields and isinstance(virtual_fields, list):
+                    result["virtual_fields"] = virtual_fields
                 return result
             return {"action": "done", "reason": "plan_completed"}
 

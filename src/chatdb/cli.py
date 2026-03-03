@@ -25,12 +25,12 @@ async def interactive_query(query: str, yml_config: str | None = None) -> None:
     """交互式查询"""
     from chatdb.core import AgentOrchestrator
     from chatdb.utils.logger import setup_logging
-    from chatdb.database.base import create_connector
+    from chatdb.database.base import BaseDatabaseConnector
     from chatdb.llm.factory import LLMFactory
 
     setup_logging()
 
-    connector = create_connector()
+    connector = BaseDatabaseConnector.create()
     async with connector:
         llm = LLMFactory.create()
         orchestrator = AgentOrchestrator(

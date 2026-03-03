@@ -1,0 +1,23 @@
+[
+  {
+    "id": "ratio_each",
+    "type": "ratio",
+    "description": "各维度分别占比（CTE 模式1）",
+    "notes": ["模式: 分别占比", "必须使用CTE隔离分组与全局聚合", "NULLIF防除零"],
+    "sql_template": "WITH grouped AS (SELECT {{dimension}}, {{metric}} AS part_value FROM {{table}} WHERE {{conditions}} GROUP BY {{dimension}}), total AS (SELECT {{metric}} AS total_value FROM {{table}} WHERE {{conditions}}) SELECT g.{{dimension}}, g.part_value, t.total_value, ROUND(g.part_value * 100.0 / NULLIF(t.total_value, 0), 2) AS ratio FROM grouped g CROSS JOIN total t ORDER BY g.part_value DESC"
+  },
+  {
+    "id": "ratio_sum",
+    "type": "ratio",
+    "description": "合计占比（CTE 模式2）",
+    "notes": ["模式: 合计占比", "分子加额外筛选条件", "NULLIF防除零"],
+    "sql_template": "WITH part AS (SELECT {{metric}} AS part_value FROM {{table}} WHERE {{conditions}} AND {{numerator_filter}}), total AS (SELECT {{metric}} AS total_value FROM {{table}} WHERE {{conditions}}) SELECT p.part_value, t.total_value, ROUND(p.part_value * 100.0 / NULLIF(t.total_value, 0), 2) AS ratio FROM part p CROSS JOIN total t"
+  },
+  {
+    "id": "ratio_topn",
+    "type": "ratio",
+    "description": "TOP N 占比（CTE 模式3）",
+    "notes": ["模式: TopN占比", "CTE先取TopN再CROSS JOIN全局总值", "NULLIF防除零"],
+    "sql_template": "WITH ranked AS (SELECT {{dimension}}, {{metric}} AS part_value FROM {{table}} WHERE {{conditions}} GROUP BY {{dimension}} ORDER BY part_value DESC LIMIT {{N}}), total AS (SELECT {{metric}} AS total_value FROM {{table}} WHERE {{conditions}}) SELECT r.{{dimension}}, r.part_value, t.total_value, ROUND(r.part_value * 100.0 / NULLIF(t.total_value, 0), 2) AS ratio FROM ranked r CROSS JOIN total t ORDER BY r.part_value DESC"
+  }
+]

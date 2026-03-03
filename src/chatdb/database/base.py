@@ -119,6 +119,10 @@ class BaseDatabaseConnector(ABC):
                 if fetch:
                     rows = result.fetchall()
                     columns = result.keys()
+                    # DDL/DML 语句需要显式 commit，否则 autobegin 退出时会回滚
+                    sql_upper = sql.lstrip().upper()
+                    if sql_upper.startswith(("CREATE ", "DROP ", "ALTER ", "INSERT ", "UPDATE ", "DELETE ")):
+                        await conn.commit()
                     return [dict(zip(columns, row)) for row in rows]
 
                 await conn.commit()
@@ -286,23 +290,4 @@ class BaseDatabaseConnector(ABC):
             return ExcelConnector(**kwargs)
         else:
             raise ValueError(f"不支持的数据库类型: {db_type}")
-
-
-# ==================== 向后兼容函数 ====================
-
-def create_connector(
-    db_type: Literal["postgresql", "mysql", "sqlite", "duckdb", "excel"] | None = None,
-    connection_url: str | None = None,
-    **kwargs,
-) -> BaseDatabaseConnector:
-    """创建数据库连接器实例（向后兼容函数）"""
-    return BaseDatabaseConnector.create(db_type=db_type, connection_url=connection_url, **kwargs)
-
-
-def DatabaseConnector(
-    connection_url: str | None = None,
-    db_type: str | None = None,
-) -> BaseDatabaseConnector:
-    """数据库连接器工厂函数（向后兼容）"""
-    return BaseDatabaseConnector.create(db_type=db_type, connection_url=connection_url)
 

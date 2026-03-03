@@ -12,6 +12,7 @@ from chatdb.llm.anthropic_llm import AnthropicLLM
 from chatdb.llm.base import BaseLLM
 from chatdb.llm.hunyuan_llm import HunyuanLLM
 from chatdb.llm.openai_llm import OpenAILLM
+from chatdb.llm.venus_llm import VenusLLM
 
 
 class LLMFactory:
@@ -21,12 +22,13 @@ class LLMFactory:
         "openai": OpenAILLM,
         "anthropic": AnthropicLLM,
         "hunyuan": HunyuanLLM,
+        "venus": VenusLLM,
     }
 
     @classmethod
     def create(
         cls,
-        provider: Literal["openai", "anthropic", "hunyuan"] | None = None,
+        provider: Literal["openai", "anthropic", "hunyuan", "venus"] | None = None,
         use_config: bool = True,
         **kwargs,
     ) -> BaseLLM:
@@ -46,21 +48,27 @@ class LLMFactory:
         if provider not in cls._providers:
             raise ValueError(f"不支持的 LLM 提供商: {provider}")
 
-        # 如果启用配置且没有提供参数，则从配置中获取
-        if use_config and not kwargs:
+        # 从配置中获取基础参数，再用 kwargs 覆盖
+        if use_config:
+            config_params = {}
             if provider == "hunyuan":
-                kwargs = settings.llm.get_hunyuan_params()
+                config_params = settings.llm.get_hunyuan_params()
             elif provider == "openai":
-                kwargs = {
+                config_params = {
                     "model": settings.llm.openai_model,
                     "api_key": settings.llm.openai_api_key,
                     "api_base": settings.llm.openai_api_base,
                 }
+            elif provider == "venus":
+                config_params = settings.llm.get_venus_params()
             elif provider == "anthropic":
-                kwargs = {
+                config_params = {
                     "model": settings.llm.anthropic_model,
                     "api_key": settings.llm.anthropic_api_key,
                 }
+            # kwargs 覆盖配置值
+            config_params.update(kwargs)
+            kwargs = config_params
 
         return cls._providers[provider](**kwargs)
 

@@ -1,0 +1,9 @@
+[
+  {
+    "id": "comparison_example",
+    "type": "comparison",
+    "description": "对比两期数据，计算差值和增长率",
+    "notes": ["对比方式: 同比/环比", "分组维度: 根据需求", "排序: 按变化值排序", "必须计算差值和增长率"],
+    "sql_template": "SELECT COALESCE(a.{{dimension}}, b.{{dimension}}) AS {{dimension}}, COALESCE(a.{{base_value}}, 0) AS {{base_value}}, COALESCE(b.{{current_value}}, 0) AS {{current_value}}, (COALESCE(b.{{current_value}}, 0) - COALESCE(a.{{base_value}}, 0)) AS delta, ROUND((COALESCE(b.{{current_value}}, 0) - COALESCE(a.{{base_value}}, 0)) * 100.0 / NULLIF(a.{{base_value}}, 0), 2) AS growth_rate FROM ({{base_subquery}}) a FULL OUTER JOIN ({{current_subquery}}) b ON a.{{dimension}} IS NOT DISTINCT FROM b.{{dimension}} ORDER BY {{sort_column}} {{sort_direction}}"
+  }
+]

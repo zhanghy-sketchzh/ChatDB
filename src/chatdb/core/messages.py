@@ -44,6 +44,9 @@ class TaskRequest:
     # 之前已收集的结果快照（只读，用于 drilldown 等需要前置结果的场景）
     previous_results: tuple[dict[str, Any], ...] = ()
 
+    # 上游任务的临时表映射 {task_id: {name: str, columns: list, row_count: int}}
+    upstream_temp_tables: dict[str, Any] = field(default_factory=dict)
+
     @classmethod
     def from_planner_task(
         cls,
@@ -51,6 +54,7 @@ class TaskRequest:
         *,
         parent_results_summary: str = "",
         previous_results: list[dict[str, Any]] | None = None,
+        upstream_temp_tables: dict[str, Any] | None = None,
     ) -> TaskRequest:
         """从 Planner 输出的 task dict 构建"""
         return cls(
@@ -62,6 +66,7 @@ class TaskRequest:
             meta=dict(task_dict.get("meta", {})),
             parent_results_summary=parent_results_summary,
             previous_results=tuple(previous_results or []),
+            upstream_temp_tables=dict(upstream_temp_tables or {}),
         )
 
 
@@ -78,6 +83,8 @@ class TaskResultEntry:
     examples: list[dict[str, Any]] = field(default_factory=list)
     stats: dict[str, Any] = field(default_factory=dict)
     issues: list[str] = field(default_factory=list)
+    # 完整行数据（供临时表创建使用，不参与序列化）
+    all_rows: list[dict[str, Any]] = field(default_factory=list, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {

@@ -22,13 +22,13 @@ DUCKDB_WHERE_GROUPBY = """
 DUCKDB_CTE_NUMERIC_LIMIT = """
 ### CTE、子查询与数值
 - CTE/表别名用英文或拼音；同一 SELECT 不能引用本层别名；禁止 SELECT 中多行子查询，用 JOIN 或窗口函数
-- 数值：ROUND(column, 2)；除零用 NULLIF；比例：ROUND(SUM(CASE WHEN cond THEN 1 ELSE 0 END)*100.0/COUNT(*), 2)
+- 数值：ROUND(column, 2)；除零用 NULLIF；比例计算使用系统预定义的聚合表达式
 - 仅当用户要求「前N条」等时加 LIMIT
 - **聚合子查询必须 GROUP BY**：若子查询中使用 ORDER BY SUM(...)/COUNT(*) 等聚合排序，必须对 SELECT 的非聚合列加 GROUP BY
 
 ### 日期函数类型限制（重要！）
 - QUARTER()/MONTH()/YEAR() 等日期函数**只接受 DATE/TIMESTAMP 类型**，不接受 BIGINT/INTEGER
-- 若月份列是整数格式（如 202501、202502），**禁止**使用 QUARTER("月份")，或根据列元信息中的具体值范围（如 202501~202512）使用 CASE WHEN 映射
+- 若月份列是整数格式（如 202501、202502），**禁止**使用 QUARTER("月份")，应通过整数除法或取模运算推算季度
 """
 
 # 多表查询策略

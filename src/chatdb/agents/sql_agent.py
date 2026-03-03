@@ -28,6 +28,7 @@ ReAct 流程示例：
 """
 
 from __future__ import annotations
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -138,7 +139,7 @@ SQL_TASK_META: dict[SQLTaskType, SQLTaskMeta] = {
     SQLTaskType.RATIO: SQLTaskMeta(
         label="占比分析",
         description="计算部分占总体的比例",
-        intent_hint_template="计算{numerator}在{denominator}中的占比，分子条件用 CASE WHEN，全局条件用 WHERE",
+        intent_hint_template="计算{numerator}在{denominator}中的占比，使用系统预定义的聚合表达式",
         stats_fields=["numerator", "denominator", "ratio"],
         issue_fields=["zero_denominator", "missing_numerator"],
     ),
@@ -190,10 +191,32 @@ SQL_TASK_META: dict[SQLTaskType, SQLTaskMeta] = {
 }
 
 
-def get_task_meta(task_type: SQLTaskType) -> SQLTaskMeta:
-    """获取任务类型的元信息"""
+def get_task_meta(task_type: SQLTaskType, skill_registry: Any = None) -> SQLTaskMeta:
+    """
+    获取任务类型的元信息
+    
+    优先从 SkillRegistry 获取（文件驱动），fallback 到 SQL_TASK_META（硬编码）。
+    """
+    # ── 优先：SkillRegistry ──
+    if skill_registry is not None:
+        skill_meta = skill_registry.get_skill_meta(task_type.value)
+        if skill_meta is not None:
+            skill = skill_registry.get(task_type.value)
+            return SQLTaskMeta(
+                label=skill.label if skill else task_type.value,
+                description=skill.description if skill else "",
+                requires_time=skill_meta.requires_time,
+                requires_dimension=skill_meta.requires_dimension,
+                requires_previous_results=skill_meta.requires_previous_results,
+                default_time_granularity=skill_meta.default_time_granularity,
+                intent_hint_template=skill_meta.intent_hint_template,
+                stats_fields=list(skill_meta.stats_fields),
+                issue_fields=list(skill_meta.issue_fields),
+            )
+
+    # ── Fallback：硬编码 SQL_TASK_META ──
     if task_type not in SQL_TASK_META:
-        raise KeyError(f"未注册的任务类型: {task_type.value}，请在 SQL_TASK_META 中添加定义")
+        raise KeyError(f"未注册的任务类型: {task_type.value}，请在 SQL_TASK_META 中添加定义或创建 skills/{task_type.value}/SKILL.md")
     return SQL_TASK_META[task_type]
 
 
@@ -377,6 +400,7 @@ class SQLAgent(BaseAgent):
         llm: BaseLLM,
         db_connector: BaseDatabaseConnector,
         yml_config: Optional[Union[str, Path, dict]] = None,
+        skill_registry: Any = None,
     ):
         super().__init__(
             name="SQLAgent",
@@ -384,9 +408,10 @@ class SQLAgent(BaseAgent):
             description="SQL 分析专家：接收高层任务，内部 ReAct 拆解执行",
         )
         self.db_connector = db_connector
-        self._sql_tool = SQLTool(llm, db_connector)
+        self._sql_tool = SQLTool(llm, db_connector, skill_registry=skill_registry)
         self._log = get_component_logger("SQLAgent")
         self._thoughts: list[SQLAgentThought] = []
+        self._skill_registry = skill_registry
         
         # 加载领域配置
         self.config: Optional[DomainConfig] = None
@@ -437,8 +462,8 @@ class SQLAgent(BaseAgent):
         - 注入 retry_hint（来自 Planner 的 SQL 修复建议）
         - SQLTool 可基于这些信息做模板化 SQL 生成
         """
-        # 获取任务元信息
-        meta = get_task_meta(task_type)
+        # 获取任务元信息（优先 SkillRegistry，fallback 硬编码）
+        meta = get_task_meta(task_type, skill_registry=self._skill_registry)
         
         # intent_hint 优先级：调用方显式指定 > 任务描述（description 已足够具体） > 元信息模板
         # 避免用刚性模板覆盖任务的具体语义
@@ -466,6 +491,15 @@ class SQLAgent(BaseAgent):
         if not parent_results_summary and request.parent_results_summary:
             parent_results_summary = request.parent_results_summary
         
+        # ★ 提取上游临时表映射（新增）
+        upstream_temp_tables = getattr(request, "upstream_temp_tables", {})
+        
+        # ★ 从 Planner notes 中提取虚拟字段 ID，补充到 required_filters
+        required_filters = list(getattr(state, "required_filters", []))
+        required_filters = self._merge_notes_virtual_fields(
+            required_filters, list(request.notes), state,
+        )
+        
         ctx = {
             # 基础任务信息
             "task_id": request.task_id,
@@ -480,13 +514,16 @@ class SQLAgent(BaseAgent):
             "current_dimension": current_dimension,
             "parent_results_summary": parent_results_summary,
             
+            # ★ 上游临时表映射（新增）
+            "upstream_temp_tables": upstream_temp_tables,
+            
             # ★ Planner 的 SQL 修复建议（重试时使用）
             "retry_hint": retry_hint,
             "retry_count": retry_count,
             
             # 新增：结构化元信息（供 SQLTool 使用）
             "metric_id": getattr(state, "current_metric", ""),
-            "required_filters": getattr(state, "required_filters", []),
+            "required_filters": required_filters,
             "task_meta": {
                 "label": meta.label,
                 "description": meta.description,
@@ -504,335 +541,313 @@ class SQLAgent(BaseAgent):
     @staticmethod
     def _resolve_dimension_column(dim_id: str, yml_config: dict[str, Any]) -> str:
         """将维度 ID 解析为实际列名（如 dim_product → 考核产品）"""
-        dims = yml_config.get("dimensions", {})
-        if dim_id in dims:
-            return dims[dim_id].get("column", dim_id)
+        vf = yml_config.get("virtual_fields", {}).get(dim_id, {})
+        if isinstance(vf, dict) and vf.get("field_type") == "column":
+            return vf.get("column", dim_id)
         return dim_id
 
-    @staticmethod
-    def _custom_condition_to_sql(col: str, op: str, val: Any, yml_config: dict[str, Any]) -> str | None:
-        """
-        将 custom condition 转换为 DuckDB SQL 表达式。
-        
-        自动将维度 ID（如 dim_product）解析为真实列名（如 考核产品）。
-        """
-        real_col = SQLAgent._resolve_dimension_column(col, yml_config)
-        quoted = f'"{real_col}"'
-        op = (op or "=").upper()
+    def _merge_notes_virtual_fields(
+        self,
+        required_filters: list[dict[str, Any]],
+        notes: list[str],
+        state: ReActState,
+    ) -> list[dict[str, Any]]:
+        """从 Planner notes 中提取虚拟字段 ID，补充到 required_filters。
 
-        if op == "IN":
-            if isinstance(val, str):
-                values = [v.strip() for v in val.split(",") if v.strip()]
-            elif isinstance(val, (list, tuple)):
-                values = [str(v) for v in val]
-            else:
-                values = [str(val)]
-            if not values:
-                return None
-            vals_str = ", ".join(f"'{v}'" for v in values)
-            return f"{quoted} IN ({vals_str})"
-        elif op in ("=", "!=", "<>", ">", "<", ">=", "<="):
-            op_str = "!=" if op == "<>" else op
-            return f"{quoted} {op_str} '{val}'"
-        elif op == "LIKE":
-            return f"{quoted} LIKE '{val}'"
-        return None
+        Planner 会在 notes 中通过如下形式引用虚拟字段：
+        - "筛选: source_actual"
+        - "额外筛选: source_forecast"
+        - "筛选: source_actual, time_2025"
 
-    def _expand_derived_metric(
-        self, 
-        metric_id: str, 
-        metrics_config: dict[str, Any],
-        filters_config: dict[str, Any],
-    ) -> tuple[str, list[str]]:
+        本方法解析这些引用，查找 yml_config.virtual_fields 中对应定义（支持
+        condition / metric / column 三种类型），将不在 required_filters 中的字段
+        补充进去，确保 SQL 生成端能看到完整的虚拟字段列表。
         """
-        展开派生指标公式为 SQL 表达式
-        
-        派生指标的 formula 引用其他指标 ID，例如：
-        - profit_margin.formula = "total_profit_post / total_gross * 100"
-        
-        展开逻辑：
-        1. 解析 formula 中的指标 ID
-        2. 将原子指标替换为 CASE WHEN 表达式（因为不同指标有不同的 filter_refs）
-        3. 返回完整的 SQL 聚合表达式
-        
-        Returns:
-            (agg_expr, filter_refs): 展开后的聚合表达式和需要的筛选器
-        """
-        metric_def = metrics_config.get(metric_id, {})
-        
-        # 原子指标：直接返回 agg
-        if metric_def.get("type") != "derived":
-            agg = metric_def.get("agg", "")
-            filter_refs = metric_def.get("filter_refs", [])
-            return agg, filter_refs
-        
-        formula = metric_def.get("formula", "")
-        if not formula:
-            return "", []
-        
-        # 收集所有需要的筛选器（派生指标依赖的所有原子指标的公共筛选器）
-        all_filter_refs: set[str] = set()
-        
-        # 解析公式中引用的指标 ID
-        # 使用正则匹配标识符（字母、数字、下划线组成，以字母开头）
-        import re
-        tokens = re.findall(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\b', formula)
-        
-        # 构建替换映射：指标 ID -> CASE WHEN 表达式
-        expanded_formula = formula
-        for token in tokens:
-            if token not in metrics_config:
+        yml_config = state.yml_config or {}
+        virtual_fields = yml_config.get("virtual_fields", {})
+        if not virtual_fields or not notes:
+            return required_filters
+
+        existing_ids = {f.get("id") for f in required_filters}
+        added: list[str] = []
+
+        for note in notes:
+            note_str = str(note).strip()
+            # 匹配 "筛选: xxx" / "额外筛选: xxx" / "筛选条件: xxx" 模式
+            match = re.match(r'^(?:额外)?筛选(?:条件)?\s*[:：]\s*(.+)$', note_str)
+            if not match:
                 continue
-            
-            ref_metric = metrics_config[token]
-            ref_type = ref_metric.get("type", "atomic")
-            
-            if ref_type == "derived":
-                # 递归展开（暂不支持多层嵌套，简化处理）
-                self._log.warn(f"派生指标 {metric_id} 引用了另一个派生指标 {token}，暂不支持嵌套展开")
-                continue
-            
-            # 获取原子指标的 filter_refs，找出区分不同指标的筛选器
-            ref_filter_refs = ref_metric.get("filter_refs", [])
-            
-            # 找出区分报表项的筛选器（metric_* 开头的）
-            metric_filter = None
-            for fref in ref_filter_refs:
-                if fref.startswith("metric_"):
-                    metric_filter = fref
-                    break
-            
-            # 构建 CASE WHEN 表达式
-            if metric_filter and metric_filter in filters_config:
-                filter_def = filters_config[metric_filter]
-                filter_expr = filter_def.get("expr", "")
-                # 提取筛选值（如 "大盘报表项" = '递延后利润'）
-                # filter_expr 格式如: "大盘报表项" = '递延后利润'
-                case_expr = f'SUM(CASE WHEN {filter_expr} THEN "ieg口径金额-人民币" ELSE 0 END)'
-            else:
-                # 没有特定筛选器，使用通用聚合
-                case_expr = ref_metric.get("agg", 'SUM("ieg口径金额-人民币")')
-            
-            # 替换公式中的指标 ID
-            # 使用单词边界确保精确匹配
-            expanded_formula = re.sub(rf'\b{token}\b', f'({case_expr})', expanded_formula)
-            
-            # 收集公共筛选器（排除 metric_* 的，因为已经在 CASE WHEN 中处理了）
-            for fref in ref_filter_refs:
-                if not fref.startswith("metric_"):
-                    all_filter_refs.add(fref)
-        
-        # 添加 ROUND 和 NULLIF 防止除零
-        round_digits = metric_def.get("round", 2)
-        # 检测是否有除法，添加 NULLIF
-        if "/" in expanded_formula:
-            # 简单处理：用 NULLIF 包装分母
-            # 更复杂的场景需要解析表达式树
-            pass
-        
-        final_expr = f"ROUND({expanded_formula}, {round_digits})"
-        
-        # 添加派生指标自己声明的 filter_refs
-        for fref in metric_def.get("filter_refs", []):
-            all_filter_refs.add(fref)
-        
-        return final_expr, list(all_filter_refs)
+            # 可能是逗号分隔的多个虚拟字段 ID
+            raw_ids = [s.strip() for s in match.group(1).split(",") if s.strip()]
+            for raw_id in raw_ids:
+                # 清理可能的引号
+                fid = raw_id.strip('"').strip("'").strip()
+                if fid in existing_ids:
+                    continue
+                fdef = virtual_fields.get(fid)
+                if not isinstance(fdef, dict):
+                    continue
+                field_type = fdef.get("field_type", "condition")
+                # condition / metric: 直接用 expr
+                if field_type in ("condition", "metric"):
+                    expr = fdef.get("expr", "").strip()
+                    if not expr:
+                        continue
+                    entry = {
+                        "id": fid,
+                        "label": fdef.get("description", fid),
+                        "expr": expr,
+                        "field_type": field_type,
+                        "description": fdef.get("description", ""),
+                        "group": fdef.get("group", ""),
+                    }
+                    if field_type == "metric":
+                        entry["agg_type"] = fdef.get("agg_type", "")
+                    required_filters.append(entry)
+                elif field_type == "column":
+                    col_name = fdef.get("column", "").strip()
+                    if not col_name:
+                        continue
+                    required_filters.append({
+                        "id": fid,
+                        "label": fdef.get("description", fid),
+                        "expr": f'"{col_name}"',
+                        "field_type": "column",
+                        "description": fdef.get("description", ""),
+                    })
+                else:
+                    continue
+                existing_ids.add(fid)
+                added.append(fid)
 
-    def _inject_metric_definition(self, state: ReActState) -> None:
-        """
-        ★ 核心方法：把 YAML 里的 metric/filter 结构化灌入 state
+        if added:
+            self._log.info(f"从 Planner notes 中补充虚拟字段: {added}")
+
+        return required_filters
+
+    def _is_temp_table_only_task(self, state: ReActState, request: Any = None) -> bool:
+        """判断当前任务是否只查临时表（不涉及源表）
         
-        支持两种指标类型：
-        1. 原子指标（atomic）：直接使用 agg 表达式
-        2. 派生指标（derived）：展开 formula 为 SQL 表达式
-        
-        这样 SQLTool 在生成 SQL 时，能直接拿到：
-        - current_metric: 当前指标 ID
-        - current_metric_def: 指标定义（含展开后的 agg）
-        - required_filters: 必须包含的筛选条件（已解析为 SQL 片段）
+        当任务依赖上游结果（有 upstream_temp_tables）且 selected_tables 中
+        全部是临时表（temp_ 开头）时，认为是"纯临时表查询"。
+        此时不应注入面向源表的虚拟字段（它们引用源表的列，临时表里不存在）。
         """
-        if not state.yml_config:
+        # 条件 1：有上游临时表
+        upstream = getattr(request, "upstream_temp_tables", {}) if request else {}
+        if not upstream:
+            return False
+        
+        # 条件 2：selected_tables 中是否包含源表
+        selected = getattr(state, "selected_tables", None)
+        if selected:
+            source_table = getattr(state, "table_name", "")
+            for tbl in selected:
+                if not tbl.startswith("temp_") and tbl == source_table:
+                    return False
+            # selected_tables 里没有源表 → 纯临时表查询
+            return True
+        
+        # 没有 selected_tables 但有 upstream → 仍可能查源表（兜底不跳过）
+        return False
+
+    def _inject_metric_definition(self, state: ReActState, request: Any = None) -> None:
+        """从 virtual_fields 注入指标定义和筛选条件
+        
+        virtual_fields 包含所有定义：
+        - field_type=metric → 聚合指标（expr 已是完整 SQL 聚合表达式）
+        - field_type=condition → WHERE 条件（expr 是布尔表达式）
+        
+        ★ 临时表优化：如果当前任务只查临时表，跳过 condition/metric 类虚拟字段注入，
+        因为临时表已经是预聚合结果，其列来自上游查询的 SELECT，不包含源表的原始列。
+        """
+        yml_config = state.yml_config
+        virtual_fields = yml_config.get("virtual_fields", {})
+        
+        # ★ 临时表检测：纯临时表查询不需要虚拟字段展开
+        temp_table_only = self._is_temp_table_only_task(state, request)
+        if temp_table_only:
+            self._log.info(
+                "v2 检测到纯临时表查询，跳过 condition/metric 虚拟字段注入"
+                "（临时表已是预聚合结果，直接用已有列即可）"
+            )
+            state.current_metric = ""
+            state.current_metric_def = {}
+            state.all_metric_defs = {}
+            state.required_filters = []
             return
         
-        yml_config = state.yml_config
-        metrics_config = yml_config.get("metrics", {})
-        filters_config = yml_config.get("filters", {})
+        metrics_vf = {
+            k: v for k, v in virtual_fields.items()
+            if isinstance(v, dict) and v.get("field_type") == "metric"
+        }
         
-        # 从 intent 获取当前指标，或使用默认
-        metric_ids = []
-        if state.intent and state.intent.metrics:
-            metric_ids = state.intent.metrics
+        # 获取 per-task 指标
+        metric_ids: list[str] = []
+        if request is not None:
+            meta = getattr(request, "meta", {}) or {}
+            per_task_metric = meta.get("metric")
+            if per_task_metric:
+                raw_ids = [per_task_metric] if isinstance(per_task_metric, str) else list(per_task_metric)
+                metric_ids = [mid for mid in raw_ids if mid in metrics_vf]
+                if metric_ids:
+                    self._log.info(f"v2 per-task 指标: {metric_ids}")
         
-        # 如果没有指定指标，尝试从 filter_refs 推断
-        if not metric_ids and state.intent and state.intent.filter_refs:
-            for fref in state.intent.filter_refs:
-                # 根据 filter_refs 反查 metrics
-                for mid, mdef in metrics_config.items():
-                    if fref in mdef.get("filter_refs", []):
-                        metric_ids.append(mid)
-                        break
+        if not metric_ids and state.intent and state.intent.metrics:
+            metric_ids = [mid for mid in state.intent.metrics if mid in metrics_vf]
         
-        # 默认使用 total_flow
         if not metric_ids:
-            metric_ids = ["total_flow"]
+            metric_ids = ["total_flow"] if "total_flow" in metrics_vf else list(metrics_vf.keys())[:1]
         
-        # 取第一个指标作为主指标
-        metric_name = metric_ids[0]
-        metric_def = metrics_config.get(metric_name, {}).copy()  # 复制以免修改原配置
+        # 构建指标定义
+        all_metric_defs: dict[str, dict] = {}
+        for mid in metric_ids:
+            mdef = dict(metrics_vf.get(mid, {}))
+            mdef["agg"] = mdef.get("expr", "")
+            mdef["_expanded"] = True  # v2 的 expr 已包含完整 CASE WHEN
+            all_metric_defs[mid] = mdef
         
-        # ★ 关键：检测是否是派生指标，展开公式
-        metric_type = metric_def.get("type", "atomic")
-        if metric_type == "derived":
-            expanded_agg, expanded_filter_refs = self._expand_derived_metric(
-                metric_name, metrics_config, filters_config
-            )
-            # 将展开后的表达式写入 metric_def
-            metric_def["agg"] = expanded_agg
-            metric_def["_expanded"] = True
-            metric_def["_expanded_filter_refs"] = expanded_filter_refs
-            self._log.info(f"派生指标 {metric_name} 展开为: {expanded_agg[:100]}...")
+        metric_name = metric_ids[0] if metric_ids else ""
+        metric_def = all_metric_defs.get(metric_name, {})
         
-        # 写入 state
         state.current_metric = metric_name
         state.current_metric_def = metric_def
+        state.all_metric_defs = all_metric_defs
         
-        # 解析 filter_refs，构建必须包含的 WHERE 片段
-        required_filters = []
+        # 构建 required_filters（扫描虚拟字段中所有节点：condition / metric / column）
+        required_filters: list[dict[str, Any]] = []
+        added_ids: set[str] = set()
         
-        # 派生指标使用展开后的 filter_refs
-        if metric_def.get("_expanded"):
-            filter_refs = metric_def.get("_expanded_filter_refs", [])
-        else:
-            filter_refs = metric_def.get("filter_refs", [])
+        # ── 0. 获取 per-task virtual_fields 列表（Planner 分配的）──
+        per_task_vf_ids: list[str] = []
+        if request is not None:
+            meta = getattr(request, "meta", {}) or {}
+            per_task_vf_ids = meta.get("virtual_fields") or []
         
-        # 同时加入 intent 中的 filter_refs
-        intent_filter_refs = []
-        if state.intent and state.intent.filter_refs:
-            intent_filter_refs = state.intent.filter_refs
-        
-        # ========================================
-        # 通用筛选器合并逻辑（基于 YAML 元数据）
-        # ========================================
-        # 
-        # 每个筛选器可以有 group 和 merge_mode 属性：
-        # - group: 同组筛选器会被一起处理
-        # - merge_mode: 
-        #   - "exclusive": 互斥，用户指定的优先，忽略指标定义中的同组筛选器
-        #   - "union": 并集，同组筛选器用 OR 连接
-        #   - "intersect" (默认): 交集，同组筛选器用 AND 连接
-        #
-        # 这样避免硬编码 metric_*、time_q* 等规则
-        
-        def get_filter_group(fref: str) -> tuple[str, str]:
-            """获取筛选器的 group 和 merge_mode"""
-            if fref in filters_config:
-                f_def = filters_config[fref]
-                group = f_def.get("group", "default")
-                merge_mode = f_def.get("merge_mode", "intersect")
-                return group, merge_mode
-            return "default", "intersect"
-        
-        # 1. 先收集 intent 中各 group 的筛选器
-        intent_groups: dict[str, list[str]] = {}
-        for fref in intent_filter_refs:
-            group, _ = get_filter_group(fref)
-            if group not in intent_groups:
-                intent_groups[group] = []
-            intent_groups[group].append(fref)
-        
-        # 2. 合并筛选器，处理 exclusive 逻辑
-        merged_filter_refs = []
-        for fref in filter_refs:
-            group, merge_mode = get_filter_group(fref)
-            
-            # exclusive 模式：如果 intent 已有同组筛选器，跳过指标定义中的
-            if merge_mode == "exclusive" and group in intent_groups:
-                continue
-            
-            # 跳过派生指标已处理的筛选器（通过 group="metric" 识别）
-            if metric_def.get("_expanded"):
-                f_group, _ = get_filter_group(fref)
-                if f_group == "metric":
+        # ── 1. 从 per-task virtual_fields 收集 condition 类型虚拟字段 ──
+        # 优先使用 Planner 为每个子任务单独分配的虚拟字段
+        if per_task_vf_ids:
+            for fid in per_task_vf_ids:
+                if fid in added_ids:
                     continue
-            
-            merged_filter_refs.append(fref)
-        
-        # 3. 添加 intent 中的筛选器（避免重复）
-        for fref in intent_filter_refs:
-            if fref not in merged_filter_refs:
-                merged_filter_refs.append(fref)
-        
-        # 4. 按 group 分组，准备合并
-        groups: dict[str, list[str]] = {}
-        for fref in merged_filter_refs:
-            group, _ = get_filter_group(fref)
-            if group not in groups:
-                groups[group] = []
-            groups[group].append(fref)
-        
-        # 5. 根据 merge_mode 生成最终筛选条件
-        for group_name, frefs in groups.items():
-            if not frefs:
-                continue
-            
-            # 获取该组的 merge_mode（取第一个筛选器的设置）
-            _, merge_mode = get_filter_group(frefs[0])
-            
-            if merge_mode == "union" and len(frefs) > 1:
-                # union 模式：多个筛选器用 OR 连接
-                exprs = []
-                labels = []
-                for fref in frefs:
-                    if fref in filters_config:
-                        f_def = filters_config[fref]
-                        expr = f_def.get("expr", "")
-                        if expr:
-                            exprs.append(f"({expr})")
-                            labels.append(f_def.get("label", fref))
-                if exprs:
-                    combined_expr = " OR ".join(exprs)
-                    required_filters.append({
-                        "id": f"{group_name}_combined",
-                        "label": f"{', '.join(labels)}",
-                        "expr": f"({combined_expr})",
-                        "description": f"筛选 {', '.join(labels)} 的数据",
-                    })
-            else:
-                # intersect 或 exclusive 模式：每个筛选器独立（AND 连接）
-                for fref in frefs:
-                    if fref in filters_config:
-                        f_def = filters_config[fref]
-                        expr = f_def.get("expr", "")
-                        if expr:
-                            required_filters.append({
-                                "id": fref,
-                                "label": f_def.get("label", fref),
-                                "expr": expr,
-                                "description": f_def.get("description", ""),
-                            })
-        
-        # ★ 追加 intent 中的 custom 条件（如多轮对话指代消解产生的 IN 条件）
-        if state.intent:
-            for cond in state.intent.get_custom_filters():
-                col = cond.get("column", "")
-                op = (cond.get("op") or cond.get("operator", "=")).upper()
-                val = cond.get("value")
-                if not col or val is None:
+                fdef = virtual_fields.get(fid, {})
+                if not isinstance(fdef, dict) or fdef.get("field_type") != "condition":
                     continue
-                sql_expr = self._custom_condition_to_sql(col, op, val, yml_config)
-                if sql_expr:
+                expr = fdef.get("expr", "").strip()
+                if expr:
                     required_filters.append({
-                        "id": f"custom_{col}",
-                        "label": f"用户指定筛选: {col}",
-                        "expr": sql_expr,
-                        "description": "来自用户查询的自定义筛选条件（如多轮对话指代消解）",
+                        "id": fid,
+                        "label": fdef.get("description", fid),
+                        "expr": expr,
+                        "field_type": "condition",
+                        "description": fdef.get("description", ""),
+                        "group": fdef.get("group", ""),
                     })
-
+                    added_ids.add(fid)
+        
+        # ── 1.1 兜底：如果 per-task 没有指定任何 condition，从 intent.conditions 全局继承 ──
+        has_per_task_conditions = any(
+            f.get("field_type") == "condition" for f in required_filters
+        )
+        if not has_per_task_conditions and state.intent:
+            for c in state.intent.conditions:
+                if c.get("type") != "ref":
+                    continue
+                fid = c["id"]
+                if fid in added_ids:
+                    continue
+                fdef = virtual_fields.get(fid, {})
+                if not isinstance(fdef, dict) or fdef.get("field_type") != "condition":
+                    continue
+                expr = fdef.get("expr", "").strip()
+                if expr:
+                    required_filters.append({
+                        "id": fid,
+                        "label": fdef.get("description", fid),
+                        "expr": expr,
+                        "field_type": "condition",
+                        "description": fdef.get("description", ""),
+                        "group": fdef.get("group", ""),
+                    })
+                    added_ids.add(fid)
+        
+        # ── 1.2 确保 scope=required 的 condition 字段始终存在 ──
+        for fid, fdef in virtual_fields.items():
+            if not isinstance(fdef, dict):
+                continue
+            if fdef.get("field_type") != "condition":
+                continue
+            if fdef.get("scope") != "required":
+                continue
+            if fid in added_ids:
+                continue
+            expr = fdef.get("expr", "").strip()
+            if expr:
+                required_filters.append({
+                    "id": fid,
+                    "label": fdef.get("description", fid),
+                    "expr": expr,
+                    "field_type": "condition",
+                    "description": fdef.get("description", ""),
+                    "group": fdef.get("group", ""),
+                })
+                added_ids.add(fid)
+        
+        # ── 2. 收集当前任务用到的 metric 类型虚拟字段 ──
+        for mid in metric_ids:
+            if mid in added_ids:
+                continue
+            mdef = virtual_fields.get(mid, {})
+            if not isinstance(mdef, dict) or mdef.get("field_type") != "metric":
+                continue
+            expr = mdef.get("expr", "").strip()
+            if expr:
+                required_filters.append({
+                    "id": mid,
+                    "label": mdef.get("description", mid),
+                    "expr": expr,
+                    "field_type": "metric",
+                    "description": mdef.get("description", ""),
+                    "agg_type": mdef.get("agg_type", ""),
+                })
+                added_ids.add(mid)
+        
+        # ── 3. 收集 Planner/intent 引用的 column 类型虚拟字段 ──
+        # 从 intent.dimensions 和 request.meta.virtual_fields 中获取
+        column_candidates: list[str] = []
+        if state.intent and state.intent.dimensions:
+            column_candidates.extend(state.intent.dimensions)
+        if request is not None:
+            meta = getattr(request, "meta", {}) or {}
+            for vfid in (meta.get("virtual_fields") or []):
+                if vfid not in column_candidates:
+                    column_candidates.append(vfid)
+        for cid in column_candidates:
+            if cid in added_ids:
+                continue
+            cdef = virtual_fields.get(cid, {})
+            if not isinstance(cdef, dict) or cdef.get("field_type") != "column":
+                continue
+            # column 类型用真实列名作为 expr
+            col_name = cdef.get("column", "").strip()
+            if col_name:
+                required_filters.append({
+                    "id": cid,
+                    "label": cdef.get("description", cid),
+                    "expr": f'"{col_name}"',
+                    "field_type": "column",
+                    "description": cdef.get("description", ""),
+                })
+                added_ids.add(cid)
+        
         state.required_filters = required_filters
-
-        agg_preview = metric_def.get('agg', '')[:50] if metric_def.get('agg') else ''
-        self._log.info(f"注入指标定义: {metric_name} ({metric_type}), agg={agg_preview}..., "
-                       f"required_filters={len(required_filters)}个")
+        
+        metric_summary = ", ".join(f"{mid}" for mid in all_metric_defs)
+        filter_types = {}
+        for f in required_filters:
+            ft = f.get("field_type", "condition")
+            filter_types[ft] = filter_types.get(ft, 0) + 1
+        type_info = ", ".join(f"{k}={v}" for k, v in filter_types.items())
+        self._log.info(f"注入: metrics=[{metric_summary}], required_filters={len(required_filters)}个 ({type_info})")
 
     async def run_task(
         self,
@@ -877,6 +892,8 @@ class SQLAgent(BaseAgent):
         state.current_sql = ""
         state.final_sql = ""
         state.refine_attempts = 0
+        state.all_metric_defs = {}
+        state.metric_union_info = []
         
         # 重试时的额外日志
         retry_count = request.meta.get("retry_count", 0)
@@ -964,8 +981,10 @@ class SQLAgent(BaseAgent):
         rows = state.execute_result.get("rows", [])
         result.row_count = len(rows)
         
-        # 样例行（前 5 行）
+        # 样例行（前 5 行，供 prompt 展示）
         result.examples = rows[:5] if rows else []
+        # 完整行（供临时表创建使用）
+        result.all_rows = rows
         
         # 描述性统计
         if rows:
@@ -1176,7 +1195,7 @@ async def handle_basic_task(
     LLM 会根据 column_profiles（列元信息）自行推理合适的分组列。
     """
     # 注入指标定义
-    agent._inject_metric_definition(state)
+    agent._inject_metric_definition(state, request)
     
     # 构建任务上下文（LLM 根据 Intent 和 column_profiles 自行推理分组方式）
     state.current_task = agent._build_task_context(
@@ -1207,7 +1226,7 @@ async def handle_trend_task(
 ) -> None:
     """执行趋势分析任务"""
     # 注入指标定义
-    agent._inject_metric_definition(state)
+    agent._inject_metric_definition(state, request)
     
     # 构建任务上下文（不硬编码 intent_hint，让 description 优先逻辑生效）
     state.current_task = agent._build_task_context(
@@ -1254,7 +1273,7 @@ async def handle_source_task(
 ) -> None:
     """执行来源分析任务（按维度拆解）"""
     # 注入指标定义
-    agent._inject_metric_definition(state)
+    agent._inject_metric_definition(state, request)
     
     # ★ 收集所有可用维度（不选择，全部传给 LLM 判断）
     yml_config = state.yml_config or {}
@@ -1331,7 +1350,7 @@ async def handle_drilldown_task(
         return
     
     # 注入指标定义
-    agent._inject_metric_definition(state)
+    agent._inject_metric_definition(state, request)
     
     # 构建任务上下文（不硬编码 intent_hint，让 description 优先逻辑生效）
     state.current_task = agent._build_task_context(
@@ -1365,7 +1384,7 @@ async def handle_comparison_task(
 ) -> None:
     """执行对比分析任务"""
     # 注入指标定义
-    agent._inject_metric_definition(state)
+    agent._inject_metric_definition(state, request)
     
     # 获取上游结果摘要
     parent_summary = agent._get_parent_results_summary(request)
@@ -1503,23 +1522,16 @@ async def handle_ratio_task(
     
     核心目标：计算"部分 / 总体"的比例
     
-    SQL 模式：
-    ```sql
-    SELECT 
-        SUM(CASE WHEN 分子条件 THEN 金额 ELSE 0 END) as 分子,
-        SUM(金额) as 分母,
-        ROUND(分子/分母 * 100, 2) as 占比
-    FROM 表
-    WHERE 全局条件
-    ```
+    使用系统预定义的聚合表达式（已内含 CASE WHEN 逻辑），
+    LLM 直接引用即可，无需自行构造。
     """
     # 注入指标定义
-    agent._inject_metric_definition(state)
+    agent._inject_metric_definition(state, request)
     
     # 构建任务上下文
     state.current_task = agent._build_task_context(
         request, SQLTaskType.RATIO, state,
-        intent_hint="计算占比，LLM 需智能判断：分子条件用 CASE WHEN，全局条件用 WHERE，输出占比百分比",
+        intent_hint="计算占比，直接使用系统预定义的聚合表达式（已内含分子/分母逻辑），输出占比百分比",
     )
     
     # 执行 SQL
@@ -1552,7 +1564,7 @@ async def handle_ranking_task(
     核心目标：按指标排序，找出 TopN 或 BottomN
     """
     # 注入指标定义
-    agent._inject_metric_definition(state)
+    agent._inject_metric_definition(state, request)
     
     # 获取排名参数（从 Intent 中）
     order_by = None

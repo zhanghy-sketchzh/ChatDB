@@ -120,11 +120,6 @@ class ReActPhase(str, Enum):
     REFINE = "refine"                 # 修正 SQL
     DONE = "done"                     # 完成
     GIVE_UP = "give_up"               # 放弃
-    # 兼容旧版阶段
-    PLAN = "plan"                    # 兼容: 等同于 INIT
-    PARSE = "parse"                  # 兼容: 等同于 SEMANTIC_PARSE
-    GENERATE = "generate"            # 兼容: 等同于 SQL_BUILD
-    EVALUATE = "evaluate"            # 兼容: 等同于 CRITIQUE
 
 
 class ErrorType(str, Enum):
@@ -215,13 +210,6 @@ class ReActState:
     # - missing_time_dimension: True  (没有时间列)
     # - accept_no_time_filter: False  (是否接受无时间条件)
     
-    # ===== 显式任务计划（已迁移到 PlannerAgent._analysis_plan + 文件持久化）=====
-    # 旧版 plan/plan_index 已废弃，保留字段仅为 debug 输出兼容
-    # 实际计划管理由 PlannerAgent._analysis_plan（DAG 拓扑）驱动
-    # 跨轮次持久化由 ScratchPadManager.save_plan/load_plan 实现
-    plan: list[dict[str, Any]] = field(default_factory=list)
-    plan_index: int = 0
-    
     # ===== 持久化计划引用（Plan Persistence）=====
     # Orchestrator 在恢复/创建计划时设置，用于 debug 和上下文注入
     persistent_plan_path: str = ""              # scratch/{session_id}/plan.json 路径
@@ -231,6 +219,21 @@ class ReActState:
     # Orchestrator 在 _init_context 阶段一次性检索，后续各 Agent 按需取用
     # 结构为 RetrievalResult（或 None 表示未启用检索）
     retrieval_context: Any = None
+
+    # ===== 虚拟字段检索结果（VirtualFieldRetriever 注入）=====
+    # 在 semantic_parse 之前，将用户查询与 YML 虚拟字段做相似度匹配
+    # 结构为 VirtualFieldRetrievalResult（或 None 表示未启用）
+    retrieved_virtual_fields: Any = None
+
+    # ===== 表理解文本（LLM 生成，从 meta_data.db 缓存加载）=====
+    # 在 semantic_parser / planner / sql_tool 阶段注入 prompt，帮助 LLM 理解表的业务含义
+    table_understanding: str = ""
+
+    # ===== Planner Decide 注入的表选择（selected_tables）=====
+    # Planner 决策时从「源表 + 已生成临时表」中选择下一步需要的表名列表
+    # SQL 生成器据此判断是否注入源表 schema/列信息
+    # 为 None 表示未设置（默认注入源表），为 [] 表示空选择
+    selected_tables: list[str] | None = None
     
     # ===== 分析型任务：结构化中间结果 =====
     need_more_analysis: bool = False       # LLM 评估：当前结果尚不足以完整回答用户问题
@@ -245,14 +248,13 @@ class ReActState:
     temp_results: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     # ===== YAML 指标定义注入（SQLAgent -> SQLTool）=====
-    current_metric: str = ""                 # 当前指标 ID
-    current_metric_def: dict[str, Any] = field(default_factory=dict)  # 指标定义（含 agg, filter_refs）
+    current_metric: str = ""                 # 主指标 ID（向后兼容）
+    current_metric_def: dict[str, Any] = field(default_factory=dict)  # 主指标定义（向后兼容）
+    all_metric_defs: dict[str, dict[str, Any]] = field(default_factory=dict)  # 所有 per-task 指标 {id: def}
     required_filters: list[dict[str, Any]] = field(default_factory=list)  # 必须包含的 WHERE 筛选条件
+    metric_union_info: list[dict[str, Any]] = field(default_factory=list)  # 多原子指标 union 合并信息（供 SQL prompt CASE WHEN 引导）
     
     # ===== 口径设计（已合并到 SQLTool generate_sql prompt）=====
-    calibration_plan: Any = None             # 保留字段（兼容）
-    numerator_filters: list[dict[str, Any]] = field(default_factory=list)  # 保留字段（兼容）
-    sql_pattern: str = ""                    # SQL 模式建议（保留字段）
     sql_hint: str = ""                       # LLM 给 SQL 生成的额外建议
 
     # ===== 思考/反思日志 =====
@@ -348,21 +350,6 @@ class ReActState:
         """
         self.step += 1
     
-    # ===== 兼容旧版方法 =====
-    
-    def add_thought(self, thought: str) -> None:
-        """兼容旧版: 等同于 think()"""
-        self.think(thought)
-    
-    def log_tool(self, tool_name: str, input_data: dict, output_data: dict, duration_ms: float = 0) -> None:
-        """兼容旧版: 记录工具调用"""
-        self.tool_log.append({
-            "tool": tool_name,
-            "input": input_data,
-            "output": output_data,
-            "duration_ms": duration_ms,
-        })
-    
     def set_error(self, error: str, error_type: ErrorType, context: dict[str, Any] | None = None) -> None:
         """设置错误"""
         self.error = error
@@ -443,8 +430,6 @@ class ReActState:
     def get_debug_info(self) -> dict[str, Any]:
         """获取调试信息"""
         return {
-            "plan": self.plan,
-            "plan_display": self.get_plan_display(),
             "plan_resumed": self.plan_resumed,
             "persistent_plan_path": self.persistent_plan_path,
             "reasoning_trace": self.get_reasoning_trace(),
@@ -457,30 +442,6 @@ class ReActState:
             "refine_attempts": self.refine_attempts,
             "exec_meta": self.exec_meta,
         }
-
-    def get_plan_display(self) -> str:
-        """格式化计划为可读文本（用于 debug 输出）"""
-        if not self.plan:
-            return ""
-        lines = ["Plan:"]
-        for i, item in enumerate(self.plan):
-            step = item.get("step", i + 1)
-            goal = item.get("goal", "")
-            action = item.get("action", "")
-            status = item.get("status", "pending")
-            marker = "→" if i == self.plan_index else ("✓" if status == "done" else " ")
-            lines.append(f"  {marker} {step}. [{action}] {goal}")
-        return "\n".join(lines)
-
-    def get_current_plan_step(self) -> dict[str, Any] | None:
-        """获取当前计划步骤"""
-        if 0 <= self.plan_index < len(self.plan):
-            return self.plan[self.plan_index]
-        return None
-    
-    def get_current_task(self) -> dict[str, Any] | None:
-        """别名：获取当前任务（与 Planner 接口对齐）"""
-        return self.get_current_plan_step()
 
     # ===== exec_meta helpers（Orchestrator 执行状态管理）=====
     
@@ -532,30 +493,6 @@ class ReActState:
         """减少计划步数（用于 retry 场景）"""
         if self.exec_meta["plan_step"] > 0:
             self.exec_meta["plan_step"] -= 1
-
-    def advance_plan(self) -> None:
-        """将计划推进到下一步"""
-        if self.plan and self.plan_index < len(self.plan):
-            self.plan[self.plan_index]["status"] = "done"
-            self.plan_index += 1
-
-    def insert_plan_step(self, action: str, goal: str, position: int | None = None) -> None:
-        """在计划中插入新步骤（用于动态调整计划）"""
-        new_step = {
-            "step": len(self.plan) + 1,
-            "action": action,
-            "goal": goal,
-            "status": "pending",
-        }
-        if position is None or position >= len(self.plan):
-            # 插入到当前位置之后
-            insert_pos = self.plan_index + 1
-        else:
-            insert_pos = position
-        self.plan.insert(insert_pos, new_step)
-        # 重新编号
-        for i, p in enumerate(self.plan):
-            p["step"] = i + 1
 
     def get_reasoning_trace(self) -> str:
         """
@@ -713,11 +650,4 @@ class ReActState:
                 lines.append(f"  - {s.dimension}: {s.row_count} 类{top_str}")
         
         return "\n".join(lines)
-
-    # ===== 兼容旧版 analysis_results =====
-    
-    @property
-    def analysis_results(self) -> list[dict[str, Any]]:
-        """兼容旧版: 返回 dict 格式的分析结果"""
-        return [s.to_dict() for s in self.analysis_slices]
 

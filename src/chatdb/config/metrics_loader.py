@@ -102,25 +102,46 @@ class MetricsConfigLoader:
         return self.get_global_expr("base_valid_expr")
     
     def get_calibration(self) -> dict:
-        """获取口径映射配置"""
-        return self._config.get("calibration", {})
+        """获取口径映射配置（兼容 v1.1 calibration 段和 v1.2 rules 段）"""
+        # v1.2: 从 rules 中提取 disambiguation 和 canonical_scope
+        cal = self._config.get("calibration", {})
+        if cal:
+            return cal
+        # v1.2: 从统一 rules 合成
+        rules = self._config.get("rules", [])
+        disamb = [r for r in rules if r.get("type") == "disambiguation"]
+        scopes = {
+            r.get("scope_name", ""): r.get("filter", "")
+            for r in rules if r.get("type") == "canonical_scope"
+        }
+        return {"disambiguation": disamb, "scopes": scopes}
     
     def get_canonical_filter(self, metric_id: str) -> str | None:
         """获取指标的规范口径筛选器"""
-        # 先从 metrics 定义中查找
+        # 从 metrics 定义中查找 canonical_filters
         metrics = self._config.get("metrics", {})
         if metric_id in metrics:
             canonical = metrics[metric_id].get("canonical_filters", [])
             if canonical:
                 return canonical[0] if isinstance(canonical, list) else canonical
-        
-        # 再从 calibration 中查找
-        scope = self.get_calibration().get("metrics_default_scope", {})
-        return scope.get(metric_id)
+        return None
     
     def get_disambiguation_rules(self) -> list:
-        """获取消歧义规则"""
-        return self.get_calibration().get("disambiguation", [])
+        """获取消歧义规则（兼容 v1.1 calibration 和 v1.2 rules）"""
+        # v1.1: calibration.disambiguation
+        cal = self._config.get("calibration", {})
+        if cal and "disambiguation" in cal:
+            return cal["disambiguation"]
+        # v1.2: 从 rules 中提取 type=disambiguation
+        rules = self._config.get("rules", [])
+        return [
+            {
+                "pattern": r.get("match_pattern", []),
+                "default": r.get("default_filter") or r.get("default_metric", ""),
+                "note": r.get("description", ""),
+            }
+            for r in rules if r.get("type") == "disambiguation"
+        ]
     
     def resolve_filter_by_term(self, term: str) -> list[str]:
         """根据业务术语查找对应的 filters"""

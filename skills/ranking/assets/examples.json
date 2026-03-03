@@ -1,0 +1,9 @@
+[
+  {
+    "id": "ranking_example",
+    "type": "ranking",
+    "description": "按指标排序取TopN或BottomN",
+    "notes": ["排序方向: DESC/ASC", "限制数量: 根据需求", "分组维度: 根据需求"],
+    "sql_template": "SELECT {{dimension}}, {{aggregation}}({{metric}}) AS {{alias}} FROM {{table}} WHERE {{conditions}} GROUP BY {{dimension}} ORDER BY {{alias}} {{sort_direction}} LIMIT {{limit}}"
+  }
+]

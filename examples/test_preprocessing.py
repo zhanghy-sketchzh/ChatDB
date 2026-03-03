@@ -1,7 +1,8 @@
 """预处理模块测试 - 使用真实数据"""
 
 import pandas as pd
-from chatdb.preprocessing import DataPreprocessor
+import yaml
+from chatdb.preprocessing import DataPreprocessor, extract_meta_info_from_yml
 from chatdb.storage import MetaDataStore
 from chatdb.config.table_config import load_table_config
 
@@ -16,6 +17,18 @@ def test_preprocessing():
     df = pd.read_csv(csv_path, nrows=10000)
     print(f"数据: {len(df)} 行, {len(df.columns)} 列")
     
+    # 从 YML 配置中提取 meta_info，增强 BM25 索引
+    yml_path = "data/yml/metrics_config.yml"
+    meta_info = None
+    try:
+        with open(yml_path, "r", encoding="utf-8") as f:
+            yml_config = yaml.safe_load(f)
+        meta_info = extract_meta_info_from_yml(yml_config)
+        print(f"YML meta_info: display_name={meta_info.get('display_name')}, "
+              f"synonyms={len(meta_info.get('virtual_field_synonyms', []))}个")
+    except FileNotFoundError:
+        print(f"YML 配置不存在: {yml_path}，跳过 meta_info 增强")
+    
     preprocessor = DataPreprocessor()
     result = preprocessor.preprocess_dataframe(
         df,
@@ -23,6 +36,7 @@ def test_preprocessing():
         table_description="IEG产品流水与收入数据",
         id_columns=["考核产品编码", "考核部门编码"],
         file_name="脚本测试数据.csv",
+        meta_info=meta_info,
     )
     
     print(f"索引文档: {result.index_doc_count}")

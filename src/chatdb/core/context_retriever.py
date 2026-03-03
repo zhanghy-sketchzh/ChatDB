@@ -39,6 +39,10 @@ class RetrievalResult:
     few_shot_examples: list[dict[str, str]] = field(default_factory=list)
     # [{question, sql, explanation?}]
 
+    # 实时列描述统计（由 DuckDB get_column_stats 注入）
+    # {table_name: [{"name", "type", "null_pct", "unique_count", "summary", "stats"}, ...]}
+    column_stats_map: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
     def has_schema_hints(self) -> bool:
         return bool(self.relevant_tables or self.relevant_columns)
 
@@ -54,7 +58,7 @@ class RetrievalResult:
     # ── Prompt 格式化 ──
 
     def format_schema_hint(self, max_tables: int = 5, max_cols_per_table: int = 10) -> str:
-        """格式化 Schema 召回结果为 prompt 段落"""
+        """格式化 Schema 召回结果为 prompt 段落（含实时描述统计）"""
         if not self.has_schema_hints():
             return ""
 
@@ -71,8 +75,39 @@ class RetrievalResult:
         if self.relevant_columns:
             lines.append("### 高相关列")
             for tbl, cols in list(self.relevant_columns.items())[:max_tables]:
-                cols_str = ", ".join(f'"{c}"' for c in cols[:max_cols_per_table])
-                lines.append(f"- {tbl}: {cols_str}")
+                stats_list = self.column_stats_map.get(tbl)
+                if stats_list:
+                    from chatdb.database.column_stats_provider import ColumnStats, ColumnStatsProvider
+
+                    stats_idx = {s["name"]: s for s in stats_list}
+                    stats_objs: list[ColumnStats] = []
+                    for c in cols[:max_cols_per_table]:
+                        st = stats_idx.get(c)
+                        if st:
+                            cs = ColumnStats(
+                                name=st.get("name", ""),
+                                dtype=st.get("type", ""),
+                                null_pct=st.get("null_pct", 0.0),
+                                unique_count=st.get("unique_count", 0),
+                            )
+                            s = st.get("stats")
+                            if s:
+                                cs.min_val = s.get("min")
+                                cs.max_val = s.get("max")
+                                cs.mean_val = s.get("mean")
+                                cs.median_val = s.get("median")
+                            if st.get("top_values"):
+                                cs.top_values = st["top_values"]
+                            stats_objs.append(cs)
+                        else:
+                            stats_objs.append(ColumnStats(name=c, dtype=""))
+
+                    col_lines = [f"  {cs.format_line()}" for cs in stats_objs]
+                    lines.append(f"- {tbl}:")
+                    lines.extend(col_lines)
+                else:
+                    cols_str = ", ".join(f'"{c}"' for c in cols[:max_cols_per_table])
+                    lines.append(f"- {tbl}: {cols_str}")
 
         return "\n".join(lines)
 
