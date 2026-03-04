@@ -17,7 +17,7 @@ ToolRegistry - 工具注册中心（Agent + Tool 架构）
 from typing import Any
 
 from chatdb.tools.base import BaseTool, ToolResult, ToolMetadata
-from chatdb.utils.logger import logger
+from lib.utils.logger import logger
 
 
 class ToolRegistry:

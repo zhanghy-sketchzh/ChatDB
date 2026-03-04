@@ -7,8 +7,8 @@
 from typing import Any
 
 from chatdb.core.react_state import ReActState
-from chatdb.storage.chat_history import ChatHistoryManager
-from chatdb.storage.task_history import TaskTracker
+from lib.storage.chat_history import ChatHistoryManager
+from lib.storage.task_history import TaskTracker
 
 
 class HistoryHelper:

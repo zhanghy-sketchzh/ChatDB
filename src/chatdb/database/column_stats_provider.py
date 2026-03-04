@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
-from chatdb.utils.logger import get_component_logger
+from lib.utils.logger import get_component_logger
 
 _log = get_component_logger("ColumnStatsProvider")
 

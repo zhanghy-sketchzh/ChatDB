@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from chatdb.api.dependencies import get_db_connector, get_schema_inspector
 from chatdb.api.schemas import SchemaResponse, TableInfoResponse, ColumnInfoResponse
 from chatdb.utils.exceptions import SchemaError
-from chatdb.utils.logger import logger
+from lib.utils.logger import logger
 from chatdb.database.base import BaseDatabaseConnector
 from chatdb.database.schema import SchemaInspector
 

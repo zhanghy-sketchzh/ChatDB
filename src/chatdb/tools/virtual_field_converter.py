@@ -44,7 +44,7 @@ from typing import Any
 import sqlglot
 from sqlglot import exp
 
-from chatdb.utils.logger import get_component_logger
+from lib.utils.logger import get_component_logger
 
 _log = get_component_logger("VirtualFieldConverter")
 
@@ -58,7 +58,7 @@ class VirtualFieldMapping:
     """单个虚拟字段的映射描述。"""
     field_id: str          # 虚拟字段标识符，如 "base_valid_data"、"total_flow"
     expr: str              # 真实 SQL 表达式（metric 类型为纯值表达式，不含聚合函数）
-    field_type: str = "condition"  # "condition"（WHERE 条件）/ "metric"（聚合表达式）/ "column"（列映射）
+    field_type: str = "condition"  # "condition"（WHERE 条件）/ "metric"（聚合表达式）
     label: str = ""        # 人类可读描述
     description: str = ""  # 业务说明（如"仅筛选流水类报表项"）
     agg_type: str = ""     # 聚合类型：SUM/AVG/COUNT/MAX/MIN/EXPR（仅 metric 类型有效）
@@ -91,7 +91,8 @@ def _build_field_maps(
     """构建三种映射索引。
 
     Returns:
-        (condition_map, column_map, metric_map) — 分别存放条件型、列型和指标型虚拟字段
+        (condition_map, column_map, metric_map) — 分别存放条件型、其他型和指标型虚拟字段
+        注意：column 类型已从 YML 配置中移除，column_map 正常情况下应为空。
     """
     cond_map: dict[str, VirtualFieldMapping] = {}
     col_map: dict[str, VirtualFieldMapping] = {}
@@ -201,6 +202,9 @@ class VirtualFieldConverter:
         self._parsed_cache: dict[str, exp.Expression] = {}
         self._replaced: list[str] = []
         self._messages: list[str] = []
+        # ★ 作用域信息（在 _transform_tree 中初始化）
+        self._cte_names: set[str] = set()           # CTE 名称集合
+        self._table_alias_to_source: dict[str, str] = {}  # 表别名 → 源名称
 
     def convert(self, sql: str) -> ConversionResult:
         """主入口：转换 SQL 中的虚拟字段。"""
@@ -309,15 +313,146 @@ class VirtualFieldConverter:
 
     def _transform_tree(self, tree: exp.Expression) -> None:
         """深度优先遍历 AST，替换所有虚拟字段引用。"""
+        # ★ 收集作用域信息：CTE 名称和表别名映射
+        self._collect_scope_info(tree)
         # 使用 sqlglot 的 transform 机制
         # transform 会深度优先遍历，对每个节点调用回调
         tree.transform(self._transform_node, copy=False)
+
+    def _collect_scope_info(self, tree: exp.Expression) -> None:
+        """收集 AST 中的 CTE 名称和表别名 → 源名称映射。
+
+        用于判断某个 Column 引用是否来自派生数据源（CTE / 子查询），
+        从而决定是否跳过虚拟字段展开。
+        """
+        self._cte_names = set()
+        self._table_alias_to_source = {}
+
+        # 1. 收集所有 CTE 名称
+        for cte_node in tree.find_all(exp.CTE):
+            alias = cte_node.alias
+            if alias:
+                self._cte_names.add(alias)
+
+        # 2. 收集表别名 → 源名称映射
+        #    FROM grouped AS g  →  g → "grouped"
+        #    FROM (subquery) AS s  →  s → "__subquery__"
+        for ta in tree.find_all(exp.TableAlias):
+            parent = ta.parent
+            alias_name = (
+                ta.this.name if isinstance(ta.this, exp.Identifier) else str(ta.this)
+            )
+            if isinstance(parent, exp.Table):
+                self._table_alias_to_source[alias_name] = parent.name
+            elif isinstance(parent, exp.Subquery):
+                self._table_alias_to_source[alias_name] = "__subquery__"
+
+    def _is_from_derived_source(self, node: exp.Column) -> bool:
+        """判断 Column 节点是否引用了派生数据源（CTE 或子查询）的输出列。
+
+        判断逻辑：
+        1. 有表前缀 (如 g.dim_product_category)：
+           查找 g → 源名称 → 如果是 CTE 名称或子查询 → True
+        2. 无表前缀 (如 dim_product_category)：
+           找到所属 SELECT 的 FROM/JOIN 数据源，如果**所有**直接数据源
+           都是 CTE 或子查询 → True（该 SELECT 层不直接接触原表）
+
+        Returns:
+            True 表示该 Column 引用的是派生源，不应展开虚拟字段
+        """
+        table_prefix = node.table
+
+        if table_prefix:
+            # 有表前缀：解析别名链
+            source = self._table_alias_to_source.get(table_prefix, table_prefix)
+            return source in self._cte_names or source == "__subquery__"
+
+        # 无表前缀：检查所属 SELECT 的所有直接 FROM/JOIN 源
+        enclosing_select = self._find_enclosing_select(node)
+        if enclosing_select is None:
+            return False
+
+        sources = self._get_direct_from_sources(enclosing_select)
+        if not sources:
+            return False
+
+        return all(
+            self._is_derived_source_name(s) for s in sources
+        )
+
+    def _is_derived_source_name(self, name: str) -> bool:
+        """判断一个数据源名称是否为派生源（CTE 或子查询）。"""
+        if name in self._cte_names or name == "__subquery__":
+            return True
+        # 也检查别名映射：如果 name 本身是一个别名，解析其源
+        source = self._table_alias_to_source.get(name, name)
+        return source in self._cte_names or source == "__subquery__"
+
+    @staticmethod
+    def _find_enclosing_select(node: exp.Expression) -> exp.Select | None:
+        """向上查找最近的 Select 祖先节点。"""
+        parent = node.parent
+        while parent is not None:
+            if isinstance(parent, exp.Select):
+                return parent
+            parent = parent.parent
+        return None
+
+    @staticmethod
+    def _get_direct_from_sources(select: exp.Select) -> list[str]:
+        """获取 SELECT 的直接 FROM 和 JOIN 数据源名称。
+
+        只检查直接的源（不穿透子查询内部），返回源名称列表：
+        - Table → 表名
+        - Subquery → "__subquery__"
+        """
+        sources: list[str] = []
+
+        # FROM 子句
+        frm = select.find(exp.From)
+        if frm and frm.this:
+            source_node = frm.this
+            if isinstance(source_node, exp.Table):
+                sources.append(source_node.name)
+            elif isinstance(source_node, exp.Subquery):
+                sources.append("__subquery__")
+
+        # JOIN 子句（直接子节点）
+        for join in select.find_all(exp.Join):
+            # 只处理当前 SELECT 层的 JOIN，不穿透子查询
+            # 检查 join 是否是 select 的直接子 JOIN
+            if join.parent is not select and not isinstance(join.parent, exp.From):
+                # 向上检查是否属于当前 select
+                p = join.parent
+                is_direct = False
+                while p is not None:
+                    if p is select:
+                        is_direct = True
+                        break
+                    if isinstance(p, (exp.Select, exp.Subquery)):
+                        # 穿过了另一个 SELECT 边界
+                        break
+                    p = p.parent
+                if not is_direct:
+                    continue
+
+            join_source = join.this
+            if isinstance(join_source, exp.Table):
+                sources.append(join_source.name)
+            elif isinstance(join_source, exp.Subquery):
+                sources.append("__subquery__")
+
+        return sources
 
     def _transform_node(self, node: exp.Expression) -> exp.Expression:
         """对单个 AST 节点进行转换。
 
         检查节点是否是虚拟字段引用（Column 类型且名称匹配映射表），
         如果是，替换为对应的真实表达式 AST。
+
+        ★ 作用域感知：如果该 Column 引用的数据源是 CTE 或子查询（派生源），
+        则跳过展开——因为虚拟字段名在派生源中可能是 AS 别名，
+        展开后会破坏外层对 CTE 别名的引用。
         """
         if not isinstance(node, exp.Column):
             return node
@@ -334,6 +469,16 @@ class VirtualFieldConverter:
             fid = col_name
 
         if fid is None or fid not in self._mappings:
+            return node
+
+        # ★ 作用域检查：如果 Column 引用的是派生数据源，跳过展开
+        if self._is_from_derived_source(node):
+            self._messages.append(
+                f"跳过虚拟字段 '{fid}' 展开: 引用来自 CTE/子查询的输出列"
+            )
+            # 还原 __vf__ 前缀为原始字段名（保持 AS 别名正确）
+            if col_name.startswith("__vf__"):
+                node.set("this", exp.to_identifier(fid, quoted=True))
             return node
 
         mapping = self._mappings[fid]

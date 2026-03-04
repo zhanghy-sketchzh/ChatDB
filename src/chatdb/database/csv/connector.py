@@ -14,7 +14,7 @@ from typing import Any
 import duckdb
 
 from chatdb.database.duckdb import DuckDBConnector
-from chatdb.utils.logger import logger
+from lib.utils.logger import logger
 
 
 class CSVConnector(DuckDBConnector):

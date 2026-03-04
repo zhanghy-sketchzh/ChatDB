@@ -26,6 +26,7 @@ from chatdb.tools.base import (
     ToolParameter,
     ToolResult,
     ToolMetadata,
+    AgentBackedTool,
 )
 
 from chatdb.tools.registry import (
@@ -54,6 +55,7 @@ __all__ = [
     "ToolParameter",
     "ToolResult",
     "ToolMetadata",
+    "AgentBackedTool",
     # 注册中心
     "ToolRegistry",
     "get_default_registry",

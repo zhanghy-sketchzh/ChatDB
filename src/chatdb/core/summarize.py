@@ -18,8 +18,8 @@ SummarizeAnswerTool - 总结回答工具
 from typing import Any, TYPE_CHECKING
 
 from chatdb.tools.base import BaseTool, ToolMetadata, ToolParameter, ToolResult
-from chatdb.llm.base import BaseLLM
-from chatdb.utils.logger import get_component_logger
+from lib.llm import BaseLLM
+from lib.utils.logger import get_component_logger
 
 if TYPE_CHECKING:
     from chatdb.core.react_state import ReActState
@@ -159,8 +159,13 @@ class SummarizeAnswerTool(BaseTool):
                 caller_name="summarize_answer",
             )
             
+            # ★ 自检验证机制
+            validated_summary = await self._validate_summary(
+                user_query, summary_context, response.strip(), research_mode
+            )
+            
             return ToolResult.ok(
-                data={"summary": response.strip()},
+                data={"summary": validated_summary},
                 message="汇总完成",
             )
         
@@ -170,6 +175,93 @@ class SummarizeAnswerTool(BaseTool):
                 data={"summary": f"分析已完成，但汇总生成失败: {e}"},
                 message="汇总失败",
             )
+
+    async def _validate_summary(
+        self,
+        user_query: str,
+        summary_context: str,
+        initial_summary: str,
+        research_mode: bool = False,
+    ) -> str:
+        """对汇总结果进行自检验证
+        
+        检查内容：
+        1. 是否完整回答了用户问题
+        2. 数据引用是否准确
+        3. 是否存在逻辑矛盾
+        4. 是否有明显的幻觉内容
+        """
+        try:
+            validation_prompt = f"""请对以下数据分析报告进行质量检查：
+
+## 用户原始问题
+{user_query}
+
+## 分析数据上下文
+{summary_context}
+
+## 待检查的分析报告
+{initial_summary}
+
+---
+
+## 检查要求
+
+请逐项检查以下方面：
+
+### 1. 完整性检查
+- 是否完整回答了用户的问题？
+- 是否遗漏了关键信息？
+
+### 2. 准确性检查  
+- 报告中提到的具体数字是否能在上述数据中找到对应？
+- 是否存在数据引用错误或计算错误？
+
+### 3. 一致性检查
+- 报告内部是否存在逻辑矛盾？
+- 不同部分的数据是否一致？
+
+### 4. 可信度检查
+- 是否存在明显的推测或编造内容？
+- 结论是否有充分的数据支撑？
+
+## 输出要求
+
+如果发现问题，请输出改进后的报告。
+如果没有发现问题，请输出 "VALIDATION_PASSED: 原报告质量良好" + 原报告内容。
+
+改进时请：
+- 修正发现的错误
+- 补充遗漏的信息  
+- 消除逻辑矛盾
+- 标注不确定的部分"""
+
+            if research_mode:
+                validation_prompt += """
+
+### 深度分析模式额外检查
+- 置信度标注是否合理？
+- 证据链是否完整？
+- 限制性说明是否充分？"""
+
+            validation_response = await self.llm.chat(
+                prompt=validation_prompt,
+                system_prompt="你是质量控制专家，负责检查数据分析报告的准确性和完整性。严格基于提供的数据进行验证，不得添加额外信息。",
+                caller_name="summarize_validation",
+            )
+            
+            # 如果验证通过，返回原报告；否则返回改进后的报告
+            if validation_response.strip().startswith("VALIDATION_PASSED:"):
+                self._log.info("汇总验证通过")
+                return initial_summary
+            else:
+                self._log.info("汇总经过验证改进")
+                return validation_response.strip()
+                
+        except Exception as e:
+            self._log.error(f"汇总验证失败: {e}")
+            # 验证失败时返回原报告，避免影响主流程
+            return initial_summary
 
     async def __call__(
         self,

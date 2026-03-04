@@ -43,9 +43,9 @@ from chatdb.config.metrics_loader import preprocess_yaml_config
 from chatdb.core.messages import TaskRequest, TaskResponse, TaskResultEntry
 from chatdb.core.react_state import ErrorType, ReActState
 from chatdb.database.base import BaseDatabaseConnector
-from chatdb.llm.base import BaseLLM
+from lib.llm import BaseLLM
 from chatdb.tools.sql import SQLTool
-from chatdb.utils.logger import get_component_logger
+from lib.utils.logger import get_component_logger
 
 
 # =============================================================================
@@ -540,10 +540,11 @@ class SQLAgent(BaseAgent):
 
     @staticmethod
     def _resolve_dimension_column(dim_id: str, yml_config: dict[str, Any]) -> str:
-        """将维度 ID 解析为实际列名（如 dim_product → 考核产品）"""
-        vf = yml_config.get("virtual_fields", {}).get(dim_id, {})
-        if isinstance(vf, dict) and vf.get("field_type") == "column":
-            return vf.get("column", dim_id)
+        """将维度 ID 解析为实际列名。
+        
+        注意：column 类型虚拟字段已移除，此方法现在直接返回 dim_id。
+        保留以兼容调用方。
+        """
         return dim_id
 
     def _merge_notes_virtual_fields(
@@ -604,17 +605,6 @@ class SQLAgent(BaseAgent):
                     if field_type == "metric":
                         entry["agg_type"] = fdef.get("agg_type", "")
                     required_filters.append(entry)
-                elif field_type == "column":
-                    col_name = fdef.get("column", "").strip()
-                    if not col_name:
-                        continue
-                    required_filters.append({
-                        "id": fid,
-                        "label": fdef.get("description", fid),
-                        "expr": f'"{col_name}"',
-                        "field_type": "column",
-                        "description": fdef.get("description", ""),
-                    })
                 else:
                     continue
                 existing_ids.add(fid)
@@ -810,34 +800,6 @@ class SQLAgent(BaseAgent):
                     "agg_type": mdef.get("agg_type", ""),
                 })
                 added_ids.add(mid)
-        
-        # ── 3. 收集 Planner/intent 引用的 column 类型虚拟字段 ──
-        # 从 intent.dimensions 和 request.meta.virtual_fields 中获取
-        column_candidates: list[str] = []
-        if state.intent and state.intent.dimensions:
-            column_candidates.extend(state.intent.dimensions)
-        if request is not None:
-            meta = getattr(request, "meta", {}) or {}
-            for vfid in (meta.get("virtual_fields") or []):
-                if vfid not in column_candidates:
-                    column_candidates.append(vfid)
-        for cid in column_candidates:
-            if cid in added_ids:
-                continue
-            cdef = virtual_fields.get(cid, {})
-            if not isinstance(cdef, dict) or cdef.get("field_type") != "column":
-                continue
-            # column 类型用真实列名作为 expr
-            col_name = cdef.get("column", "").strip()
-            if col_name:
-                required_filters.append({
-                    "id": cid,
-                    "label": cdef.get("description", cid),
-                    "expr": f'"{col_name}"',
-                    "field_type": "column",
-                    "description": cdef.get("description", ""),
-                })
-                added_ids.add(cid)
         
         state.required_filters = required_filters
         

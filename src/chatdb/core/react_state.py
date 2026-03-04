@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from chatdb.utils.logger import get_component_logger
+from lib.utils.logger import get_component_logger
 
 
 # ============================================================
@@ -229,6 +229,10 @@ class ReActState:
     # 在 semantic_parser / planner / sql_tool 阶段注入 prompt，帮助 LLM 理解表的业务含义
     table_understanding: str = ""
 
+    # ===== 前置分类结果（quick_classify 注入）=====
+    # 用于下游语义解析强化识别
+    pre_classified_mode: str = ""
+
     # ===== Planner Decide 注入的表选择（selected_tables）=====
     # Planner 决策时从「源表 + 已生成临时表」中选择下一步需要的表名列表
     # SQL 生成器据此判断是否注入源表 schema/列信息
@@ -257,6 +261,13 @@ class ReActState:
     # ===== 口径设计（已合并到 SQLTool generate_sql prompt）=====
     sql_hint: str = ""                       # LLM 给 SQL 生成的额外建议
     
+    # ===== SQL 修正历史（防循环） =====
+    # 每次 refine 后追加一条记录，在 _build_diagnose_prompt 中注入，让 LLM 避免重复犯错
+    # 结构: [{"attempt": 1, "sql": "...", "error": "...", "diagnosis": "..."}, ...]
+    refine_history: list[dict[str, Any]] = field(default_factory=list)
+    # 展开前的 SQL（含虚拟字段占位符），供 refine 时让 LLM 理解虚拟字段 → 真实列名映射
+    _pre_expand_sql: str = ""
+
     # ===== Deep Research =====
     research_mode: bool = False              # 是否深度分析模式（由 LLM 自动判断）
     intervention: dict[str, Any] | None = None  # 人类介入信息（Planner E 决策产生）

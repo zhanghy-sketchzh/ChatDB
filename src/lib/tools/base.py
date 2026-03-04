@@ -1,0 +1,384 @@
+"""
+Tool 基类 - 结构化工具定义（Agent + Tool 架构）
+
+设计理念（参考 Agno）：
+- Tool 是"能力"的抽象，Agent 只是"使用者"
+- 每个 Tool 有清晰的元数据（ToolMetadata）
+- 支持渐进式披露：顶层 Tool + subtools
+- 可文档化：每个 Tool 可关联 TOOL.md
+
+每个 Tool 包含：
+- metadata: 工具元数据（名称、描述、分类、输入输出定义等）
+- execute: 执行方法（直接操作 state/context）
+
+注意：此模块为场景无关的通用基类。
+- State / AgentContext 等类型仅用于 TYPE_CHECKING，使用字符串注解延迟解析
+- 子类在各场景包中实现具体绑定
+"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any
+from pathlib import Path
+
+
+# ============================================================
+# 工具元数据定义
+# ============================================================
+
+@dataclass
+class ToolParameter:
+    """工具参数定义"""
+    name: str
+    type: str  # string, number, boolean, object, array
+    description: str
+    required: bool = True
+    default: Any = None
+    enum: list[str] | None = None  # 枚举值
+    
+    def to_schema(self) -> dict[str, Any]:
+        """转换为 JSON Schema 格式"""
+        schema: dict[str, Any] = {
+            "type": self.type,
+            "description": self.description,
+        }
+        if self.enum:
+            schema["enum"] = self.enum
+        if self.default is not None:
+            schema["default"] = self.default
+        return schema
+
+
+@dataclass
+class SubToolDef:
+    """子工具定义 -- LLM 可独立调用的原子指令"""
+    name: str
+    description: str
+    parameters: list["ToolParameter"] = field(default_factory=list)
+
+    def to_function_schema(self) -> dict[str, Any]:
+        properties = {}
+        required = []
+        for p in self.parameters:
+            properties[p.name] = p.to_schema()
+            if p.required:
+                required.append(p.name)
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            },
+        }
+
+    def to_prompt_text(self) -> str:
+        lines = [f"#### {self.name}", f"{self.description}"]
+        if self.parameters:
+            lines.append("参数：")
+            for p in self.parameters:
+                opt = "" if p.required else "（可选）"
+                enum_hint = f"，可选值: {p.enum}" if p.enum else ""
+                lines.append(f"  - `{p.name}` ({p.type}): {p.description}{opt}{enum_hint}")
+        return "\n".join(lines)
+
+
+@dataclass
+class ToolMetadata:
+    """
+    工具元数据 - 完整的工具"说明书"
+    
+    设计理念：
+    - 既供 LLM 理解（description、inputs、outputs）
+    - 也供系统管理（category、version、dependencies）
+    - 支持渐进式披露（subtools）
+    """
+    name: str                                   # 工具名，如 "semantic_parse"
+    description: str                            # 工具干什么（一句话）
+    category: str = "general"                   # 分类：analysis/execution/diagnosis/planning
+    
+    # 输入输出定义（用于 LLM 理解和文档生成）
+    inputs: dict[str, dict[str, str]] = field(default_factory=dict)
+    outputs: dict[str, dict[str, str]] = field(default_factory=dict)
+    
+    # 版本和文档
+    version: str = "1.0"
+    doc_path: str | None = None                 # 对应 TOOL.md 路径
+    
+    # 子工具（渐进式披露）
+    subtools: list[str] = field(default_factory=list)
+    
+    # 依赖和标记
+    is_core: bool = False
+    dependencies: list[str] = field(default_factory=list)
+    
+    def to_prompt_text(self, include_subtools: bool = False) -> str:
+        """生成供 LLM 使用的描述文本"""
+        lines = [f"### {self.name}"]
+        lines.append(self.description)
+        
+        if self.inputs:
+            lines.append("\n**输入参数：**")
+            for param, info in self.inputs.items():
+                type_str = info.get("type", "any")
+                desc = info.get("description", "")
+                lines.append(f"- `{param}` ({type_str}): {desc}")
+        
+        if self.outputs:
+            lines.append("\n**输出结果：**")
+            for result, info in self.outputs.items():
+                type_str = info.get("type", "any")
+                desc = info.get("description", "")
+                lines.append(f"- `{result}` ({type_str}): {desc}")
+        
+        if include_subtools and self.subtools:
+            lines.append("\n**子能力：**")
+            for subtool in self.subtools:
+                lines.append(f"- {subtool}")
+        
+        return "\n".join(lines)
+    
+    def to_dict(self) -> dict[str, Any]:
+        """转换为字典"""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "category": self.category,
+            "inputs": self.inputs,
+            "outputs": self.outputs,
+            "version": self.version,
+            "doc_path": self.doc_path,
+            "subtools": self.subtools,
+            "is_core": self.is_core,
+            "dependencies": self.dependencies,
+        }
+
+
+# ============================================================
+# 工具执行结果
+# ============================================================
+
+@dataclass
+class ToolResult:
+    """工具执行结果"""
+    success: bool
+    data: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+    message: str = ""
+    
+    def to_dict(self) -> dict[str, Any]:
+        """转换为字典"""
+        result = {
+            "success": self.success,
+            "data": self.data,
+            "message": self.message,
+        }
+        if self.error:
+            result["error"] = self.error
+        return result
+    
+    @classmethod
+    def ok(cls, data: dict[str, Any] | None = None, message: str = "") -> "ToolResult":
+        """创建成功结果"""
+        return cls(success=True, data=data or {}, message=message)
+    
+    @classmethod
+    def fail(cls, error: str, data: dict[str, Any] | None = None) -> "ToolResult":
+        """创建失败结果"""
+        return cls(success=False, error=error, data=data or {})
+
+
+# ============================================================
+# 工具基类
+# ============================================================
+
+class BaseTool(ABC):
+    """
+    工具基类（通用框架）
+    
+    设计理念（参考 Agno）：
+    - Tool 是独立的"能力单元"
+    - 通过 metadata 提供完整的"说明书"
+    - execute 直接操作 state/context（而非返回数据让 Agent 处理）
+    - 支持两种模式：
+      1. 简单模式：execute(**kwargs) -> ToolResult
+      2. ReAct 模式：__call__(state, context, **kwargs) -> None（直接修改 state）
+    
+    子类需要实现：
+    - metadata: 工具元数据
+    - execute 或 __call__: 执行方法
+    """
+    
+    def __init__(self, metadata: ToolMetadata | None = None):
+        self._metadata = metadata
+    
+    @property
+    def metadata(self) -> ToolMetadata:
+        """获取工具元数据"""
+        if self._metadata:
+            return self._metadata
+        return ToolMetadata(
+            name=self.name,
+            description=self.description,
+        )
+    
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """工具名称（唯一标识）"""
+        ...
+    
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """工具描述"""
+        ...
+    
+    @property
+    def category(self) -> str:
+        """工具分类"""
+        return self.metadata.category
+    
+    @property
+    def parameters(self) -> list[ToolParameter]:
+        """参数定义列表（兼容旧版）"""
+        return []
+    
+    @property
+    def subtools(self) -> list[str]:
+        """子工具列表"""
+        return self.metadata.subtools
+    
+    def get_doc(self) -> str | None:
+        """获取工具文档内容（从 TOOL.md）"""
+        doc_path = self.metadata.doc_path
+        if doc_path and Path(doc_path).exists():
+            return Path(doc_path).read_text(encoding="utf-8")
+        return None
+    
+    # ============================================================
+    # 执行接口
+    # ============================================================
+    
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        """简单模式执行（兼容旧版）"""
+        raise NotImplementedError("子类需要实现 execute 方法")
+    
+    async def __call__(self, state: Any, context: Any, **kwargs: Any) -> None:
+        """
+        ReAct 模式执行（新架构核心）
+        
+        直接读写 state/context，不返回数据。
+        state/context 类型由各场景包子类约束。
+        """
+        result = await self.execute(**kwargs)
+        if not result.success:
+            state.set_error(result.error or "工具执行失败")
+    
+    # ============================================================
+    # 辅助方法
+    # ============================================================
+    
+    def validate_params(self, **kwargs: Any) -> tuple[bool, str]:
+        """验证参数"""
+        for param in self.parameters:
+            if param.required and param.name not in kwargs:
+                return False, f"缺少必需参数: {param.name}"
+        return True, ""
+    
+    def to_function_schema(self) -> dict[str, Any]:
+        """转换为 OpenAI Function Calling 格式"""
+        properties = {}
+        required = []
+        
+        for param in self.parameters:
+            properties[param.name] = param.to_schema()
+            if param.required:
+                required.append(param.name)
+        
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        }
+    
+    def get_prompt_description(self, include_subtools: bool = False) -> str:
+        """获取供 LLM 使用的描述文本"""
+        return self.metadata.to_prompt_text(include_subtools)
+
+    # ============================================================
+    # 子工具（LLM 可选指令集）
+    # ============================================================
+
+    @property
+    def subtool_defs(self) -> list[SubToolDef]:
+        """子工具定义列表，子类覆写以声明 LLM 可调用的原子指令"""
+        return []
+
+    def get_subtool_schemas(self) -> list[dict[str, Any]]:
+        """生成所有子工具的 Function Calling Schema"""
+        return [d.to_function_schema() for d in self.subtool_defs]
+
+    def get_tool_instructions(self) -> str:
+        """生成 LLM 可读的工具使用说明（含所有子工具）"""
+        defs = self.subtool_defs
+        if not defs:
+            return self.get_prompt_description(include_subtools=True)
+        lines = [f"## {self.name}", self.description, ""]
+        lines.append("### 可用指令\n")
+        for d in defs:
+            lines.append(d.to_prompt_text())
+            lines.append("")
+        return "\n".join(lines)
+
+    async def invoke(self, subtool_name: str, **kwargs: Any) -> ToolResult:
+        """按子工具名称调用，默认映射到 execute(action=subtool_name, ...)"""
+        valid_names = {d.name for d in self.subtool_defs}
+        if valid_names and subtool_name not in valid_names:
+            return ToolResult.fail(f"未知指令: {subtool_name}，可用: {valid_names}")
+        return await self.execute(action=subtool_name, **kwargs)
+
+    def __repr__(self) -> str:
+        return f"<Tool: {self.name}>"
+
+
+# ============================================================
+# Agent 能力封装工具基类
+# ============================================================
+
+class AgentBackedTool(BaseTool):
+    """
+    封装 Agent 能力的工具基类
+
+    子类实现：_get_agent()、_build_context(**kwargs)、_map_result(AgentResult)。
+    execute 默认：构建 context → 调用 agent.execute(context) → 将 AgentResult 转为 ToolResult。
+    
+    注意：此基类不绑定具体的 AgentContext/AgentResult 类型，
+    由各场景包子类（如 chatdb.tools.base）提供具体实现。
+    """
+
+    def _get_agent(self) -> Any:
+        """返回本工具封装的 Agent 实例（延迟初始化由子类实现）。"""
+        raise NotImplementedError
+
+    def _build_context(self, **kwargs: Any) -> Any:
+        """根据 execute 参数构建 AgentContext。"""
+        raise NotImplementedError
+
+    def _map_result(self, agent_result: Any) -> ToolResult:
+        """将 AgentResult 转为 ToolResult。"""
+        raise NotImplementedError
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        """通过封装的 Agent 执行，并映射结果为 ToolResult。"""
+        context = self._build_context(**kwargs)
+        result = await self._get_agent().execute(context)
+        return self._map_result(result)

@@ -17,7 +17,7 @@ from typing import Any
 
 import yaml
 
-from chatdb.utils.logger import logger
+from lib.utils.logger import logger
 
 
 class DomainConfigLoader:

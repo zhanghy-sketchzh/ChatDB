@@ -37,21 +37,21 @@ from chatdb.agents.base import AgentContext, AgentStatus
 from chatdb.core.messages import TaskRequest, TaskResponse
 from chatdb.core.react_state import ReActState, ReActPhase, ErrorType
 from chatdb.core.scratch_pad import ScratchPadManager
-from chatdb.core.result_cache import ResultCache
+from lib.core.result_cache import ResultCache
 from chatdb.core.history_mixin import HistoryHelper
 from chatdb.agents.planner import AnalysisPlan, PlannerAgent
 from chatdb.agents.sql_agent import SQLAgent
 from chatdb.database.base import BaseDatabaseConnector
 from chatdb.database.schema import SchemaInspector
-from chatdb.llm.base import BaseLLM
-from chatdb.storage.chat_history import ChatHistoryManager, HistoryConfig
-from chatdb.storage.task_history import TaskHistoryDB, TaskTracker, TaskStatus
+from lib.llm import BaseLLM
+from lib.storage.chat_history import ChatHistoryManager, HistoryConfig
+from lib.storage.task_history import TaskHistoryDB, TaskTracker, TaskStatus
 from chatdb.tools import ToolRegistry, UnixTool
 from chatdb.core.semantic_parse import SemanticParseTool
 from chatdb.core.summarize import SummarizeAnswerTool
 from chatdb.core.context_retriever import ContextRetriever, RetrievalResult
-from chatdb.skills import SkillRegistry as SkillReg, init_skill_registry, get_skill_registry
-from chatdb.utils.logger import logger, set_log_level_to_debug, enable_llm_debug, task_log, get_component_logger
+from lib.skills import SkillRegistry as SkillReg, init_skill_registry, get_skill_registry
+from lib.utils.logger import logger, set_log_level_to_debug, enable_llm_debug, task_log, get_component_logger
 from chatdb.utils.common import select_best_table, build_schema_text, get_tables_info, format_rows
 
 
@@ -105,7 +105,7 @@ class AgentOrchestrator:
         self.registry = ToolRegistry()
         
         # ===== SkillRegistry（分析技能知识源）=====
-        self._skill_registry = init_skill_registry("skills")
+        self._skill_registry = init_skill_registry("skills/db")
         
         # SQLAgent（核心 Agent，接受 yml_config + skill_registry）
         self._sql_agent = SQLAgent(self.llm, self.db_connector, yml_config,
@@ -228,10 +228,18 @@ class AgentOrchestrator:
         
         try:
             # ============================================================
-            # 0. [前置] 轻量分类：快速识别非数据分析问题
+            # 0. [前置] 轻量分类：快速识别问题类型（analysis/report/chat/ambiguous）
             # 在所有重操作（虚拟字段检索、语义解析）之前，用极短的 LLM 调用判断问题类型
             # ============================================================
-            query_type = await self._quick_classify(query, chat_history)
+            # 获取表描述（缓存优先，无缓存则 LLM 生成）—— 复用已有的 _load_table_understanding
+            table_understanding = await self._load_table_understanding(
+                state.table_name, state.available_tables
+            )
+            query_type = await self._quick_classify(
+                query, chat_history, table_understanding=table_understanding,
+            )
+            orch_log.info(f"前置分类: {query_type}")
+            
             if query_type == "chat":
                 orch_log.info(f"前置分类: chat，走快速响应路径")
                 state = await self._handle_chat_query(state, context, orch_log)
@@ -244,6 +252,7 @@ class AgentOrchestrator:
                     await self._event_sink.put(None)
                     self._event_sink = None
                 return result
+            
             
             # ============================================================
             # 0.5 [前置] 虚拟字段检索（在语义解析之前）
@@ -1407,15 +1416,21 @@ class AgentOrchestrator:
         """手动清除结果缓存"""
         return self._result_cache.invalidate(session_id)
     
-    async def _quick_classify(self, query: str, chat_history: list | None) -> str:
+    
+    async def _quick_classify(
+        self,
+        query: str,
+        chat_history: list | None,
+        table_understanding: str = "",
+    ) -> str:
         """
-        前置轻量分类：判断问题是否和数据分析有关。
+        前置轻量分类：快速判断问题类型并分流。
         
         在所有重操作（虚拟字段检索、语义解析）之前执行，
         用极短的 LLM 调用快速分流。
         
         Returns:
-            "analysis" | "chat" | "ambiguous"
+            "analysis" | "report" | "chat" | "ambiguous"
         """
         history_hint = ""
         if chat_history:
@@ -1425,12 +1440,17 @@ class AgentOrchestrator:
                 a = (last.get("answer") or "")[:60]
                 history_hint = f"\n上一轮对话: Q: {q} A: {a}"
         
+        # 注入表描述信息，帮助 LLM 判断问题与数据的相关性
+        data_hint = ""
+        if table_understanding:
+            data_hint = f"\n当前数据表描述: {table_understanding}"
+        
         prompt = f"""判断用户问题的类型，只输出一个单词：
-- analysis: 需要查询数据库、做数据分析（如流水、收入、趋势、排名、对比等）
+- analysis: 需要查询数据库、做数据分析（如查流水、收入、趋势、排名、对比、问数等）
 - chat: 闲聊、常识问答、与数据分析无关（如天气、地理、打招呼等）
 - ambiguous: 不确定，可能和数据有关也可能无关
 
-用户问题: {query}{history_hint}
+用户问题: {query}{history_hint}{data_hint}
 
 类型:"""
 
@@ -1441,7 +1461,8 @@ class AgentOrchestrator:
                 caller_name="quick_classify",
             )
             result = response.strip().lower().split()[0] if response else "analysis"
-            return result if result in ("analysis", "chat", "ambiguous") else "analysis"
+            valid_types = ("analysis", "chat", "ambiguous")
+            return result if result in valid_types else "analysis"
         except Exception:
             return "analysis"  # 分类失败时走正常分析流程
     
@@ -1552,6 +1573,8 @@ class AgentOrchestrator:
         if state.temp_results:
             summary_context = self._build_summary_context(state)
             state.extra_context = summary_context
+            
+            # 普通模式：使用现有的 ReAct 调用方式
             await self._summarize_tool(state, AgentContext(user_query=query))
             return state
         
@@ -1781,6 +1804,21 @@ class AgentOrchestrator:
             if debug_info.get("reasoning_trace"):
                 logger.debug("[AgentOrchestrator] %s", debug_info["reasoning_trace"])
             result["debug"] = debug_info
+
+        # ★ 添加 token 使用统计
+        token_stats = self._task_tracker.get_task_token_stats()
+        if token_stats:
+            result["token_usage"] = {
+                "total_calls": token_stats["total_calls"],
+                "total_input_tokens": token_stats["total_input_tokens"],
+                "total_output_tokens": token_stats["total_output_tokens"],
+                "total_tokens": token_stats["total_tokens"],
+                "total_duration_ms": token_stats["total_duration_ms"],
+                "by_caller": token_stats["by_caller"],
+            }
+            # 在debug模式下提供详细报告
+            if self.debug:
+                result["debug"]["token_report"] = self._task_tracker.format_token_report()
 
         return result
     

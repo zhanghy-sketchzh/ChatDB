@@ -10,7 +10,7 @@ from chatdb.core import AgentOrchestrator
 from chatdb.api.dependencies import get_orchestrator
 from chatdb.api.schemas import QueryRequest, QueryResponse, ClarificationResponse
 from chatdb.utils.exceptions import AgentError, ChatDBError
-from chatdb.utils.logger import logger
+from lib.utils.logger import logger
 
 router = APIRouter(prefix="/query", tags=["Query"])
 

@@ -15,9 +15,9 @@ from typing import Any, TYPE_CHECKING
 
 from chatdb.database.base import BaseDatabaseConnector
 from chatdb.database.duckdb.syntax_rules import get_duckdb_syntax_rules
-from chatdb.llm.base import BaseLLM
+from lib.llm import BaseLLM
 from chatdb.tools.base import BaseTool, ToolParameter, ToolResult
-from chatdb.utils.logger import get_component_logger
+from lib.utils.logger import get_component_logger
 from chatdb.utils.common import parse_json, clean_sql as _clean_sql_util, format_rows
 
 from chatdb.core.react_state import ReActState, ReActPhase, ErrorType, AnalysisPhase
@@ -1242,6 +1242,9 @@ class SQLTool:
             candidates, virtual_fields = self._parse_candidates(response)
             # 虚拟字段替换（AST 转换引擎）
             if candidates:
+                # ★ 在展开前保存原始 SQL（含虚拟字段占位符），供 refine 时参考
+                if state and hasattr(state, '__dict__'):
+                    state._pre_expand_sql = candidates[0].sql
                 self._expand_virtual_fields_in_candidates(
                     candidates, virtual_fields, tables_info, state,
                 )
@@ -1515,12 +1518,26 @@ class SQLTool:
         intent: Any,
         schema_text: str | None,
         required_filters: list[dict[str, Any]] | None = None,
+        refine_history: list[dict[str, Any]] | None = None,
+        pre_expand_sql: str | None = None,
     ) -> str:
         prompt = f"""请诊断以下 SQL 的问题并给出最小修正。
 
-## 当前 SQL
+## 当前 SQL（虚拟字段展开后，实际执行的 SQL）
 {eval_result.sql}
+"""
+        # ★ 同时给出展开前的 SQL，让 LLM 理解虚拟字段占位符与展开后列名的对应关系
+        if pre_expand_sql and pre_expand_sql != eval_result.sql:
+            prompt += f"""
+## 展开前 SQL（含虚拟字段占位符）
+{pre_expand_sql}
 
+★ 上方两段 SQL 的区别：系统会自动将虚拟字段占位符展开为真实表达式。
+你修正时应使用虚拟字段占位符（如 "base_valid_data"、dim_year、total_flow），系统会自动展开。
+**注意**：虚拟字段展开后的真实列名（如 dim_year → "年"）才是子查询暴露的列名，外层引用时必须用展开后的列名或 AS 别名。
+"""
+
+        prompt += f"""
 ## 错误类型
 {eval_result.error_type.value}
 
@@ -1542,6 +1559,16 @@ class SQLTool:
             vf_section = self._build_virtual_fields_section(required_filters)
             if vf_section:
                 prompt += f"\n{vf_section}\n"
+
+        # ★ 注入修正历史，防止 LLM 重复犯错（循环修正）
+        if refine_history:
+            prompt += "\n## 之前的修正尝试（请避免重复这些已失败的方向）\n"
+            for entry in refine_history:
+                attempt = entry.get("attempt", "?")
+                diag = entry.get("diagnosis", "无")
+                err = entry.get("error", "无")
+                prompt += f"- 第 {attempt} 次修正：诊断=\"{diag}\"，修正后报错=\"{err[:120]}\"\n"
+            prompt += "★ 请勿重复上述已失败的修正策略，尝试不同的修复方向。\n"
 
         # ★ 根据错误类型给出针对性的诊断指南
         error_guide = self._get_error_diagnosis_guide(eval_result.error_type)
@@ -1596,7 +1623,13 @@ class SQLTool:
 
 **3. CTE 内层列名在外层不可见**
 - 症状: 外层 SELECT 引用的列在 CTE 中未被 SELECT
-- 修复: 确保外层引用的列在 CTE 的 SELECT 列表中""",
+- 修复: 确保外层引用的列在 CTE 的 SELECT 列表中
+
+**4. 虚拟字段在子查询外层不可见**
+- 症状: `column "大盘报表项" not found` 等，错误涉及虚拟字段展开后的原始列名
+- 原因: 外层查询错误地使用了指标型虚拟字段占位符（如 total_flow），系统将其展开为引用原表列的聚合表达式，但外层 FROM 的是子查询结果，子查询中已经没有原表列了
+- 修复: 指标型虚拟字段只能在直接 FROM 原表的最内层 SELECT 中使用并用 AS 起别名，外层查询必须引用内层的 AS 别名，禁止再次写虚拟字段裸名称
+- 示例: 内层写 `total_flow AS "总流水"`，外层写 `LAG("总流水") OVER (...)` 而非 `LAG(total_flow) OVER (...)`""",
 
             ErrorType.TYPE_MISMATCH: """## 常见类型不匹配模式与修复方法
 
@@ -1623,8 +1656,14 @@ class SQLTool:
         yml_config: dict[str, Any],
         schema_text: str | None,
         required_filters: list[dict[str, Any]] | None = None,
+        refine_history: list[dict[str, Any]] | None = None,
+        pre_expand_sql: str | None = None,
     ) -> EvaluationResult:
-        prompt = self._build_diagnose_prompt(eval_result, intent, schema_text, required_filters)
+        prompt = self._build_diagnose_prompt(
+            eval_result, intent, schema_text, required_filters,
+            refine_history=refine_history,
+            pre_expand_sql=pre_expand_sql,
+        )
         system = ("你是 SQL 调试专家。严格按以下步骤修正：\n"
                   "1. 精确定位错误位置（不要只说'括号不匹配'，要指出具体在哪个函数/子查询处缺少了什么）\n"
                   "2. 参考诊断指南中的常见模式匹配错误类型\n"
@@ -1696,13 +1735,22 @@ class SQLTool:
         eval_result = EvaluationResult(sql=sql)
         eval_result = await self._execute_sql_internal(eval_result)
         attempts = 0
+        refine_history: list[dict[str, Any]] = []
         while not eval_result.execution_success and attempts < self.MAX_REFINE_ATTEMPTS:
             self._log.info(f"尝试修正 (第 {attempts + 1} 次)")
             eval_result = await self._diagnose_and_refine(
                 eval_result, intent, yml_config or {}, schema_text or None,
                 required_filters=required_filters,
+                refine_history=refine_history if refine_history else None,
             )
             if eval_result.refined:
+                # ★ 记录修正历史
+                refine_history.append({
+                    "attempt": len(refine_history) + 1,
+                    "sql": eval_result.refined_sql[:200],
+                    "diagnosis": eval_result.diagnosis,
+                    "error": (eval_result.execution_error or "")[:200],
+                })
                 eval_result.sql = eval_result.refined_sql
                 eval_result = await self._execute_sql_internal(eval_result)
             attempts += 1
@@ -1976,11 +2024,23 @@ class SQLTool:
             error_type=state.error_type,
             error_context=state.error_context,
         )
+        # ★ 传递修正历史和展开前 SQL
         eval_result = await self._diagnose_and_refine(
             eval_result, state.intent, state.yml_config, state.schema_text,
             required_filters=state.required_filters or None,
+            refine_history=state.refine_history or None,
+            pre_expand_sql=getattr(state, '_pre_expand_sql', None),
         )
         if eval_result.refined and eval_result.refined_sql != state.current_sql:
+            # ★ 记录修正历史（在展开之前）
+            state.refine_history.append({
+                "attempt": len(state.refine_history) + 1,
+                "sql": eval_result.refined_sql[:200],
+                "diagnosis": eval_result.diagnosis,
+                "error": (state.execution_error or state.error or "")[:200],
+            })
+            # ★ 保存展开前的 SQL，供下次 refine 参考
+            state._pre_expand_sql = eval_result.refined_sql
             # ★ 修复后的 SQL 可能仍含虚拟字段占位符，需要再做一次展开
             refined = eval_result.refined_sql
             mappings = build_mappings_from_tables_info(None, state)
@@ -2131,6 +2191,9 @@ class SQLTool:
         await self.run_generate(state, context)
         if state.error:
             return
+        
+        # ★ 每次新任务开始时清空修正历史
+        state.refine_history = []
         
         for attempt in range(max_refine + 1):
             # 执行 SQL

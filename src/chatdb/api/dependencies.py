@@ -10,7 +10,7 @@ from chatdb.core import AgentOrchestrator
 from chatdb.utils.config import settings
 from chatdb.database.base import BaseDatabaseConnector
 from chatdb.database.schema import SchemaInspector
-from chatdb.llm.factory import LLMFactory
+from lib.llm import LLMFactory
 
 
 class AppState:

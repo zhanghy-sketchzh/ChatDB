@@ -11,7 +11,7 @@
 import logging
 from typing import Any
 
-from chatdb.llm.base import BaseLLM, Message
+from lib.llm import BaseLLM, Message
 
 logger = logging.getLogger(__name__)
 

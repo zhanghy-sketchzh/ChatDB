@@ -13,7 +13,7 @@ from sqlalchemy.engine import Engine
 
 from chatdb.utils.config import settings
 from chatdb.utils.exceptions import ConnectionError, QueryExecutionError
-from chatdb.utils.logger import logger
+from lib.utils.logger import logger
 
 
 class DuckDBConnector:

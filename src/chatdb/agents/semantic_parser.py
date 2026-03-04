@@ -27,8 +27,8 @@ import yaml
 
 from chatdb.agents.base import AgentContext, AgentResult, AgentStatus
 from chatdb.config.metrics_loader import preprocess_yaml_config
-from chatdb.llm.base import BaseLLM
-from chatdb.utils.logger import get_component_logger
+from lib.llm import BaseLLM
+from lib.utils.logger import get_component_logger
 
 
 @dataclass
@@ -246,8 +246,6 @@ class StructuredIntent:
             ft = fdef.get("field_type", "")
             if ft == "metric" and fid not in self.metrics:
                 metrics.append(fid)
-            elif ft == "column" and fid not in self.dimensions:
-                dimensions.append(fid)
             elif ft == "condition" and fid not in condition_ids:
                 self.conditions.append({"type": "ref", "id": fid})
                 condition_ids.add(fid)
@@ -597,14 +595,6 @@ research_mode 是深度复杂推理开关。开启后系统会进行多轮假设
             intent.virtual_fields = [fid for fid in intent.virtual_fields if fid in valid_vf_ids]
             intent.populate_from_virtual_fields(yml_config)
             
-            # 校验 dimensions（column 类型字段也是有效维度）
-            valid_dims = {
-                fid for fid, fdef in virtual_fields.items()
-                if isinstance(fdef, dict) and fdef.get("field_type") == "column"
-            }
-            if intent.dimensions:
-                intent.dimensions = [d for d in intent.dimensions if d in valid_dims]
-            
             self._log.observe(
                 f"提取意图: mode={intent.mode}, task_type={intent.task_type}, "
                 f"virtual_fields={intent.virtual_fields}, metrics={intent.metrics}, "
@@ -878,7 +868,6 @@ research_mode 是深度复杂推理开关。开启后系统会进行多轮假设
         按 field_type 分组展示，包含 scope、synonyms、description。
         """
         conditions = []
-        columns = []
         metrics = []
         for fid, fdef in virtual_fields.items():
             if not isinstance(fdef, dict):
@@ -887,8 +876,6 @@ research_mode 是深度复杂推理开关。开启后系统会进行多轮假设
             entry = {"id": fid, **fdef}
             if ft == "condition":
                 conditions.append(entry)
-            elif ft == "column":
-                columns.append(entry)
             elif ft == "metric":
                 metrics.append(entry)
         
@@ -905,21 +892,6 @@ research_mode 是深度复杂推理开关。开启后系统会进行多轮假设
                 lines.append(
                     f"| {c['id']} | {c.get('description', '')} "
                     f"| {c.get('scope', 'optional')} | {syns} | {c.get('group', '')} |"
-                )
-            lines.append("")
-        
-        # 维度列
-        if columns:
-            lines.append("### column (维度列 — 用于 GROUP BY / ORDER BY)")
-            lines.append("")
-            lines.append("| ID | 描述 | 真实列名 | synonyms | sql_type |")
-            lines.append("|-----|------|----------|----------|----------|")
-            for c in columns:
-                col = c.get("column", c["id"])
-                syns = ", ".join(c.get("synonyms", []))
-                lines.append(
-                    f"| {c['id']} | {c.get('description', '')} "
-                    f"| `{col}` | {syns} | {c.get('sql_type', '')} |"
                 )
             lines.append("")
         

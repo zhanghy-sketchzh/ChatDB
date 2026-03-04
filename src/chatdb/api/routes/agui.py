@@ -159,7 +159,7 @@ async def _create_orchestrator(db_path: str) -> Any:
     """根据文件路径创建 Orchestrator 实例。"""
     from chatdb.database.duckdb import DuckDBConnector
     from chatdb.core import AgentOrchestrator
-    from chatdb.llm.factory import LLMFactory
+    from lib.llm import LLMFactory
 
     file_path = Path(db_path)
 

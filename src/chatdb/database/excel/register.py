@@ -19,7 +19,7 @@ import openpyxl
 import pandas as pd
 
 from chatdb.utils.exceptions import ConnectionError
-from chatdb.utils.logger import logger
+from lib.utils.logger import logger
 from chatdb.database.base import BaseDatabaseConnector
 from chatdb.database.excel.data_processor import DataProcessor
 from chatdb.database.schema import SchemaGenerator
@@ -300,7 +300,7 @@ class ExcelConnector(BaseDatabaseConnector):
         if self.llm_client is None or self.model_name is None:
             try:
                 from chatdb.utils.config import settings
-                from chatdb.llm.factory import LLMFactory
+                from lib.llm import LLMFactory
                 if self.llm_client is None:
                     self.llm_client = LLMFactory.create()
                 if self.model_name is None:
@@ -325,7 +325,7 @@ class ExcelConnector(BaseDatabaseConnector):
         tables_basic_info = []  # 存储每个表的基础信息（用于统一生成schema）
         
         # 第一阶段：处理所有sheet的数据，生成基础信息
-        from chatdb.utils.logger import log_step
+        from lib.utils.logger import log_step
         logger.info(f"第一阶段：处理{len(target_sheets)}个sheet的数据", center=True, symbol="=")
         for idx, sheet_name in enumerate(target_sheets):
             logger.info(f"Sheet {idx+1}/{len(target_sheets)}: {sheet_name}", center=True, symbol="-")

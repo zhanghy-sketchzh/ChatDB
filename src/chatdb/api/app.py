@@ -11,9 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from chatdb import __version__
 from chatdb.api.dependencies import app_state
-from chatdb.api.routes import database_router, health_router, query_router, chat_router, agui_router
+from chatdb.api.routes import (
+    database_router, health_router, query_router, chat_router, agui_router,
+    report_router, report_agui_router, gateway_router,
+)
 from chatdb.utils.config import settings
-from chatdb.utils.logger import logger, setup_logging
+from lib.utils.logger import logger, setup_logging
 
 
 @asynccontextmanager
@@ -46,10 +49,10 @@ def create_app() -> FastAPI:
 
 ## 功能特性
 
-- 🗣️ **自然语言查询**: 使用自然语言描述查询需求
-- 🔄 **多数据库支持**: PostgreSQL、MySQL、SQLite
-- 🤖 **多智能体协作**: SQL 生成、验证、结果总结
-- 🔒 **安全查询**: 仅支持 SELECT 查询，防止数据篡改
+-  **自然语言查询**: 使用自然语言描述查询需求
+-  **多数据库支持**: PostgreSQL、MySQL、SQLite
+-  **多智能体协作**: SQL 生成、验证、结果总结
+-  **安全查询**: 仅支持 SELECT 查询，防止数据篡改
 
 ## 使用方式
 
@@ -78,6 +81,9 @@ def create_app() -> FastAPI:
     app.include_router(query_router)
     app.include_router(database_router)
     app.include_router(agui_router)
+    app.include_router(report_router)
+    app.include_router(report_agui_router)
+    app.include_router(gateway_router)
 
     return app
 

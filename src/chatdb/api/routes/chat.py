@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from chatdb.utils.logger import logger
+from lib.utils.logger import logger
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 
@@ -95,7 +95,7 @@ async def chat_query(request: ChatRequest) -> ChatResponse:
     """
     from chatdb.database.duckdb import DuckDBConnector
     from chatdb.core import AgentOrchestrator
-    from chatdb.llm.factory import LLMFactory
+    from lib.llm import LLMFactory
     
     file_path = Path(request.db_path)
     

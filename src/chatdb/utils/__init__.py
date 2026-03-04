@@ -1,6 +1,6 @@
 """工具模块 - 配置、异常、日志、通用函数"""
 
-from chatdb.utils.json_utils import convert_to_json_serializable
+from lib.utils.json_utils import convert_to_json_serializable
 from chatdb.utils.common import (
     select_best_table,
     build_schema_text,

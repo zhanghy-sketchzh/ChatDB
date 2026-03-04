@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from chatdb.utils.logger import logger
+from lib.utils.logger import logger
 
 
 class DataProcessor:
@@ -879,7 +879,7 @@ class DataProcessor:
         Returns:
             表头行的索引列表（从0开始）
         """
-        from chatdb.llm.base import BaseLLM, Message, _extract_json_from_text
+        from lib.llm import BaseLLM, Message, extract_json_from_text
 
         if not isinstance(llm_client, BaseLLM):
             raise ValueError("llm_client 必须是 BaseLLM 实例")
@@ -974,7 +974,7 @@ class DataProcessor:
 返回JSON格式的结果："""
 
         # 调用LLM
-        from chatdb.utils.logger import log_llm_interaction
+        from lib.utils.logger import log_llm_interaction
         
         response = await llm_client.generate(
             [Message(role="user", content=prompt)], 
@@ -990,7 +990,7 @@ class DataProcessor:
 
         # 解析JSON结果
         try:
-            json_str = _extract_json_from_text(response.content)
+            json_str = extract_json_from_text(response.content)
             if not json_str:
                 raise Exception("无法提取JSON内容")
             

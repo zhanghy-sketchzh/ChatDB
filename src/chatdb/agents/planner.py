@@ -22,8 +22,8 @@ from enum import Enum
 
 from chatdb.agents.base import BaseAgent, AgentContext, AgentResult, AgentStatus
 from chatdb.core.react_state import ReActState
-from chatdb.llm.base import BaseLLM, _extract_json_from_text as extract_json
-from chatdb.utils.logger import get_component_logger
+from lib.llm import BaseLLM, extract_json_from_text as extract_json
+from lib.utils.logger import get_component_logger
 
 
 # ============================================================
@@ -513,7 +513,9 @@ class PlannerAgent(BaseAgent):
 
 ## 用户问题
 {state.user_query}
-{history_section}{scene_lines}
+{history_section}{scene_lines}"""
+
+        prompt += f"""
 ## 已解析的意图
 {json.dumps(intent_summary, ensure_ascii=False, indent=2)}
 
@@ -742,9 +744,10 @@ class PlannerAgent(BaseAgent):
     ) -> str:
         """为 Planner decide prompt 构建可选表的详细信息段。
 
-        与 _llm_decide 中原来的简略列表不同，这里复用 ColumnStatsProvider
-        为每张表提供 schema + 列统计（缺失率、唯一值、常见值等），
-        帮助 Planner 做出更精准的 selected_tables 决策。
+        智能截断策略：
+        - 已完成任务数 ≤ 2：展示完整表信息（schema + 统计）
+        - 已完成任务数 3-5：展示简化表信息（仅列名和类型）
+        - 已完成任务数 > 5：仅展示表名和用途摘要
         """
         source_table = state.table_name or ""
         results_src = collected_results if collected_results is not None else state.temp_results
@@ -763,6 +766,17 @@ class PlannerAgent(BaseAgent):
         if not table_names:
             return ""
 
+        # ★ 计算已完成任务数，决定详细程度
+        completed_count = len([t for t in (self._analysis_plan.tasks if self._analysis_plan else []) 
+                              if t.status == "completed"])
+        
+        if completed_count <= 2:
+            detail_level = "full"  # 完整信息
+        elif completed_count <= 5:
+            detail_level = "medium"  # 简化信息
+        else:
+            detail_level = "minimal"  # 最简信息
+
         parts: list[str] = [
             "## 可选表",
             "",
@@ -771,9 +785,10 @@ class PlannerAgent(BaseAgent):
             "- **临时表**（temp_ 开头）：上游任务的预聚合结果，只包含输出列，**不能使用虚拟字段**",
             "",
         ]
+        
         for tbl_name, origin in table_names:
             tbl_section = await self._build_table_info_for_decide(
-                tbl_name, origin, state,
+                tbl_name, origin, state, detail_level=detail_level,
             )
             parts.append(tbl_section)
 
@@ -784,11 +799,15 @@ class PlannerAgent(BaseAgent):
         table_name: str,
         origin: str,
         state: ReActState,
+        detail_level: str = "full",
     ) -> str:
-        """为单张表构建 decide prompt 用的精简信息段。
+        """为单张表构建 decide prompt 用的信息段。
 
-        包含：表名、行数、列信息（类型 + 统计摘要）。
-        复用 ColumnStatsProvider.format_columns 保持与 SQLTool 一致的展示格式。
+        Args:
+            detail_level: "full" | "medium" | "minimal"
+                - full: 完整信息（列统计）
+                - medium: 简化信息（仅列名和类型）
+                - minimal: 最简信息（仅表名和用途）
         """
         is_temp = table_name.startswith("temp_")
         tag = "临时表/预聚合" if is_temp else "源表"
@@ -802,21 +821,43 @@ class PlannerAgent(BaseAgent):
         if row_count:
             header += f"  — {row_count:,} 行"
 
-        # 2. 尝试获取实时列统计
-        stats_text = await self._get_column_stats_text(table_name, columns)
-
-        if stats_text:
-            result = f"{header}\n{stats_text}"
-        elif columns:
-            # 无统计时退化为简单列信息
-            col_lines = []
-            for col in columns:
-                col_name = col.get("name", col.get("column_name", ""))
-                col_type = col.get("type", col.get("column_type", ""))
-                col_lines.append(f"  - {col_name} ({col_type})")
-            result = f"{header}\n" + "\n".join(col_lines)
-        else:
+        # ★ 根据详细程度决定展示内容
+        if detail_level == "minimal":
+            # 最简模式：仅表名和用途
             result = header
+            if is_temp:
+                result += "\n  > 临时表，包含预聚合结果"
+            return result
+        
+        elif detail_level == "medium":
+            # 简化模式：仅列名和类型，无统计
+            if columns:
+                col_lines = []
+                for col in columns[:8]:  # 最多显示8列
+                    col_name = col.get("name", col.get("column_name", ""))
+                    col_type = col.get("type", col.get("column_type", ""))
+                    col_lines.append(f"  - {col_name} ({col_type})")
+                if len(columns) > 8:
+                    col_lines.append(f"  - ... 共 {len(columns)} 列")
+                result = f"{header}\n" + "\n".join(col_lines)
+            else:
+                result = header
+        
+        else:  # detail_level == "full"
+            # 完整模式：包含列统计
+            stats_text = await self._get_column_stats_text(table_name, columns)
+            if stats_text:
+                result = f"{header}\n{stats_text}"
+            elif columns:
+                # 无统计时退化为简单列信息
+                col_lines = []
+                for col in columns:
+                    col_name = col.get("name", col.get("column_name", ""))
+                    col_type = col.get("type", col.get("column_type", ""))
+                    col_lines.append(f"  - {col_name} ({col_type})")
+                result = f"{header}\n" + "\n".join(col_lines)
+            else:
+                result = header
 
         # ★ 临时表追加使用提示
         if is_temp:
@@ -905,8 +946,6 @@ class PlannerAgent(BaseAgent):
             # v2: 从 virtual_fields 按 field_type 分类展示
             metric_fields = {k: v for k, v in virtual_fields.items()
                             if isinstance(v, dict) and v.get("field_type") == "metric"}
-            column_fields = {k: v for k, v in virtual_fields.items()
-                            if isinstance(v, dict) and v.get("field_type") == "column"}
             condition_fields = {k: v for k, v in virtual_fields.items()
                                if isinstance(v, dict) and v.get("field_type") == "condition"}
             
@@ -932,14 +971,6 @@ class PlannerAgent(BaseAgent):
                     unit_str = f" ({unit})" if unit else ""
                     syn_str = f" [同义词: {', '.join(syns)}]" if syns else ""
                     lines.append(f"  - {mid}: {desc}{unit_str}{syn_str}")
-            
-            if column_fields:
-                lines.append("可用维度（field_type=column，用于 GROUP BY / ORDER BY）:")
-                for did, d in list(column_fields.items())[:10]:
-                    col = d.get("column", did)
-                    syns = d.get("synonyms", [])
-                    syn_str = f" [同义词: {', '.join(syns)}]" if syns else ""
-                    lines.append(f'  - {did}: {d.get("description", did)} → 列名 `{col}`{syn_str}')
 
         return "\n".join(lines)
 
@@ -1057,18 +1088,47 @@ class PlannerAgent(BaseAgent):
     ) -> str:
         """构建任务执行结果的上下文摘要
 
-        策略：
-        - 少量数据（≤ INLINE_ROW_THRESHOLD 行）：直接内联完整数据
-        - 大量数据（> INLINE_ROW_THRESHOLD 行）：展示前 INLINE_ROW_THRESHOLD 行 + 统计摘要
-
-        所有数据直接在上下文中展示，Planner 无需额外工具调用。
+        智能截断策略：
+        - 已完成任务数 ≤ 3：展示最近 3 个任务的完整数据
+        - 已完成任务数 4-6：展示最近 2 个任务的完整数据 + 更早任务的统计摘要
+        - 已完成任务数 > 6：展示最近 1 个任务的完整数据 + 更早任务的统计摘要
         """
         results = collected_results if collected_results is not None else state.temp_results
         if not results:
             return "（尚无）"
 
+        # ★ 计算已完成任务数，决定展示策略
+        completed_count = len([t for t in (self._analysis_plan.tasks if self._analysis_plan else []) 
+                              if t.status == "completed"])
+        
+        if completed_count <= 3:
+            recent_tasks_full = 3
+        elif completed_count <= 6:
+            recent_tasks_full = 2
+        else:
+            recent_tasks_full = 1
+
+        # 按任务顺序排序（最新的在后）
+        task_items = list(results.items())
+        
         lines: list[str] = []
-        for task_id, task_results in results.items():
+        
+        # 处理较早的任务（仅统计摘要）
+        if len(task_items) > recent_tasks_full:
+            older_tasks = task_items[:-recent_tasks_full]
+            lines.append("### 早期任务摘要")
+            for task_id, task_results in older_tasks:
+                total_rows = sum(r.get("row_count", 0) for r in task_results)
+                has_errors = any(any("error:" in issue for issue in r.get("issues", [])) 
+                               for r in task_results)
+                status_str = "❌ 有错误" if has_errors else "✅ 成功"
+                lines.append(f"  [{task_id}] {total_rows} 行 {status_str}")
+            lines.append("")
+
+        # 处理最近的任务（完整数据）
+        recent_tasks = task_items[-recent_tasks_full:] if len(task_items) > recent_tasks_full else task_items
+        
+        for task_id, task_results in recent_tasks:
             lines.append(f"### 任务: {task_id}")
             for i, r in enumerate(task_results):
                 subtask = r.get("subtask", f"步骤{i+1}")
@@ -1084,7 +1144,10 @@ class PlannerAgent(BaseAgent):
                 if has_sql_error and sql:
                     lines.append(f"  **失败的SQL**: `{sql}`")
 
-                if row_count <= self.INLINE_ROW_THRESHOLD:
+                # ★ 动态行数阈值：基于已完成任务数调整
+                dynamic_threshold = max(10, 50 - completed_count * 5)
+                
+                if row_count <= dynamic_threshold:
                     # ★ 少量数据：直接内联完整数据
                     if examples:
                         lines.append("  **完整数据**:")
@@ -1092,8 +1155,8 @@ class PlannerAgent(BaseAgent):
                             items = list(ex.items())
                             lines.append(f"    - {', '.join(f'{k}={v}' for k, v in items)}")
                 else:
-                    # ★ 大量数据：展示前 INLINE_ROW_THRESHOLD 行
-                    display_rows = examples[:self.INLINE_ROW_THRESHOLD]
+                    # ★ 大量数据：展示前 N 行
+                    display_rows = examples[:dynamic_threshold]
                     if display_rows:
                         lines.append(f"  **数据（前 {len(display_rows)} / 共 {row_count} 行）**:")
                         for ex in display_rows:
@@ -1204,10 +1267,8 @@ class PlannerAgent(BaseAgent):
         if vf_retrieval_section:
             virtual_fields_section = f"{virtual_fields_section}\n\n{vf_retrieval_section}"
 
-        # ★ 根据 research_mode 切换 system_prompt 档位
-        research_mode = getattr(state, "research_mode", False)
-        
-        system_prompt = f"""你是数据分析决策专家。{'你不仅要判断任务是否成功，更要像分析师一样思考数据背后的故事。' if research_mode else '根据执行结果决定下一步。'}
+        # ★ 固定 system_prompt（前缀缓存友好）
+        system_prompt = """你是数据分析决策专家。根据执行结果决定下一步行动。
 关键原则：
 1. 空结果 ≠ 失败，先诊断是 SQL 问题还是数据真的为空
 2. SQL 报错时分析错误信息，用 B（重试）给出修复建议
@@ -1221,12 +1282,21 @@ class PlannerAgent(BaseAgent):
 10. 选 A 时必须输出 transition_context + selected_tables
 11. 输出 JSON"""
 
+        # ★ 根据 research_mode 在 user prompt 中添加模式提示
+        research_mode = getattr(state, "research_mode", False)
+        mode_hint = ""
+        if research_mode:
+            mode_hint = """
+## 分析模式提示
+当前为深度分析模式，你不仅要判断任务是否成功，更要像分析师一样思考数据背后的故事。
+"""
+
         # ★ 构建可选表的详细信息（含 schema + 列统计），替代原来的简略列表
         available_tables_section = await self._build_available_tables_section(
             state, collected_results,
         )
 
-        prompt = f"""## 用户问题
+        prompt = f"""{mode_hint}## 用户问题
 {state.user_query}
 {approach_section}
 ## 当前计划状态
@@ -1394,7 +1464,6 @@ class PlannerAgent(BaseAgent):
         # 按 field_type 分组
         cond_fields = {k: v for k, v in active_fields.items() if v.get("field_type") == "condition"}
         metric_fields = {k: v for k, v in active_fields.items() if v.get("field_type") == "metric"}
-        column_fields = {k: v for k, v in active_fields.items() if v.get("field_type") == "column"}
 
         lines = [
             "\n## 虚拟字段（Virtual Fields）— 当前查询涉及的预定义字段",
@@ -1425,16 +1494,6 @@ class PlannerAgent(BaseAgent):
                     f"| {fid} | {fdef.get('description', '')} "
                     f"| {fdef.get('unit', '')} | {syns} |"
                 )
-            lines.append("")
-        
-        if column_fields:
-            lines.append("### column (维度列)")
-            lines.append("| ID | 描述 | 真实列名 | synonyms |")
-            lines.append("|-----|------|----------|----------|")
-            for fid, fdef in sorted(column_fields.items()):
-                col = fdef.get("column", fid)
-                syns = ", ".join(fdef.get("synonyms", []))
-                lines.append(f"| {fid} | {fdef.get('description', '')} | `{col}` | {syns} |")
             lines.append("")
 
         return "\n".join(lines)

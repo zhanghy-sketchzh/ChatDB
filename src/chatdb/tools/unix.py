@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from chatdb.tools.base import BaseTool, SubToolDef, ToolMetadata, ToolParameter, ToolResult
-from chatdb.utils.logger import get_component_logger
+from lib.utils.logger import get_component_logger
 
 if TYPE_CHECKING:
     from chatdb.core.react_state import ReActState

@@ -1,22 +1,25 @@
 """
-自定义异常类
+chatdb.utils.exceptions — ChatDB 异常类
 
-定义项目中使用的各类异常，便于统一异常处理和错误追踪。
+通用异常已迁移到 lib.utils.exceptions，此处：
+1. re-export 所有通用异常
+2. 定义 ChatDB 特有的 DB/SQL 异常
 """
 
-from typing import Any
+# re-export 公共异常
+from lib.utils.exceptions import (  # noqa: F401
+    ChatDBError,
+    LLMError,
+    LLMConnectionError,
+    LLMResponseError,
+    LLMRateLimitError,
+    AgentError,
+    AgentTimeoutError,
+    AgentValidationError,
+)
 
 
-class ChatDBError(Exception):
-    """ChatDB 基础异常类"""
-
-    def __init__(self, message: str, details: dict[str, Any] | None = None):
-        self.message = message
-        self.details = details or {}
-        super().__init__(message)
-
-
-# ==================== 数据库相关异常 ====================
+# ==================== 数据库相关异常（ChatDB 特有）====================
 
 
 class DatabaseError(ChatDBError):
@@ -43,55 +46,7 @@ class SchemaError(DatabaseError):
     pass
 
 
-# ==================== LLM 相关异常 ====================
-
-
-class LLMError(ChatDBError):
-    """LLM 调用异常"""
-
-    pass
-
-
-class LLMConnectionError(LLMError):
-    """LLM API 连接异常"""
-
-    pass
-
-
-class LLMResponseError(LLMError):
-    """LLM 响应解析异常"""
-
-    pass
-
-
-class LLMRateLimitError(LLMError):
-    """LLM API 限流异常"""
-
-    pass
-
-
-# ==================== Agent 相关异常 ====================
-
-
-class AgentError(ChatDBError):
-    """Agent 执行异常"""
-
-    pass
-
-
-class AgentTimeoutError(AgentError):
-    """Agent 执行超时异常"""
-
-    pass
-
-
-class AgentValidationError(AgentError):
-    """Agent 输入验证异常"""
-
-    pass
-
-
-# ==================== SQL 相关异常 ====================
+# ==================== SQL 相关异常（ChatDB 特有）====================
 
 
 class SQLError(ChatDBError):
@@ -116,4 +71,3 @@ class UnsafeSQLError(SQLError):
     """不安全的 SQL 异常"""
 
     pass
-

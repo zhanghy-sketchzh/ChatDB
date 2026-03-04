@@ -24,9 +24,9 @@ def run_server(host: str, port: int, reload: bool = False) -> None:
 async def interactive_query(query: str, yml_config: str | None = None) -> None:
     """交互式查询"""
     from chatdb.core import AgentOrchestrator
-    from chatdb.utils.logger import setup_logging
+    from lib.utils.logger import setup_logging
     from chatdb.database.base import BaseDatabaseConnector
-    from chatdb.llm.factory import LLMFactory
+    from lib.llm import LLMFactory
 
     setup_logging()
 

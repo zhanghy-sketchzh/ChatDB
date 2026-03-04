@@ -15,7 +15,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from chatdb.utils.exceptions import SchemaError
-from chatdb.utils.logger import logger
+from lib.utils.logger import logger
 from chatdb.database.base import BaseDatabaseConnector
 
 
@@ -103,7 +103,7 @@ class SchemaManager:
             llm_client: LLM 客户端（BaseLLM 实例，用于生成 Schema）
             model_name: LLM 模型名称（可选，如果提供会覆盖llm_client的model）
         """
-        from chatdb.llm.base import BaseLLM
+        from lib.llm import BaseLLM
         
         self.connector = connector
         self.llm_client = llm_client
@@ -231,7 +231,7 @@ class SchemaManager:
             raise ValueError("LLM客户端未配置，无法识别ID列")
 
         import asyncio
-        from chatdb.llm.base import BaseLLM, Message
+        from lib.llm import BaseLLM, Message
 
         if not isinstance(self.llm_client, BaseLLM):
             raise ValueError("llm_client 必须是 BaseLLM 实例")
@@ -254,7 +254,7 @@ class SchemaManager:
 无ID列返回: {{"id_columns": []}}"""
 
         # 调用LLM
-        from chatdb.utils.logger import log_llm_interaction
+        from lib.utils.logger import log_llm_interaction
         
         try:
             loop = asyncio.get_event_loop()
@@ -284,9 +284,9 @@ class SchemaManager:
             return []
 
         # 提取JSON
-        from chatdb.llm.base import _extract_json_from_text
+        from lib.llm import extract_json_from_text
 
-        json_str = _extract_json_from_text(response.content)
+        json_str = extract_json_from_text(response.content)
         if not json_str:
             return []
 
@@ -683,7 +683,7 @@ class SchemaManager:
         prompt = self._build_multi_table_schema_prompt(tables_info_for_prompt, filename)
 
         # 调用LLM生成所有表的schema
-        from chatdb.llm.base import call_llm_for_schema
+        from lib.llm import call_llm_for_schema
         # LLM 交互日志会在 call_llm_for_schema 中统一处理
 
         llm_result = await call_llm_for_schema(self.llm_client, prompt, self.model_name)

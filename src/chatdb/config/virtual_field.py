@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from chatdb.utils.logger import get_component_logger
+from lib.utils.logger import get_component_logger
 
 
 # =============================================================================
@@ -25,7 +25,7 @@ class RetrievedVirtualField:
     """单个召回的虚拟字段"""
     id: str
     description: str = ""
-    field_type: str = ""       # condition / column / metric
+    field_type: str = ""       # condition / metric
     scope: str = "optional"    # required / default / optional
     expr: str = ""
     synonyms: list[str] = field(default_factory=list)
@@ -33,7 +33,7 @@ class RetrievedVirtualField:
     # 额外信息
     group: str = ""
     unit: str = ""
-    column: str = ""           # column 类型的真实列名
+    column: str = ""           # 保留字段（兼容旧配置）
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -78,7 +78,6 @@ class VirtualFieldRetrievalResult:
         # 按 field_type 分组展示
         cond_fields = [f for f in self.fields if f.field_type == "condition"]
         metric_fields = [f for f in self.fields if f.field_type == "metric"]
-        column_fields = [f for f in self.fields if f.field_type == "column"]
 
         if cond_fields:
             lines.append("### 条件型（condition — WHERE 筛选）")
@@ -106,20 +105,6 @@ class VirtualFieldRetrievalResult:
                 lines.append(
                     f"| `{f.id}` | {f.description}{unit_str} | {f.scope} "
                     f"| {syns} | `{expr_display}` | {f.score:.2f} |"
-                )
-            lines.append("")
-
-        if column_fields:
-            lines.append("### 维度列（column — GROUP BY / ORDER BY）")
-            lines.append("")
-            lines.append("| ID | 描述 | scope | 同义词 | 真实列名 | 相关度 |")
-            lines.append("|-----|------|-------|--------|---------|--------|")
-            for f in column_fields:
-                syns = ", ".join(f.synonyms) if f.synonyms else ""
-                col = f.column or f.expr
-                lines.append(
-                    f"| `{f.id}` | {f.description} | {f.scope} "
-                    f"| {syns} | `{col}` | {f.score:.2f} |"
                 )
             lines.append("")
 
@@ -398,7 +383,7 @@ class VirtualFieldPromptBuilder:
         """构建完整的虚拟字段说明段落。
 
         Args:
-            required_filters: 虚拟字段列表（包含 condition/column/metric 三种类型）
+            required_filters: 虚拟字段列表（包含 condition/metric 两种类型）
             metric_name: 当前任务的主指标 ID（用于上下文提示）
 
         Returns:
@@ -413,15 +398,12 @@ class VirtualFieldPromptBuilder:
         metric_name: str = "",
     ) -> str:
         """内部方法：构建完整段落"""
-        # ── 1. 分类：条件型 vs 列型 vs 指标型 ──
+        # ── 1. 分类：条件型 vs 指标型 ──
         condition_fields: list[dict[str, Any]] = []
-        column_fields: list[dict[str, Any]] = []
         metric_fields: list[dict[str, Any]] = []
         for f in required_filters:
             ft = f.get('field_type', 'condition')
-            if ft == 'column':
-                column_fields.append(f)
-            elif ft == 'metric':
+            if ft == 'metric':
                 metric_fields.append(f)
             else:
                 condition_fields.append(f)
@@ -449,7 +431,6 @@ class VirtualFieldPromptBuilder:
         lines.extend(self._build_exclusive_groups_warning(exclusive_groups))
         lines.extend(self._build_scope_hints(normal_cond_fields))
         lines.extend(self._build_condition_table(condition_fields, exclusive_ids))
-        lines.extend(self._build_column_table(column_fields))
         lines.extend(self._build_metric_table(metric_fields))
         lines.extend(self._build_examples(
             condition_fields, exclusive_groups, normal_cond_fields, exclusive_ids
@@ -549,32 +530,6 @@ class VirtualFieldPromptBuilder:
         lines.append("")
         return lines
 
-    def _build_column_table(
-        self,
-        column_fields: list[dict[str, Any]],
-    ) -> list[str]:
-        """构建列型虚拟字段表格"""
-        if not column_fields:
-            return []
-
-        lines = [
-            "#### 列型（用于 SELECT / WHERE / GROUP BY / ORDER BY）",
-            "",
-            "| 列名 | 含义 | 说明 | 展开为 |",
-            "|------|------|------|--------|",
-        ]
-        for f in column_fields:
-            fid = f['id']
-            label = f.get('label', fid)
-            desc = f.get('description', '')
-            expr = f.get('expr', '')
-            expr_display = " ".join(line.strip() for line in expr.split("\n") if line.strip())
-            if len(expr_display) > 80:
-                expr_display = expr_display[:77] + "..."
-            lines.append(f'| `"{fid}"` | {label} | {desc} | `{expr_display}` |')
-        lines.append("")
-        return lines
-
     def _build_metric_table(
         self,
         metric_fields: list[dict[str, Any]],
@@ -617,6 +572,49 @@ class VirtualFieldPromptBuilder:
             "即使写了 `SUM(total_flow)`，系统也会安全跳过重复包裹。",
             "",
         ])
+
+        # ── 子查询 / 嵌套查询中的指标型虚拟字段用法 ──
+        metric_ids = [f['id'] for f in metric_fields]
+        if metric_ids:
+            sample = metric_ids[0]
+            lines.extend([
+                "**★ 指标型虚拟字段在子查询/嵌套查询中的用法（critical）**：",
+                "",
+                "指标型虚拟字段（如 `" + sample + "`）会被系统展开为引用**原表真实列**的聚合表达式。"
+                "因此它**只能在直接 FROM 原表的 SELECT 层**中使用。",
+                "",
+                "如果你需要嵌套查询（子查询 + 外层查询），必须遵循：",
+                "1. **内层子查询**：直接 FROM 原表，使用虚拟字段做聚合，并用 `AS` 起一个中文别名",
+                "2. **外层查询**：FROM 子查询结果，**只能引用内层的 AS 别名**，**禁止**再次写虚拟字段裸名称",
+                "",
+                "```sql",
+                "-- ✅ 正确：外层引用内层别名",
+                'SELECT "季度", "当期流水",',
+                '       LAG("当期流水") OVER (ORDER BY "季度") AS "上期流水"',
+                "FROM (",
+                f'    SELECT "季度", {sample} AS "当期流水"',
+                '    FROM "表名"',
+                '    WHERE "base_valid_data"',
+                '    GROUP BY "季度"',
+                ") sub",
+                'ORDER BY "季度"',
+                "```",
+                "",
+                "```sql",
+                "-- ❌ 错误：外层重复使用虚拟字段（子查询结果中没有原表列，展开会报错）",
+                f'SELECT "季度", {sample} AS "当期流水",',
+                f'       LAG({sample}) OVER (ORDER BY "季度") AS "上期流水"',
+                "FROM (",
+                f'    SELECT "季度", {sample} AS "当期流水"',
+                '    FROM "表名"',
+                '    GROUP BY "季度"',
+                ") sub",
+                "```",
+                "",
+                "**原则**：虚拟字段只在最内层（直接接触原表的层级）使用一次，外层一律用别名引用。",
+                "",
+            ])
+
         return lines
 
     def _build_examples(

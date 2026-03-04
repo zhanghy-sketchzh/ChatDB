@@ -22,8 +22,8 @@ from typing import Any, TYPE_CHECKING
 from pathlib import Path
 
 from chatdb.tools.base import BaseTool, ToolMetadata, ToolParameter, ToolResult
-from chatdb.llm.base import BaseLLM
-from chatdb.utils.logger import get_component_logger
+from lib.llm import BaseLLM
+from lib.utils.logger import get_component_logger
 
 if TYPE_CHECKING:
     from chatdb.core.react_state import ReActState

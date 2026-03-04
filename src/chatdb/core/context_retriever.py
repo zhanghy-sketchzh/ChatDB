@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from chatdb.utils.logger import get_component_logger
+from lib.utils.logger import get_component_logger
 
 
 @dataclass
